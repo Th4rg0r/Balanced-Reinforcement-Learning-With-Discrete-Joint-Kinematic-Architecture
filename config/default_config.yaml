@@ -7,7 +7,7 @@ la_mcts:
   l_enc: 2
   latent_dim: 256
   num_peaks: 4
-  log_std_bounds: [-1.5, 0.25]
+  log_std_bounds: [-2.5, 0.25]
   use_categorical_critic: true
   support_min: -150
   support_max: 150
@@ -38,9 +38,9 @@ la_mcts:
   tau_act_train: 1.0
   tau_act_eval: 0.05
   adaptive_exploration: true
-  min_policy_std_target: 0.30
+  min_policy_std_target: 0.15
   exploration_boost_max: 2.25
-  lr: 0.000025
+  lr: 0.00025
   batch_size: 128
   buffer_capacity: 50000
   context_dim: 18
@@ -75,7 +75,7 @@ brl:
   beta_score: 1.0
   eta_viol: 2.0
   beta_ent: 0.01
-  warmup_episodes: 200
+  warmup_episodes: 50
   brl_episodes: 10000
   total_episodes: 10000
   warmup_limit: 30.0
@@ -89,12 +89,12 @@ ant_morph:
   healthy_z_range: [0.2, 1.0]
   max_action_capacity: 12
   default_num_legs: 4
-  action_ema_alpha: 1.0
-  action_smoothness_coef: 0.15
+  action_ema_alpha: 0.8
+  action_smoothness_coef: 0.03
   action_smoothness_end_step: 500000
-  benchmark_vel_ref: 6.0
+  benchmark_vel_ref: 0.24
   vel_std_threshold: 0.15
-  vel_shift_factor: 3000.0
+  vel_shift_factor: 1000.0
   upside_down_time_limit: 0.0
   upside_down_penalty: 0.0
 

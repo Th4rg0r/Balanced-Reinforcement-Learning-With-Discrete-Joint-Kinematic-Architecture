@@ -254,6 +254,15 @@ def test_fixed_smoothness_and_velocity_curriculum_reward_blending() -> None:
         expected_rew = (1.0 - alpha) * info_step["custom_reward"] + alpha * info_step["raw_env_reward"]
         assert rew == pytest.approx(expected_rew, abs=1e-5)
         assert not info_step["upside_down_terminated"]
+
+        # 6. action_ema_alpha (0.8) converges linearly to 1.0 as current_vel approaches 6.0 m/s
+        assert info_step["action_ema_alpha"] == pytest.approx(0.8 + alpha * 0.2, abs=1e-7)
+        wrapper.current_vel = 0.0
+        assert wrapper.get_current_action_ema_alpha() == pytest.approx(0.8, abs=1e-7)
+        wrapper.current_vel = 3.0
+        assert wrapper.get_current_action_ema_alpha() == pytest.approx(0.9, abs=1e-7)
+        wrapper.current_vel = 6.0
+        assert wrapper.get_current_action_ema_alpha() == pytest.approx(1.0, abs=1e-7)
     finally:
         wrapper.close()
 

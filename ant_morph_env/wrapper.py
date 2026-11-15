@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 import math
-from typing import Any, Deque, Dict, Optional, Tuple
+from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 import gymnasium as gym
 from gymnasium import spaces
 import mujoco
@@ -40,7 +40,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         fixed_action_space: bool = False,
         default_num_legs: int = 4,
         healthy_z_range: Tuple[float, float] = (0.2, 1.0),
-        action_ema_alpha: float = 1.0,
+        action_ema_alpha: float = 0.8,
         action_smoothness_coef: float = 0.15,
         action_smoothness_end_step: int = 500000,
         action_smoothness_log_shape: float = 10.0,
@@ -101,9 +101,11 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self.last_xml_tweak = np.full(18, -999.0, dtype=np.float64)
         self.current_num_legs = self.default_num_legs
         self.last_xml_num_legs = -1
+        self.current_leg_angles: Optional[Tuple[float, ...]] = None
+        self.last_xml_leg_angles: Optional[Tuple[float, ...]] = None
 
         # Compile initial model so hfield and nominal constants are captured
-        self._rebuild_xml_model(self.current_tweak, self.current_num_legs)
+        self._rebuild_xml_model(self.current_tweak, self.current_num_legs, leg_angles=None)
 
         # Store nominal baseline quantities for current compiled model
         self._capture_nominal_physics()
@@ -158,8 +160,15 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self._init_qpos = self.mj_data.qpos.ravel().copy()
         self._init_qvel = self.mj_data.qvel.ravel().copy()
 
-    def _rebuild_xml_model(self, tweak: np.ndarray, num_legs: int) -> None:
-        xml_str = self.xml_gen.generate_xml(tweak_vector=tweak, num_legs=num_legs)
+    def _rebuild_xml_model(
+        self,
+        tweak: np.ndarray,
+        num_legs: int,
+        leg_angles: Optional[Sequence[float]] = None,
+    ) -> None:
+        xml_str = self.xml_gen.generate_xml(
+            tweak_vector=tweak, num_legs=num_legs, leg_angles=leg_angles
+        )
         new_model = mujoco.MjModel.from_xml_string(xml_str)
         new_data = mujoco.MjData(new_model)
         mujoco.mj_forward(new_model, new_data)
@@ -213,6 +222,9 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
 
         self.last_xml_tweak = tweak.copy()
         self.last_xml_num_legs = num_legs
+        self.last_xml_leg_angles = (
+            tuple(float(a) for a in leg_angles) if leg_angles is not None else None
+        )
         self._capture_nominal_physics()
 
         if not self.fixed_action_space:
@@ -437,6 +449,17 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             np.clip(self.current_vel / max(self.benchmark_vel_ref, 1e-6), 0.0, 1.0)
         )
 
+    def get_current_action_ema_alpha(self) -> float:
+        """Returns the effective action EMA alpha interpolating linearly from action_ema_alpha to 1.0 with velocity progress."""
+        blend = self.get_reward_blend_alpha()
+        return float(
+            np.clip(
+                self.action_ema_alpha + blend * (1.0 - self.action_ema_alpha),
+                0.05,
+                1.0,
+            )
+        )
+
     def update_velocity_curriculum(
         self,
         ep_vel: float,
@@ -482,9 +505,13 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             self.current_tweak = np.clip(w_in[:18], 0.0, 1000.0)
 
         req_legs = int(opts.get("num_legs", self.default_num_legs))
-        if req_legs not in (3, 4, 6):
+        if req_legs not in (3, 4, 5, 6):
             req_legs = 4
         self.current_num_legs = req_legs
+        raw_angles = opts.get("leg_angles")
+        self.current_leg_angles = (
+            tuple(float(a) for a in raw_angles) if raw_angles is not None else None
+        )
 
         # Reset perception distortion filter with true leg scales and tweak vector
         true_scales = np.array(
@@ -499,15 +526,20 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             seed=seed,
         )
 
-        # Rebuild MJCF XML if morphological geometry parameters (w_1..w_4) or num_legs changed
+        # Rebuild MJCF XML if morphological geometry parameters (w_1..w_4), num_legs, or leg_angles changed
         morph_delta = float(
             np.max(np.abs(self.current_tweak[:4] - self.last_xml_tweak[:4]))
         )
         if (
             morph_delta > self.xml_rebuild_threshold
             or self.current_num_legs != self.last_xml_num_legs
+            or self.current_leg_angles != self.last_xml_leg_angles
         ):
-            self._rebuild_xml_model(self.current_tweak, self.current_num_legs)
+            self._rebuild_xml_model(
+                self.current_tweak,
+                self.current_num_legs,
+                leg_angles=self.current_leg_angles,
+            )
 
         self._apply_runtime_physics(self.current_tweak)
 
@@ -560,14 +592,37 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         else:
             act_env = act_arr[:nu].copy()
         act_raw = np.clip(act_env * morph_mask[:nu], -1.0, 1.0)
+        if not self._eval_mode:
+            ref_mag = (
+                abs(self.target_vel) if self.target_vel > 0.0 else abs(self.current_vel)
+            )
+            step_delta = ref_mag / max(self.vel_shift_factor, 1.0)
+            if self.current_vel < self.target_vel:
+                self.current_vel = min(self.target_vel, self.current_vel + step_delta)
+            elif self.current_vel > self.target_vel:
+                self.current_vel = max(self.target_vel, self.current_vel - step_delta)
+
         cur_smooth_coef = self.get_current_smoothness_coef()
+        eff_ema_alpha = self.get_current_action_ema_alpha()
         if self._prev_raw_action is not None and self._prev_raw_action.shape == act_raw.shape:
             smooth_penalty = cur_smooth_coef * float(
                 np.sum(np.square(act_raw - self._prev_raw_action))
             )
+            if eff_ema_alpha < 1.0 - 1e-6 and self._prev_smoothed_action is not None:
+                act_env = np.clip(
+                    (
+                        eff_ema_alpha * act_raw
+                        + (1.0 - eff_ema_alpha) * self._prev_smoothed_action
+                    )
+                    * morph_mask[:nu],
+                    -1.0,
+                    1.0,
+                )
+            else:
+                act_env = act_raw.copy()
         else:
             smooth_penalty = 0.0
-        act_env = act_raw.copy()
+            act_env = act_raw.copy()
         self._prev_raw_action = act_raw.copy()
         self._prev_smoothed_action = act_env.copy()
         self.total_env_steps += 1
@@ -618,15 +673,6 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             agent_reward = raw_env_reward
             reward = raw_env_reward
         else:
-            ref_mag = (
-                abs(self.target_vel) if self.target_vel > 0.0 else abs(self.current_vel)
-            )
-            step_delta = ref_mag / max(self.vel_shift_factor, 1.0)
-            if self.current_vel < self.target_vel:
-                self.current_vel = min(self.target_vel, self.current_vel + step_delta)
-            elif self.current_vel > self.target_vel:
-                self.current_vel = max(self.target_vel, self.current_vel - step_delta)
-
             blend_alpha = self.get_reward_blend_alpha()
             agent_reward = raw_env_reward - (1.0 - blend_alpha) * smooth_penalty
             reward = agent_reward
@@ -686,6 +732,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         info["true_limb_kinematics"] = true_kinematics
         info["perceived_limb_kinematics"] = perc_kinematics
         info["action_smoothness_coef"] = float(cur_smooth_coef)
+        info["action_ema_alpha"] = float(eff_ema_alpha)
         info["brl_metrics"] = {
             "x_velocity": float(mean_x_vel),
             "total_distance": float(total_dist),
@@ -706,6 +753,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             "perception_metrics": perc_metrics,
             "num_legs": int(self.current_num_legs),
             "action_smoothness_coef": float(cur_smooth_coef),
+            "action_ema_alpha": float(eff_ema_alpha),
         }
 
         return obs_distorted, float(reward), bool(terminated), bool(truncated), info

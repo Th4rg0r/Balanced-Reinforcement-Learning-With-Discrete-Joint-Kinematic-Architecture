@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Tuple
+from typing import Optional, Sequence, Tuple
 import numpy as np
 
 
@@ -32,8 +32,9 @@ class ProceduralAntXMLGenerator:
         self,
         tweak_vector: np.ndarray | None = None,
         num_legs: int = 4,
+        leg_angles: Optional[Sequence[float]] = None,
     ) -> str:
-        """Generates a complete MuJoCo MJCF XML string for a 3-, 4-, or 6-legged Ant."""
+        """Generates a complete MuJoCo MJCF XML string for a 3-, 4-, 5-, or 6-legged Ant."""
         if tweak_vector is None:
             w = np.zeros(12, dtype=np.float64)
         else:
@@ -44,7 +45,7 @@ class ProceduralAntXMLGenerator:
         s_front, s_back, s_left, s_right = self.compute_leg_scales(w[0], w[1], w[2])
         s_mid = 0.5 * (s_front + s_back)
 
-        # Define leg configurations:
+        # Define canonical leg configurations:
         # (leg_idx, dx, dy, ankle_ax, ankle_ay, ankle_range, scale_factor, is_left)
         all_leg_specs = [
             # Leg 1: Front-Left (+x, +y)
@@ -61,7 +62,28 @@ class ProceduralAntXMLGenerator:
             (6, 0.0, -1.25, 1.0, 0.0, "30 70", s_mid * s_right, False),
         ]
 
-        if num_legs == 3:
+        if leg_angles is not None or num_legs == 5:
+            angles = (
+                list(leg_angles)
+                if leg_angles is not None
+                else [(i / float(num_legs)) * 2.0 * math.pi for i in range(num_legs)]
+            )
+            active_specs = []
+            sqrt2 = math.sqrt(2.0)
+            for idx, theta in enumerate(angles, start=1):
+                c = math.cos(float(theta))
+                s = math.sin(float(theta))
+                dx = sqrt2 * c
+                dy = sqrt2 * s
+                # Orthogonal horizontal hinge axis so +range always flexes the foot downward (-z)
+                ax = -s
+                ay = c
+                s_fb = s_front if c >= 0.0 else s_back
+                s_lr = s_left if s >= 0.0 else s_right
+                active_specs.append(
+                    (idx, dx, dy, ax, ay, "30 70", s_fb * s_lr, s >= 0.0)
+                )
+        elif num_legs == 3:
             active_specs = all_leg_specs[:3]
         elif num_legs == 6:
             active_specs = all_leg_specs[:6]
@@ -93,7 +115,7 @@ class ProceduralAntXMLGenerator:
           <joint name="hip_{leg_id}" type="hinge" pos="0.0 0.0 0.0" axis="0 0 1" range="-30 30" armature="1" damping="1"/>
           <geom name="leg_{leg_id}_geom" type="capsule" size="0.08" fromto="0.0 0.0 0.0 {p1x:.4f} {p1y:.4f} 0.0" friction="{foot_friction}"/>
           <body name="foot_{leg_id}" pos="{p1x:.4f} {p1y:.4f} 0">
-            <joint name="ankle_{leg_id}" type="hinge" pos="0.0 0.0 0.0" axis="{ax:.1f} {ay:.1f} 0.0" range="{a_range}" armature="1" damping="1"/>
+            <joint name="ankle_{leg_id}" type="hinge" pos="0.0 0.0 0.0" axis="{ax:.4f} {ay:.4f} 0.0" range="{a_range}" armature="1" damping="1"/>
             <geom name="ankle_{leg_id}_geom" type="capsule" size="0.08" fromto="0.0 0.0 0.0 {p2x:.4f} {p2y:.4f} 0.0" friction="{foot_friction}"/>
           </body>
         </body>

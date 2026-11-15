@@ -128,8 +128,9 @@ def build_harsh_scenario(
     """Builds a moderately harsh random physical/morphological scenario with full perception.
 
     Randomly selects a subset (3 to 5) of physical/morphological dimensions and samples
-    them in [100, 250], keeping 4 legs intact and zeroing all perception distortion
-    and sensor-noise dimensions.
+    them in [100, 250] with all perception-distortion and sensor-noise dimensions zeroed.
+    For Ant, randomly picks 3, 4, 5, or 6 legs, splits 360 degrees into N equal angular
+    sectors, samples one angle per sector, and permutes them across the legs.
     """
     env_key = env_type.lower().strip()
     gen = rng if rng is not None else np.random.default_rng()
@@ -155,7 +156,17 @@ def build_harsh_scenario(
         "tweak": tweak,
     }
     if env_key == "ant":
-        spec["num_legs"] = 4
+        num_legs = int(gen.choice([3, 4, 5, 6]))
+        sector_width = (2.0 * np.pi) / float(num_legs)
+        margin = 0.08 * sector_width
+        sector_angles = [
+            float(gen.uniform(k * sector_width + margin, (k + 1) * sector_width - margin))
+            for k in range(num_legs)
+        ]
+        permuted_angles = [float(a) for a in gen.permutation(sector_angles)]
+        spec["num_legs"] = num_legs
+        spec["leg_angles"] = permuted_angles
+        spec["display_name"] = f"Harsh Random ({num_legs} Legs, Full Perception)"
     elif env_key in ("dog", "unitree_go1", "go1"):
         spec["disabled_leg"] = None
     return spec
@@ -415,6 +426,8 @@ def render_scenario_video(
     }
     if "num_legs" in scenario_spec:
         reset_opts["num_legs"] = scenario_spec["num_legs"]
+    if "leg_angles" in scenario_spec:
+        reset_opts["leg_angles"] = scenario_spec["leg_angles"]
     if "disabled_leg" in scenario_spec:
         reset_opts["disabled_leg"] = scenario_spec["disabled_leg"]
 
