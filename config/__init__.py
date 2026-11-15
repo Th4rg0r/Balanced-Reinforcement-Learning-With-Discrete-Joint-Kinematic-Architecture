@@ -85,6 +85,8 @@ class BRLConfig:
     tau_s: float = 500.0
     initial_r_ref: float = 0.0
     benchmark_r_ref: float = 6169.54
+    min_win_velocity: float = 0.05
+    r_ref_target_mult: float = 1.02
     window_k_w: int = 20
     alpha_eq: float = 10.0
     alpha_inst: float = 2.0
@@ -129,6 +131,7 @@ class AntMorphConfig:
     vel_shift_factor: float = 3000.0
     upside_down_time_limit: float = 0.0
     upside_down_penalty: float = 0.0
+    min_healthy_vel: float = 0.10
 
 
 @dataclass

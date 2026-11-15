@@ -453,6 +453,7 @@ def run_single_seed(
         vel_shift_factor=sys_cfg.ant_morph.vel_shift_factor,
         upside_down_time_limit=sys_cfg.ant_morph.upside_down_time_limit,
         upside_down_penalty=sys_cfg.ant_morph.upside_down_penalty,
+        min_healthy_vel=sys_cfg.ant_morph.min_healthy_vel,
     )
 
     agent = LatentActionMCTSAgent(config=sys_cfg.la_mcts, device=device)

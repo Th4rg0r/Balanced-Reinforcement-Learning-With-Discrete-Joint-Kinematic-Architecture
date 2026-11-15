@@ -331,3 +331,59 @@ def test_front_back_left_right_leg_scaling() -> None:
         wrapper.close()
 
 
+def test_velocity_gated_healthy_reward_and_win_evaluator() -> None:
+    """Verifies training-only velocity-gated healthy_reward and WinEvaluator min_win_velocity + r_ref_target_mult."""
+    from brl_core.interfaces import WinEvaluator
+
+    # 1. WinEvaluator denies stationary wins and raises r_ref past episode_return
+    ev = WinEvaluator(
+        initial_r_ref=500.0,
+        benchmark_r_ref=6000.0,
+        beta_w=0.25,
+        adaptive_ref_rate=0.5,
+        min_win_velocity=0.05,
+        r_ref_target_mult=1.02,
+    )
+    ev.ema_win_rate = 0.60
+    # Stationary episode (vel=0.01 < 0.05) loses even with high return
+    win_stat, _, _ = ev.evaluate_episode(800.0, terminated_unhealthy=False, forward_velocity=0.01)
+    assert win_stat == 0
+
+    # Moving episode (vel=0.20 >= 0.05) wins and pushes r_ref toward 1.02 * 800 = 816 (> 0.90 * 800 = 720)
+    ev.ema_win_rate = 0.60
+    win_move, _, _ = ev.evaluate_episode(800.0, terminated_unhealthy=False, forward_velocity=0.20)
+    assert win_move == 1
+    assert ev.r_ref > 500.0
+    # After repeated wins at 800, r_ref converges above 800 (not capped at 720)
+    for _ in range(25):
+        ev.ema_win_rate = 0.80
+        ev.evaluate_episode(800.0, terminated_unhealthy=False, forward_velocity=0.20)
+    assert ev.r_ref > 800.0
+
+    # 2. Wrapper withholds healthy_reward during stationary training steps, preserves it in eval_mode
+    wrapper = MorphologicalAntBRLWrapper(
+        max_action_capacity=12,
+        fixed_action_space=True,
+        action_ema_alpha=1.0,
+        action_smoothness_coef=0.0,
+        min_healthy_vel=0.10,
+    )
+    try:
+        wrapper.reset(seed=42, options={"eval_mode": False})
+        zero_act = np.zeros(12, dtype=np.float32)
+        _, train_r, _, _, train_info = wrapper.step(zero_act)
+        raw_r = float(train_info["brl_metrics"]["raw_episode_return"])
+        survive_r = float(train_info.get("reward_survive", 0.0))
+        x_vel = float(train_info["brl_metrics"]["x_velocity"])
+        assert survive_r > 0.0
+        assert x_vel < 0.10
+        expected_gate = float(np.clip(x_vel / 0.10, 0.0, 1.0))
+        assert train_r == pytest.approx(raw_r - survive_r * (1.0 - expected_gate), abs=1e-5)
+
+        wrapper.reset(seed=42, options={"eval_mode": True})
+        _, eval_r, _, _, eval_info = wrapper.step(zero_act)
+        assert eval_r == pytest.approx(float(eval_info["brl_metrics"]["raw_episode_return"]), abs=1e-6)
+    finally:
+        wrapper.close()
+
+

@@ -52,6 +52,8 @@ class WinEvaluator:
         beta_w: float = 0.05,
         adaptive_ref_rate: float = 0.02,
         min_floor_ref: Optional[float] = None,
+        min_win_velocity: float = 0.0,
+        r_ref_target_mult: float = 1.02,
     ) -> None:
         self.initial_r_ref = float(initial_r_ref)
         self.benchmark_r_ref = float(benchmark_r_ref)
@@ -59,6 +61,8 @@ class WinEvaluator:
         self.tau_s = float(tau_s)
         self.beta_w = float(beta_w)
         self.adaptive_ref_rate = float(adaptive_ref_rate)
+        self.min_win_velocity = float(min_win_velocity)
+        self.r_ref_target_mult = max(0.5, float(r_ref_target_mult))
         if min_floor_ref is not None:
             self.min_floor_ref = float(min_floor_ref)
         else:
@@ -89,6 +93,7 @@ class WinEvaluator:
         win_indicator = int(
             (not terminated_unhealthy)
             and (episode_return >= self.r_ref)
+            and (forward_velocity >= self.min_win_velocity)
         )
 
         # Smooth logistic dominance score S_e = sigma((R_e - R_ref) / tau_s)
@@ -106,7 +111,7 @@ class WinEvaluator:
         if adapt_reference and win_indicator == 1 and self.ema_win_rate > 0.52:
             target_ref = min(
                 self.benchmark_r_ref,
-                max(self.r_ref, episode_return * 0.90),
+                max(self.r_ref, episode_return * self.r_ref_target_mult),
             )
             self.r_ref = (
                 1.0 - self.adaptive_ref_rate

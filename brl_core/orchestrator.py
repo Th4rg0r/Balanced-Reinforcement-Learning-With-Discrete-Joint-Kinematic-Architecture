@@ -33,6 +33,8 @@ class BRLTrainingOrchestrator:
             benchmark_r_ref=self.cfg.brl.benchmark_r_ref,
             tau_s=self.cfg.brl.tau_s,
             beta_w=self.cfg.brl.ema_beta_w,
+            min_win_velocity=self.cfg.brl.min_win_velocity,
+            r_ref_target_mult=self.cfg.brl.r_ref_target_mult,
         )
 
         self.last_win: int = 0

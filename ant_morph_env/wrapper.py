@@ -51,6 +51,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         vel_shift_factor: float = 3000.0,
         upside_down_time_limit: float = 0.0,
         upside_down_penalty: float = 0.0,
+        min_healthy_vel: float = 0.0,
     ) -> None:
         self.env_id = env_id
         if env is None:
@@ -86,6 +87,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self.vel_shift_factor = max(1.0, float(vel_shift_factor))
         self.upside_down_time_limit = max(0.0, float(upside_down_time_limit))
         self.upside_down_penalty = max(0.0, float(upside_down_penalty))
+        self.min_healthy_vel = max(0.0, float(min_healthy_vel))
         self._recent_ep_returns: Deque[float] = deque(maxlen=20)
         self._recent_ep_velocities: Deque[float] = self._recent_ep_returns
         self._target_return: float = 0.0
@@ -726,6 +728,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             self._upside_down_time = 0.0
 
         upside_down_terminated = False
+        healthy_penalty = 0.0
         if self._eval_mode:
             blend_alpha = 1.0
             exploration_progress = 1.0
@@ -734,7 +737,12 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         else:
             blend_alpha = self.get_reward_blend_alpha()
             exploration_progress = self.get_exploration_progress()
-            agent_reward = raw_env_reward - (1.0 - blend_alpha) * smooth_penalty
+            if self.min_healthy_vel > 0.0:
+                healthy_r = float(info.get("reward_survive", 0.0))
+                if healthy_r > 0.0 and step_x_vel < self.min_healthy_vel:
+                    vel_gate = float(np.clip(step_x_vel / self.min_healthy_vel, 0.0, 1.0))
+                    healthy_penalty = healthy_r * (1.0 - vel_gate)
+            agent_reward = raw_env_reward - (1.0 - blend_alpha) * smooth_penalty - healthy_penalty
             reward = agent_reward
 
         canonical_obs = self._get_canonical_obs()

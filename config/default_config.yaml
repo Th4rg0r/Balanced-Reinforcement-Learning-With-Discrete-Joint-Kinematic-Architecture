@@ -65,6 +65,8 @@ brl:
   tau_s: 500.0
   initial_r_ref: 300.0
   benchmark_r_ref: 6169.54
+  min_win_velocity: 0.05    # minimum mean x_velocity (m/s) required to count as a WIN (0.0 disables)
+  r_ref_target_mult: 1.02   # multiplier on episode_return when raising r_ref (>1.0 keeps duel challenging)
   window_k_w: 20
   alpha_eq: 10.0
   alpha_inst: 2.0
@@ -104,6 +106,7 @@ ant_morph:
   vel_shift_factor: 3000.0
   upside_down_time_limit: 0.0
   upside_down_penalty: 0.0
+  min_healthy_vel: 0.10     # training-only: scale healthy_reward by clip(v_x / min_healthy_vel, 0, 1); 0.0 disables
 
 # Run protocol defaults for experiments/train_ant_brl.py (CLI flags override; 0 = automatic)
 run:
