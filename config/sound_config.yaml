@@ -1,0 +1,111 @@
+la_mcts:
+  obs_dim: 27
+  max_action_dim: 8
+  k_tok: 8
+  d_model: 256
+  n_heads: 4
+  l_enc: 2
+  latent_dim: 256
+  num_peaks: 4
+  log_std_bounds: [-2.5, 0.25]
+  use_categorical_critic: true
+  support_min: -150
+  support_max: 150
+  num_bins: 301
+  gamma: 0.99
+  td_steps: 5
+  target_tau: 0.01
+  l_dyn: 3
+  proj_dim: 512
+  pred_dim: 256
+  unroll_steps: 5
+  lambda_rep: 2.0
+  beta_mse: 1.0
+  lambda_v: 0.5
+  lambda_r: 1.0
+  lambda_p: 0.25
+  lambda_ent: 0.015
+  c_reg: 0.0001
+  n_sim: 32
+  n_sim_eval: 64
+  k_act: 16
+  c_1: 1.50
+  c_2: 19652.0
+  root_tau_beta: 1.0
+  inner_tau_beta: 0.8
+  root_dirichlet_alpha: 0.3
+  root_exploration_fraction: 0.30
+  tau_act_train: 1.0
+  tau_act_eval: 0.05
+  adaptive_exploration: true
+  min_policy_std_target: 0.20
+  exploration_boost_max: 2.25
+  lr: 0.0001
+  batch_size: 128
+  buffer_capacity: 50000
+  context_dim: 18
+  history_len: 6
+  latent_ema_decay: 0.4
+  reanalyze_ratio: 0.25
+  train_every_steps: 50     # agent update every N env steps (0 = auto: max_steps // 2)
+  reanalyze_every: 4        # Reanalyze every N episodes (0 = off)
+  reanalyze_states: 4       # states refreshed per Reanalyze pass
+
+brl:
+  num_params: 18
+  param_max: 1000.0
+  budget_max: 4600.0
+  cost_min: 0.1
+  cost_max: 10.0
+  target_win_rate: 0.50
+  ema_beta_w: 0.05
+  tau_s: 500.0
+  initial_r_ref: -900.0
+  benchmark_r_ref: 6169.54
+  window_k_w: 20
+  alpha_eq: 10.0
+  alpha_inst: 2.0
+  alpha_prog: 5.0
+  sigma_zpd: 0.15
+  lambda_entropy: 0.5
+  balancer_lr: 0.0001
+  balancer_tau: 0.005
+  balancer_noise_std: 0.05
+  tweaker_lr: 0.0003
+  beta_score: 1.0
+  eta_viol: 2.0
+  beta_ent: 0.01
+  warmup_episodes: 120
+  brl_episodes: 10000
+  total_episodes: 10000
+  warmup_limit: 30.0
+  warmup_budget: 90.0
+
+ant_morph:
+  env_id: "Ant-v5"
+  use_contact_forces: false
+  max_episode_steps: 1000
+  xml_rebuild_threshold: 1.0
+  healthy_z_range: [0.2, 1.0]
+  max_action_capacity: 12
+  default_num_legs: 4
+  action_ema_alpha: 0.6 #smoothness 0.8
+  action_smoothness_coef: 0.12 # smoothness 0.06
+  action_smoothness_end_step: 500000
+  benchmark_vel_ref: 1.00
+  vel_std_threshold: 0.20
+  vel_shift_factor: 5000.0
+  upside_down_time_limit: 0.0
+  upside_down_penalty: 0.0
+
+# Run protocol defaults for experiments/train_ant_brl.py (CLI flags override; 0 = automatic)
+run:
+  seeds: 10
+  seed_offset: 42
+  episodes: 0          # 0 = brl.total_episodes
+  max_steps: 0         # 0 = ant_morph.max_episode_steps
+  device: "cuda"
+  eval_interval: 25     # 0 = min(10, episodes)
+  checkpoint_interval: 500 # Periodic milestone checkpoint interval in episodes
+  parallel_seeds: 3
+  gpu_mem_fraction: 0.0

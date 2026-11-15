@@ -82,7 +82,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self.vel_shift_factor = max(1.0, float(vel_shift_factor))
         self.upside_down_time_limit = max(0.0, float(upside_down_time_limit))
         self.upside_down_penalty = max(0.0, float(upside_down_penalty))
-        self._recent_ep_velocities: Deque[float] = deque(maxlen=4)
+        self._recent_ep_velocities: Deque[float] = deque(maxlen=20)
         self.target_vel: float = 0.0
         self.current_vel: float = 0.0
         self._eval_mode: bool = False
@@ -468,23 +468,19 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         required_steps: int = 1000,
         terminated_unhealthy: bool = False,
     ) -> Tuple[float, float]:
-        """Updates target_vel from the last 4 full (1000-step) episodes' mean forward velocities (m/s).
+        """Updates target_vel as the rolling 20-episode mean of full (1000-step) episodes' forward velocities (m/s).
 
         Only episodes that reach `required_steps` (default 1000) without unhealthy termination
         are recorded and used to update `target_vel`. Negative episode velocities are clamped to
         0.0 for curriculum / torque-penalty control so `target_vel` can move up or down with
-        recent performance, but never below 0.0.
+        the rolling 20-episode mean, never below 0.0.
         """
         if int(ep_steps) < int(required_steps) or bool(terminated_unhealthy):
             return self.target_vel, self.current_vel
         clamped_vel = max(0.0, float(ep_vel))
         self._recent_ep_velocities.append(clamped_vel)
         vals = np.maximum(0.0, np.asarray(self._recent_ep_velocities, dtype=np.float64))
-        std_v = float(np.std(vals)) if len(vals) >= 2 else 0.0
-        if std_v <= self.vel_std_threshold:
-            self.target_vel = max(0.0, float(np.mean(vals)))
-        else:
-            self.target_vel = max(0.0, float(np.min(vals)))
+        self.target_vel = max(0.0, float(np.mean(vals))) if len(vals) > 0 else 0.0
         return self.target_vel, self.current_vel
 
     def reset(

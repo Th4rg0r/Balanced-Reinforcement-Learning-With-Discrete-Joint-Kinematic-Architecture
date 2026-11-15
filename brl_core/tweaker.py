@@ -73,6 +73,18 @@ class StochasticTweakerActorCritic(nn.Module):
         self.to(self.device)
         self.optimizer = optim.Adam(self.parameters(), lr=self.cfg.tweaker_lr)
         self.memory: List[TweakerTransition] = []
+        self.exploration_progress: float = 0.0
+
+    def get_current_beta_ent(self, exploration_progress: Optional[float] = None) -> float:
+        """Returns the annealed entropy bonus coefficient beta_ent."""
+        prog = (
+            self.exploration_progress
+            if exploration_progress is None
+            else float(np.clip(exploration_progress, 0.0, 1.0))
+        )
+        start = float(self.cfg.beta_ent)
+        end = float(getattr(self.cfg, "beta_ent_end", start))
+        return float(start + prog * (end - start))
 
     def build_state(
         self,
@@ -170,7 +182,7 @@ class StochasticTweakerActorCritic(nn.Module):
             (1.0 - 2.0 * float(win_indicator))
             - self.cfg.beta_score * float(dominance_score)
             - self.cfg.eta_viol * excess_ratio
-            + self.cfg.beta_ent * float(entropy)
+            + self.get_current_beta_ent() * float(entropy)
         )
         return float(r_twk)
 
@@ -211,8 +223,15 @@ class StochasticTweakerActorCritic(nn.Module):
         )
         return reward
 
-    def update(self, ppo_epochs: int = 4, clip_eps: float = 0.2) -> Dict[str, float]:
+    def update(
+        self,
+        ppo_epochs: int = 4,
+        clip_eps: float = 0.2,
+        exploration_progress: Optional[float] = None,
+    ) -> Dict[str, float]:
         """Updates Tweaker Actor-Critic via PPO + differentiable Knapsack regularizer."""
+        if exploration_progress is not None:
+            self.exploration_progress = float(np.clip(exploration_progress, 0.0, 1.0))
         if len(self.memory) == 0:
             return {"tweaker_loss": 0.0, "tweaker_reward": 0.0}
 
@@ -288,7 +307,7 @@ class StochasticTweakerActorCritic(nn.Module):
                 policy_loss
                 + 0.5 * value_loss
                 + 0.1 * proj_discrepancy
-                - self.cfg.beta_ent * entropy
+                - self.get_current_beta_ent() * entropy
             )
 
             self.optimizer.zero_grad()

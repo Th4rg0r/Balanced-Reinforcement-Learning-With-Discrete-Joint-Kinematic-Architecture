@@ -75,6 +75,15 @@ class BRLTrainingOrchestrator:
             self._warmup_calibrated = True
 
         # 1. Balancer emits constraints (L_e, B_e, C_e)
+        vel_progress = (
+            float(self.env.get_reward_blend_alpha())
+            if hasattr(self.env, "get_reward_blend_alpha")
+            else 0.0
+        )
+        if hasattr(self.agent, "set_exploration_progress"):
+            self.agent.set_exploration_progress(vel_progress)
+        self.tweaker.exploration_progress = float(np.clip(vel_progress, 0.0, 1.0))
+
         bal_state = self.balancer.build_state(
             ema_win_rate=self.win_evaluator.ema_win_rate,
             last_win=self.last_win,
@@ -84,6 +93,7 @@ class BRLTrainingOrchestrator:
             state=bal_state,
             warmup=is_warmup,
             deterministic=is_consolidation,
+            exploration_progress=vel_progress,
         )
 
         # 2. Tweaker samples valid parameter vector w_e under Knapsack constraints
@@ -136,6 +146,8 @@ class BRLTrainingOrchestrator:
                 obs, deterministic=False, limb_kinematics=last_info.get("limb_kinematics")
             )
             next_obs, reward, terminated, truncated, info = self.env.step(action)
+            if "reward_blend_alpha" in info and hasattr(self.agent, "set_exploration_progress"):
+                self.agent.set_exploration_progress(float(info["reward_blend_alpha"]))
             self.agent.observe_transition(
                 obs, action, float(reward), next_obs, terminated, truncated, info
             )
@@ -211,6 +223,15 @@ class BRLTrainingOrchestrator:
             episode_return=ep_return, tweak_vector=w_proj, failed=unhealthy_term
         )
 
+        end_vel_progress = (
+            float(self.env.get_reward_blend_alpha())
+            if hasattr(self.env, "get_reward_blend_alpha")
+            else vel_progress
+        )
+        if hasattr(self.agent, "set_exploration_progress"):
+            self.agent.set_exploration_progress(end_vel_progress)
+        self.tweaker.exploration_progress = float(np.clip(end_vel_progress, 0.0, 1.0))
+
         # 6. Update Tweaker and Balancer
         twk_reward = self.tweaker.record_episode(
             state=twk_state,
@@ -225,7 +246,9 @@ class BRLTrainingOrchestrator:
             log_prob=log_p,
             value=twk_val,
         )
-        twk_metrics = self.tweaker.update(ppo_epochs=2)
+        twk_metrics = self.tweaker.update(
+            ppo_epochs=2, exploration_progress=end_vel_progress
+        )
 
         bal_reward = self.balancer.compute_reward(
             ema_win_rate=ema_win,

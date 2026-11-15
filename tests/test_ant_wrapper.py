@@ -232,7 +232,7 @@ def test_fixed_smoothness_and_velocity_curriculum_reward_blending() -> None:
         assert len(wrapper._recent_ep_velocities) == 0
         assert wrapper.target_vel == 0.0
 
-        # 3. Low std across 4 full 1000-step episodes -> target_vel = mean(last 4)
+        # 3. Rolling 20-episode mean of full 1000-step episodes -> target_vel = mean(rolling window up to 20)
         wrapper.update_velocity_curriculum(1.50, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
         wrapper.update_velocity_curriculum(1.55, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
         wrapper.update_velocity_curriculum(1.65, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
@@ -240,14 +240,14 @@ def test_fixed_smoothness_and_velocity_curriculum_reward_blending() -> None:
         assert len(wrapper._recent_ep_velocities) == 4
         assert wrapper.target_vel == pytest.approx(1.60, abs=1e-6)
 
-        # 4. High std across last 4 full 1000-step episodes -> target_vel = min(last 4)
+        # 4. Adding a higher velocity episode continues to take the simple rolling mean (up to 20 episodes)
         wrapper.update_velocity_curriculum(3.00, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
-        # last 4 are [1.55, 1.65, 1.70, 3.00], std > 0.15 -> min is 1.55
-        assert wrapper.target_vel == pytest.approx(1.55, abs=1e-6)
+        # [1.50, 1.55, 1.65, 1.70, 3.00] -> mean is 1.88
+        assert wrapper.target_vel == pytest.approx(1.88, abs=1e-6)
 
         # 5. Each step shifts current_vel toward target_vel by target_vel / 3000 and scales only the smoothness penalty
         wrapper.reset(seed=42)
-        expected_step_shift = 1.55 / 3000.0
+        expected_step_shift = 1.88 / 3000.0
         _, rew, _, _, info_step = wrapper.step(np.ones(12, dtype=np.float32) * 0.5)
         assert wrapper.current_vel == pytest.approx(expected_step_shift, abs=1e-7)
         alpha = expected_step_shift / 6.0
@@ -265,7 +265,7 @@ def test_fixed_smoothness_and_velocity_curriculum_reward_blending() -> None:
         wrapper.current_vel = 6.0
         assert wrapper.get_current_action_ema_alpha() == pytest.approx(1.0, abs=1e-7)
 
-        # 7. Negative velocities clamp to 0.0 for curriculum / torque-penalty control, and target_vel can move up or down (>= 0.0)
+        # 7. Negative velocities clamp to 0.0 for curriculum / torque-penalty control, and rolling 20 window caps at 20
         wrapper._recent_ep_velocities.clear()
         wrapper.target_vel = 0.0
         wrapper.current_vel = 0.0
@@ -274,11 +274,11 @@ def test_fixed_smoothness_and_velocity_curriculum_reward_blending() -> None:
         wrapper.update_velocity_curriculum(0.3, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
         wrapper.update_velocity_curriculum(0.3, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
         assert list(wrapper._recent_ep_velocities) == pytest.approx([0.0, 0.3, 0.3, 0.3], abs=1e-7)
-        # std([0.0, 0.3, 0.3, 0.3]) = 0.12990 <= 0.15 -> mean = 0.225 (would have been 0.0 if -1.5 wasn't clamped to 0.0!)
         assert wrapper.target_vel == pytest.approx(0.225, abs=1e-6)
-        # Subsequent lower velocities (e.g., 0.05) reduce target_vel down to 0.05, but never below 0.0
-        for _ in range(4):
+        # Fill 20 episodes with 0.05 -> rolling 20 mean becomes 0.05
+        for _ in range(20):
             wrapper.update_velocity_curriculum(0.05, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        assert len(wrapper._recent_ep_velocities) == 20
         assert wrapper.target_vel == pytest.approx(0.05, abs=1e-6)
         wrapper.current_vel = -0.5
         assert wrapper.get_reward_blend_alpha() == pytest.approx(0.0, abs=1e-7)

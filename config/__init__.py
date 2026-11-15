@@ -49,10 +49,13 @@ class LAMCTSConfig:
     inner_tau_beta: float = 0.8
     root_dirichlet_alpha: float = 0.3
     root_exploration_fraction: float = 0.30
+    root_exploration_fraction_end: float = 0.10
     tau_act_train: float = 1.0
+    tau_act_train_end: float = 0.25
     tau_act_eval: float = 0.05
     adaptive_exploration: bool = True
-    min_policy_std_target: float = 0.30
+    min_policy_std_target: float = 0.22
+    min_policy_std_target_end: float = 0.12
     exploration_boost_max: float = 2.25
     lr: float = 3e-4
     batch_size: int = 128
@@ -91,10 +94,12 @@ class BRLConfig:
     balancer_lr: float = 1e-4
     balancer_tau: float = 0.005
     balancer_noise_std: float = 0.05
+    balancer_noise_std_end: float = 0.01
     tweaker_lr: float = 3e-4
     beta_score: float = 1.0
     eta_viol: float = 2.0
     beta_ent: float = 0.01
+    beta_ent_end: float = 0.002
     warmup_episodes: int = 100
     brl_episodes: int = 10000
     total_episodes: int = 10000

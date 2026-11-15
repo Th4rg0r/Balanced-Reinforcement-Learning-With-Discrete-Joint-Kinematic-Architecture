@@ -363,3 +363,79 @@ def test_agent_train_step_with_latent_ema_decay() -> None:
     agent.reanalyze_batch(num_states=2)
 
 
+def test_velocity_driven_exploration_annealing() -> None:
+    """Verifies velocity-progress exploration annealing across Agent, Balancer, and Tweaker."""
+    from config import BRLConfig
+    from brl_core.balancer import DDPGBalancer
+    from brl_core.tweaker import StochasticTweakerActorCritic
+
+    cfg = LAMCTSConfig(
+        obs_dim=12,
+        max_action_dim=4,
+        context_dim=6,
+        history_len=2,
+        k_tok=4,
+        d_model=32,
+        n_heads=2,
+        l_enc=1,
+        latent_dim=32,
+        l_dyn=1,
+        proj_dim=32,
+        pred_dim=32,
+        n_sim=4,
+        k_act=4,
+        tau_act_train=1.0,
+        tau_act_train_end=0.25,
+        root_exploration_fraction=0.30,
+        root_exploration_fraction_end=0.10,
+        min_policy_std_target=0.22,
+        min_policy_std_target_end=0.12,
+    )
+    agent = LatentActionMCTSAgent(cfg, device=torch.device("cpu"))
+
+    # Progress = 0.0 -> initial exploration parameters
+    agent.set_exploration_progress(0.0)
+    assert np.isclose(agent.get_current_tau_act_train(), 1.0)
+    assert np.isclose(agent.get_current_root_exploration_fraction(), 0.30)
+    assert np.isclose(agent.get_current_std_target(), 0.22)
+
+    # Progress = 0.5 -> midpoint interpolation
+    agent.set_exploration_progress(0.5)
+    assert np.isclose(agent.get_current_tau_act_train(), 0.625)
+    assert np.isclose(agent.get_current_root_exploration_fraction(), 0.20)
+    assert np.isclose(agent.get_current_std_target(), 0.17)
+
+    # Progress = 1.0 -> end-of-curriculum precision parameters
+    agent.set_exploration_progress(1.0)
+    assert np.isclose(agent.get_current_tau_act_train(), 0.25)
+    assert np.isclose(agent.get_current_root_exploration_fraction(), 0.10)
+    assert np.isclose(agent.get_current_std_target(), 0.12)
+
+    # Can also move back up if velocity progress decreases (clamped to [0.0, 1.0])
+    agent.set_exploration_progress(-0.2)
+    assert np.isclose(agent.exploration_progress, 0.0)
+    assert np.isclose(agent.get_current_std_target(), 0.22)
+
+    # Verify Tweaker beta_ent and Balancer noise annealing
+    brl_cfg = BRLConfig(
+        num_params=6,
+        balancer_noise_std=0.05,
+        balancer_noise_std_end=0.01,
+        beta_ent=0.01,
+        beta_ent_end=0.002,
+    )
+    tweaker = StochasticTweakerActorCritic(brl_cfg, device="cpu")
+    balancer = DDPGBalancer(brl_cfg, device="cpu")
+
+    assert np.isclose(tweaker.get_current_beta_ent(0.0), 0.01)
+    assert np.isclose(tweaker.get_current_beta_ent(0.5), 0.006)
+    assert np.isclose(tweaker.get_current_beta_ent(1.0), 0.002)
+
+    bal_state = balancer.build_state(ema_win_rate=0.5, last_win=1, dominance_score=0.5)
+    limits, budget, costs, _ = balancer.select_constraints(
+        state=bal_state, warmup=False, deterministic=False, exploration_progress=1.0
+    )
+    assert limits.shape == (6,) and costs.shape == (6,) and np.isfinite(budget)
+
+
+

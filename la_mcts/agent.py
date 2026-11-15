@@ -362,6 +362,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         )
         self._last_mcts_info: Optional[Tuple[np.ndarray, np.ndarray, float]] = None
         self._last_limb_kinematics: Optional[np.ndarray] = None
+        self.exploration_progress: float = 0.0
         self._diagnostics: Dict[str, float] = {
             "v_s0": 0.0,
             "td_error": 0.0,
@@ -370,7 +371,35 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             "policy_std": float(self.cfg.min_policy_std_target),
             "policy_entropy": 0.0,
             "exploration_scale": 1.0,
+            "exploration_progress": 0.0,
+            "effective_std_target": float(self.cfg.min_policy_std_target),
+            "effective_tau_act": float(self.cfg.tau_act_train),
         }
+
+    def set_exploration_progress(self, progress: float) -> None:
+        """Updates velocity-driven exploration progress alpha in [0, 1]."""
+        self.exploration_progress = float(np.clip(progress, 0.0, 1.0))
+        self._diagnostics["exploration_progress"] = self.exploration_progress
+        self._diagnostics["effective_std_target"] = self.get_current_std_target()
+        self._diagnostics["effective_tau_act"] = self.get_current_tau_act_train()
+
+    def get_current_std_target(self) -> float:
+        """Returns the annealed policy std floor target interpolating from start to end with velocity progress."""
+        start = float(self.cfg.min_policy_std_target)
+        end = float(getattr(self.cfg, "min_policy_std_target_end", start))
+        return float(start + self.exploration_progress * (end - start))
+
+    def get_current_tau_act_train(self) -> float:
+        """Returns the annealed training MCTS action selection temperature."""
+        start = float(self.cfg.tau_act_train)
+        end = float(getattr(self.cfg, "tau_act_train_end", start))
+        return float(start + self.exploration_progress * (end - start))
+
+    def get_current_root_exploration_fraction(self) -> float:
+        """Returns the annealed MCTS root Dirichlet noise fraction."""
+        start = float(self.cfg.root_exploration_fraction)
+        end = float(getattr(self.cfg, "root_exploration_fraction_end", start))
+        return float(start + self.exploration_progress * (end - start))
 
     def set_episode_context(
         self,
@@ -478,22 +507,30 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 root_tau_beta = None
                 root_exp_frac = None
             else:
+                std_target = self.get_current_std_target()
+                base_tau_act = self.get_current_tau_act_train()
+                base_root_exp = self.get_current_root_exploration_fraction()
                 explore_scale = 1.0
                 if self.cfg.adaptive_exploration:
                     cur_std = float(
-                        self._diagnostics.get("policy_std", self.cfg.min_policy_std_target)
+                        self._diagnostics.get("policy_std", std_target)
+                    )
+                    boost_cap = 1.0 + (float(self.cfg.exploration_boost_max) - 1.0) * (
+                        1.0 - 0.5 * self.exploration_progress
                     )
                     explore_scale = float(
                         np.clip(
-                            self.cfg.min_policy_std_target / max(cur_std, 1e-3),
+                            std_target / max(cur_std, 1e-3),
                             1.0,
-                            self.cfg.exploration_boost_max,
+                            max(1.0, boost_cap),
                         )
                     )
                 self._diagnostics["exploration_scale"] = explore_scale
-                tau_act = self.cfg.tau_act_train * explore_scale
+                self._diagnostics["effective_std_target"] = std_target
+                tau_act = base_tau_act * explore_scale
+                self._diagnostics["effective_tau_act"] = tau_act
                 root_tau_beta = self.cfg.root_tau_beta * explore_scale
-                root_exp_frac = min(0.65, self.cfg.root_exploration_fraction * explore_scale)
+                root_exp_frac = min(0.65, base_root_exp * explore_scale)
 
             chosen_action, policy_weights, root_samples, root_value, _ = (
                 self.mcts.search(
@@ -683,10 +720,11 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 _, policy_weights, root_samples, root_value, _ = self.mcts.search(
                     z_root,
                     deterministic=False,
-                    tau_act=self.cfg.tau_act_train,
+                    tau_act=self.get_current_tau_act_train(),
                     n_sim=max(16, self.cfg.n_sim // 2),
                     action_mask=mask_t,
                     limb_kinematics=kin_t,
+                    root_exploration_fraction=self.get_current_root_exploration_fraction(),
                     prev_cum_state=prev_cum_root,
                 )
                 traj.mcts_policy_samples[step] = root_samples
@@ -882,6 +920,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             c_reg=self.cfg.c_reg,
             target_backbone=self.target_backbone,
             target_projector=self.target_projector,
+            min_policy_std_target=self.get_current_std_target(),
         )
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(

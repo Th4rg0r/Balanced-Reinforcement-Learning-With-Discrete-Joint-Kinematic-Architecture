@@ -190,6 +190,7 @@ class ModelRepresentationTrainer(nn.Module):
         c_reg: float = 1e-4,
         target_backbone: Optional[SelfAttentionBackbone] = None,
         target_projector: Optional[nn.Module] = None,
+        min_policy_std_target: float = 0.22,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Computes K-step unrolled total loss with SimSiam representation consistency.
 
@@ -330,12 +331,14 @@ class ModelRepresentationTrainer(nn.Module):
             for p in backbone.parameters():
                 reg_loss = reg_loss + p.pow(2).sum()
 
-        # Entropy regularization on root policy: encourage peak diversity while keeping std in [0.35, 0.55]
+        # Entropy regularization on root policy: encourage peak diversity while keeping std near [std_floor, std_ceil]
         policy_entropy, peak_entropy, mean_policy_std = actor_head.entropy_proxy(
             cum_0, limb_kinematics=kin_0, action_mask=action_mask
         )
-        std_floor_bonus = -F.relu(0.40 - mean_policy_std).mean() * 5.0
-        std_ceil_penalty = F.relu(mean_policy_std - 0.55).pow(2).mean() * 5.0
+        std_floor = max(0.05, float(min_policy_std_target))
+        std_ceil = max(std_floor + 0.15, 0.45)
+        std_floor_bonus = -F.relu(std_floor - mean_policy_std).mean() * 5.0
+        std_ceil_penalty = F.relu(mean_policy_std - std_ceil).pow(2).mean() * 5.0
         loss_ent = peak_entropy.mean() + std_floor_bonus - std_ceil_penalty
 
         total_loss = (

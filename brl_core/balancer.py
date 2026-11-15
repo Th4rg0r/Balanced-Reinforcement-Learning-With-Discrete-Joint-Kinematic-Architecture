@@ -272,6 +272,7 @@ class DDPGBalancer(nn.Module):
         state: np.ndarray,
         warmup: bool = False,
         deterministic: bool = False,
+        exploration_progress: float = 0.0,
     ) -> Tuple[np.ndarray, float, np.ndarray, np.ndarray]:
         """Emits (L_e, B_e, C_e, raw_action) for episode e."""
         if warmup:
@@ -291,9 +292,14 @@ class DDPGBalancer(nn.Module):
             ).unsqueeze(0)
             raw_act = self.actor(s_t).squeeze(0).cpu().numpy()
 
-        if not deterministic and self.cfg.balancer_noise_std > 0.0:
+        prog = float(np.clip(exploration_progress, 0.0, 1.0))
+        noise_start = float(self.cfg.balancer_noise_std)
+        noise_end = float(getattr(self.cfg, "balancer_noise_std_end", noise_start))
+        eff_noise_std = noise_start + prog * (noise_end - noise_start)
+
+        if not deterministic and eff_noise_std > 0.0:
             noise = np.random.normal(
-                0.0, self.cfg.balancer_noise_std, size=raw_act.shape
+                0.0, eff_noise_std, size=raw_act.shape
             ).astype(np.float32)
             raw_act = np.clip(raw_act + noise, 0.01, 0.99)
 
