@@ -211,13 +211,13 @@ def test_actuator_weakening_scales_linearly() -> None:
 
 
 def test_fixed_smoothness_and_velocity_curriculum_reward_blending() -> None:
-    """Verifies fixed smoothness coef, 1000-step gated target_vel curriculum, current_vel shift toward 6.0 m/s, and no upside-down penalty."""
+    """Verifies fixed smoothness coef, 1000-step gated rolling 20 raw-return curriculum (0-1000 torque, 0-3000 exploration), and no upside-down penalty."""
     wrapper = MorphologicalAntBRLWrapper(
         max_action_capacity=12,
         fixed_action_space=True,
         action_smoothness_coef=0.15,
-        benchmark_vel_ref=6.0,
-        vel_std_threshold=0.15,
+        torque_return_ref=1000.0,
+        exploration_return_ref=3000.0,
         vel_shift_factor=3000.0,
     )
     try:
@@ -226,62 +226,74 @@ def test_fixed_smoothness_and_velocity_curriculum_reward_blending() -> None:
         wrapper.set_total_env_steps(500000)
         assert wrapper.get_current_smoothness_coef() == pytest.approx(0.15, abs=1e-9)
 
-        # 2. Episodes shorter than 1000 steps or unhealthy must NOT update target_vel or enter history
-        wrapper.update_velocity_curriculum(2.0, ep_steps=500, required_steps=1000, terminated_unhealthy=False)
-        wrapper.update_velocity_curriculum(2.5, ep_steps=1000, required_steps=1000, terminated_unhealthy=True)
-        assert len(wrapper._recent_ep_velocities) == 0
-        assert wrapper.target_vel == 0.0
+        # 2. Episodes shorter than 1000 steps or unhealthy must NOT update target_return or enter history
+        wrapper.update_return_curriculum(800.0, ep_steps=500, required_steps=1000, terminated_unhealthy=False)
+        wrapper.update_return_curriculum(900.0, ep_steps=1000, required_steps=1000, terminated_unhealthy=True)
+        assert len(wrapper._recent_ep_returns) == 0
+        assert wrapper.target_return == 0.0
 
-        # 3. Rolling 20-episode mean of full 1000-step episodes -> target_vel = mean(rolling window up to 20)
-        wrapper.update_velocity_curriculum(1.50, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
-        wrapper.update_velocity_curriculum(1.55, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
-        wrapper.update_velocity_curriculum(1.65, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
-        wrapper.update_velocity_curriculum(1.70, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
-        assert len(wrapper._recent_ep_velocities) == 4
-        assert wrapper.target_vel == pytest.approx(1.60, abs=1e-6)
+        # 3. Rolling 20-episode mean of full 1000-step episodes -> target_return = mean(rolling window up to 20)
+        wrapper.update_return_curriculum(500.0, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        wrapper.update_return_curriculum(550.0, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        wrapper.update_return_curriculum(650.0, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        wrapper.update_return_curriculum(700.0, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        assert len(wrapper._recent_ep_returns) == 4
+        assert wrapper.target_return == pytest.approx(600.0, abs=1e-6)
 
-        # 4. Adding a higher velocity episode continues to take the simple rolling mean (up to 20 episodes)
-        wrapper.update_velocity_curriculum(3.00, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
-        # [1.50, 1.55, 1.65, 1.70, 3.00] -> mean is 1.88
-        assert wrapper.target_vel == pytest.approx(1.88, abs=1e-6)
+        # 4. Adding a higher return episode continues to take the simple rolling mean (up to 20 episodes)
+        wrapper.update_return_curriculum(1500.0, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        # [500, 550, 650, 700, 1500] -> mean is 780.0
+        assert wrapper.target_return == pytest.approx(780.0, abs=1e-6)
 
-        # 5. Each step shifts current_vel toward target_vel by target_vel / 3000 and scales only the smoothness penalty
+        # 5. Each step shifts current_return toward target_return by target_return / 3000;
+        #    torque/smoothness scales over 0..1000 and exploration scales over 0..3000
         wrapper.reset(seed=42)
-        expected_step_shift = 1.88 / 3000.0
+        expected_step_shift = 780.0 / 3000.0
         _, rew, _, _, info_step = wrapper.step(np.ones(12, dtype=np.float32) * 0.5)
-        assert wrapper.current_vel == pytest.approx(expected_step_shift, abs=1e-7)
-        alpha = expected_step_shift / 6.0
-        assert info_step["reward_blend_alpha"] == pytest.approx(alpha, abs=1e-7)
-        expected_rew = (1.0 - alpha) * info_step["custom_reward"] + alpha * info_step["raw_env_reward"]
+        assert wrapper.current_return == pytest.approx(expected_step_shift, abs=1e-7)
+        alpha_torque = expected_step_shift / 1000.0
+        alpha_explore = expected_step_shift / 3000.0
+        assert info_step["reward_blend_alpha"] == pytest.approx(alpha_torque, abs=1e-7)
+        assert info_step["exploration_progress"] == pytest.approx(alpha_explore, abs=1e-7)
+        expected_rew = (1.0 - alpha_torque) * info_step["custom_reward"] + alpha_torque * info_step["raw_env_reward"]
         assert rew == pytest.approx(expected_rew, abs=1e-5)
         assert not info_step["upside_down_terminated"]
 
-        # 6. action_ema_alpha (0.8) converges linearly to 1.0 as current_vel approaches 6.0 m/s
-        assert info_step["action_ema_alpha"] == pytest.approx(0.8 + alpha * 0.2, abs=1e-7)
-        wrapper.current_vel = 0.0
+        # 6. action_ema_alpha (0.8) converges linearly to 1.0 as current_return approaches 1000.0,
+        #    while exploration_progress converges to 1.0 as current_return approaches 3000.0
+        assert info_step["action_ema_alpha"] == pytest.approx(0.8 + alpha_torque * 0.2, abs=1e-7)
+        wrapper.current_return = 0.0
         assert wrapper.get_current_action_ema_alpha() == pytest.approx(0.8, abs=1e-7)
-        wrapper.current_vel = 3.0
+        assert wrapper.get_exploration_progress() == pytest.approx(0.0, abs=1e-7)
+        wrapper.current_return = 500.0
         assert wrapper.get_current_action_ema_alpha() == pytest.approx(0.9, abs=1e-7)
-        wrapper.current_vel = 6.0
+        assert wrapper.get_exploration_progress() == pytest.approx(500.0 / 3000.0, abs=1e-7)
+        wrapper.current_return = 1000.0
+        assert wrapper.get_reward_blend_alpha() == pytest.approx(1.0, abs=1e-7)
         assert wrapper.get_current_action_ema_alpha() == pytest.approx(1.0, abs=1e-7)
+        assert wrapper.get_exploration_progress() == pytest.approx(1.0 / 3.0, abs=1e-7)
+        wrapper.current_return = 3000.0
+        assert wrapper.get_reward_blend_alpha() == pytest.approx(1.0, abs=1e-7)
+        assert wrapper.get_exploration_progress() == pytest.approx(1.0, abs=1e-7)
 
-        # 7. Negative velocities clamp to 0.0 for curriculum / torque-penalty control, and rolling 20 window caps at 20
-        wrapper._recent_ep_velocities.clear()
-        wrapper.target_vel = 0.0
-        wrapper.current_vel = 0.0
-        wrapper.update_velocity_curriculum(-1.5, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
-        wrapper.update_velocity_curriculum(0.3, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
-        wrapper.update_velocity_curriculum(0.3, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
-        wrapper.update_velocity_curriculum(0.3, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
-        assert list(wrapper._recent_ep_velocities) == pytest.approx([0.0, 0.3, 0.3, 0.3], abs=1e-7)
-        assert wrapper.target_vel == pytest.approx(0.225, abs=1e-6)
-        # Fill 20 episodes with 0.05 -> rolling 20 mean becomes 0.05
+        # 7. Negative returns clamp to 0.0 for curriculum / torque-penalty control, and rolling 20 window caps at 20
+        wrapper._recent_ep_returns.clear()
+        wrapper.target_return = 0.0
+        wrapper.current_return = 0.0
+        wrapper.update_return_curriculum(-450.0, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        wrapper.update_return_curriculum(300.0, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        wrapper.update_return_curriculum(300.0, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        wrapper.update_return_curriculum(300.0, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        assert list(wrapper._recent_ep_returns) == pytest.approx([0.0, 300.0, 300.0, 300.0], abs=1e-7)
+        assert wrapper.target_return == pytest.approx(225.0, abs=1e-6)
+        # Fill 20 episodes with 50.0 -> rolling 20 mean becomes 50.0
         for _ in range(20):
-            wrapper.update_velocity_curriculum(0.05, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
-        assert len(wrapper._recent_ep_velocities) == 20
-        assert wrapper.target_vel == pytest.approx(0.05, abs=1e-6)
-        wrapper.current_vel = -0.5
+            wrapper.update_return_curriculum(50.0, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        assert len(wrapper._recent_ep_returns) == 20
+        assert wrapper.target_return == pytest.approx(50.0, abs=1e-6)
+        wrapper.current_return = -200.0
         assert wrapper.get_reward_blend_alpha() == pytest.approx(0.0, abs=1e-7)
+        assert wrapper.get_exploration_progress() == pytest.approx(0.0, abs=1e-7)
         assert wrapper.get_current_action_ema_alpha() == pytest.approx(0.8, abs=1e-7)
     finally:
         wrapper.close()

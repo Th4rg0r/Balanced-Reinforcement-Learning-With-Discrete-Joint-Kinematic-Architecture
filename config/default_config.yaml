@@ -98,6 +98,8 @@ ant_morph:
   action_smoothness_coef: 0.06 # smoothness 0.06
   action_smoothness_end_step: 500000
   benchmark_vel_ref: 0.20
+  torque_return_ref: 1000.0
+  exploration_return_ref: 3000.0
   vel_std_threshold: 0.20
   vel_shift_factor: 5000.0
   upside_down_time_limit: 0.0

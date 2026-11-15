@@ -45,6 +45,8 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         action_smoothness_end_step: int = 500000,
         action_smoothness_log_shape: float = 10.0,
         benchmark_vel_ref: float = 6.0,
+        torque_return_ref: float = 1000.0,
+        exploration_return_ref: float = 3000.0,
         vel_std_threshold: float = 0.15,
         vel_shift_factor: float = 3000.0,
         upside_down_time_limit: float = 0.0,
@@ -78,13 +80,16 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self.action_smoothness_end_step = int(action_smoothness_end_step)
         self.action_smoothness_log_shape = max(1e-6, float(action_smoothness_log_shape))
         self.benchmark_vel_ref = max(1e-6, float(benchmark_vel_ref))
+        self.torque_return_ref = max(1e-6, float(torque_return_ref))
+        self.exploration_return_ref = max(1e-6, float(exploration_return_ref))
         self.vel_std_threshold = max(0.0, float(vel_std_threshold))
         self.vel_shift_factor = max(1.0, float(vel_shift_factor))
         self.upside_down_time_limit = max(0.0, float(upside_down_time_limit))
         self.upside_down_penalty = max(0.0, float(upside_down_penalty))
-        self._recent_ep_velocities: Deque[float] = deque(maxlen=20)
-        self.target_vel: float = 0.0
-        self.current_vel: float = 0.0
+        self._recent_ep_returns: Deque[float] = deque(maxlen=20)
+        self._recent_ep_velocities: Deque[float] = self._recent_ep_returns
+        self._target_return: float = 0.0
+        self._current_return: float = 0.0
         self._eval_mode: bool = False
         self.total_env_steps: int = 0
         self.canonical_obs_dim = 105 if self.use_contact_forces else 27
@@ -439,19 +444,58 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         """Synchronizes global training step counter."""
         self.total_env_steps = max(0, int(total_env_steps))
 
+    @property
+    def target_return(self) -> float:
+        return self._target_return
+
+    @target_return.setter
+    def target_return(self, val: float) -> None:
+        self._target_return = float(val)
+
+    @property
+    def current_return(self) -> float:
+        return self._current_return
+
+    @current_return.setter
+    def current_return(self, val: float) -> None:
+        self._current_return = float(val)
+
+    @property
+    def target_vel(self) -> float:
+        return self._target_return
+
+    @target_vel.setter
+    def target_vel(self, val: float) -> None:
+        self._target_return = float(val)
+
+    @property
+    def current_vel(self) -> float:
+        return self._current_return
+
+    @current_vel.setter
+    def current_vel(self, val: float) -> None:
+        self._current_return = float(val)
+
     def get_current_smoothness_coef(self) -> float:
         """Returns the fixed action smoothness penalty coefficient (scaled via custom-to-raw reward blend)."""
         return max(0.0, float(self.action_smoothness_coef))
 
     def get_reward_blend_alpha(self) -> float:
-        """Returns the current interpolation weight in [0, 1] for raw Ant-v5 reward vs. custom reward."""
-        pos_vel = max(0.0, float(self.current_vel))
+        """Returns the torque/smoothness interpolation weight in [0, 1] scaled over 0 -> torque_return_ref (1000)."""
+        pos_ret = max(0.0, float(self._current_return))
         return float(
-            np.clip(pos_vel / max(self.benchmark_vel_ref, 1e-6), 0.0, 1.0)
+            np.clip(pos_ret / max(self.torque_return_ref, 1e-6), 0.0, 1.0)
+        )
+
+    def get_exploration_progress(self) -> float:
+        """Returns the exploration annealing progress in [0, 1] scaled over 0 -> exploration_return_ref (3000)."""
+        pos_ret = max(0.0, float(self._current_return))
+        return float(
+            np.clip(pos_ret / max(self.exploration_return_ref, 1e-6), 0.0, 1.0)
         )
 
     def get_current_action_ema_alpha(self) -> float:
-        """Returns the effective action EMA alpha interpolating linearly from action_ema_alpha to 1.0 with velocity progress."""
+        """Returns the effective action EMA alpha interpolating linearly from action_ema_alpha to 1.0 over 0 -> 1000 return."""
         blend = self.get_reward_blend_alpha()
         return float(
             np.clip(
@@ -461,6 +505,27 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             )
         )
 
+    def update_return_curriculum(
+        self,
+        ep_return: float,
+        ep_steps: int = 1000,
+        required_steps: int = 1000,
+        terminated_unhealthy: bool = False,
+    ) -> Tuple[float, float]:
+        """Updates target_return as the rolling 20-episode mean of full (1000-step) episodes' raw returns.
+
+        Only episodes that reach `required_steps` (default 1000) without unhealthy termination
+        are recorded and used to update `target_return`. Negative episode returns are clamped to
+        0.0 so `target_return` can move up or down with the rolling 20-episode mean, never below 0.0.
+        """
+        if int(ep_steps) < int(required_steps) or bool(terminated_unhealthy):
+            return self._target_return, self._current_return
+        clamped_ret = max(0.0, float(ep_return))
+        self._recent_ep_returns.append(clamped_ret)
+        vals = np.maximum(0.0, np.asarray(self._recent_ep_returns, dtype=np.float64))
+        self._target_return = max(0.0, float(np.mean(vals))) if len(vals) > 0 else 0.0
+        return self._target_return, self._current_return
+
     def update_velocity_curriculum(
         self,
         ep_vel: float,
@@ -468,20 +533,13 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         required_steps: int = 1000,
         terminated_unhealthy: bool = False,
     ) -> Tuple[float, float]:
-        """Updates target_vel as the rolling 20-episode mean of full (1000-step) episodes' forward velocities (m/s).
-
-        Only episodes that reach `required_steps` (default 1000) without unhealthy termination
-        are recorded and used to update `target_vel`. Negative episode velocities are clamped to
-        0.0 for curriculum / torque-penalty control so `target_vel` can move up or down with
-        the rolling 20-episode mean, never below 0.0.
-        """
-        if int(ep_steps) < int(required_steps) or bool(terminated_unhealthy):
-            return self.target_vel, self.current_vel
-        clamped_vel = max(0.0, float(ep_vel))
-        self._recent_ep_velocities.append(clamped_vel)
-        vals = np.maximum(0.0, np.asarray(self._recent_ep_velocities, dtype=np.float64))
-        self.target_vel = max(0.0, float(np.mean(vals))) if len(vals) > 0 else 0.0
-        return self.target_vel, self.current_vel
+        """Alias for update_return_curriculum for backward compatibility."""
+        return self.update_return_curriculum(
+            ep_return=ep_vel,
+            ep_steps=ep_steps,
+            required_steps=required_steps,
+            terminated_unhealthy=terminated_unhealthy,
+        )
 
     def reset(
         self,
@@ -670,10 +728,12 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         upside_down_terminated = False
         if self._eval_mode:
             blend_alpha = 1.0
+            exploration_progress = 1.0
             agent_reward = raw_env_reward
             reward = raw_env_reward
         else:
             blend_alpha = self.get_reward_blend_alpha()
+            exploration_progress = self.get_exploration_progress()
             agent_reward = raw_env_reward - (1.0 - blend_alpha) * smooth_penalty
             reward = agent_reward
 
@@ -720,6 +780,9 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         info["custom_reward"] = float(custom_reward)
         info["agent_reward"] = float(agent_reward)
         info["reward_blend_alpha"] = float(blend_alpha)
+        info["exploration_progress"] = float(exploration_progress)
+        info["target_return"] = float(self.target_return)
+        info["current_return"] = float(self.current_return)
         info["target_vel"] = float(self.target_vel)
         info["current_vel"] = float(self.current_vel)
         info["upside_down_time"] = float(self._upside_down_time)
@@ -741,6 +804,9 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             "raw_episode_return": float(self._ep_raw_return),
             "agent_episode_return": float(self._ep_agent_return),
             "reward_blend_alpha": float(blend_alpha),
+            "exploration_progress": float(exploration_progress),
+            "target_return": float(self.target_return),
+            "current_return": float(self.current_return),
             "target_vel": float(self.target_vel),
             "current_vel": float(self.current_vel),
             "upside_down_terminated": bool(upside_down_terminated),

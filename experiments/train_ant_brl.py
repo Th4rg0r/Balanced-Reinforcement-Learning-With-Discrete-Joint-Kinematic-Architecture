@@ -242,6 +242,12 @@ def save_training_checkpoint(
             "episodes_evaluated": int(orchestrator.win_evaluator.episodes_evaluated),
         },
         "vel_curriculum": {
+            "mode": "return",
+            "target_return": float(getattr(orchestrator.env, "target_return", 0.0)),
+            "current_return": float(getattr(orchestrator.env, "current_return", 0.0)),
+            "recent_ep_returns": list(
+                getattr(orchestrator.env, "_recent_ep_returns", [])
+            ),
             "target_vel": float(getattr(orchestrator.env, "target_vel", 0.0)),
             "current_vel": float(getattr(orchestrator.env, "current_vel", 0.0)),
             "recent_ep_velocities": list(
@@ -441,6 +447,8 @@ def run_single_seed(
         action_smoothness_end_step=sys_cfg.ant_morph.action_smoothness_end_step,
         action_smoothness_log_shape=sys_cfg.ant_morph.action_smoothness_log_shape,
         benchmark_vel_ref=sys_cfg.ant_morph.benchmark_vel_ref,
+        torque_return_ref=sys_cfg.ant_morph.torque_return_ref,
+        exploration_return_ref=sys_cfg.ant_morph.exploration_return_ref,
         vel_std_threshold=sys_cfg.ant_morph.vel_std_threshold,
         vel_shift_factor=sys_cfg.ant_morph.vel_shift_factor,
         upside_down_time_limit=sys_cfg.ant_morph.upside_down_time_limit,
@@ -535,12 +543,23 @@ def run_single_seed(
 
             if "vel_curriculum" in payload:
                 vc_d = payload["vel_curriculum"]
-                env.target_vel = max(0.0, float(vc_d.get("target_vel", env.target_vel)))
-                env.current_vel = max(0.0, float(vc_d.get("current_vel", env.current_vel)))
-                if "recent_ep_velocities" in vc_d:
-                    env._recent_ep_velocities.clear()
-                    for v_item in vc_d["recent_ep_velocities"]:
-                        env._recent_ep_velocities.append(max(0.0, float(v_item)))
+                if vc_d.get("mode") == "return" or "recent_ep_returns" in vc_d:
+                    env.target_return = max(0.0, float(vc_d.get("target_return", env.target_return)))
+                    env.current_return = max(0.0, float(vc_d.get("current_return", env.current_return)))
+                    if "recent_ep_returns" in vc_d:
+                        env._recent_ep_returns.clear()
+                        for r_item in vc_d["recent_ep_returns"]:
+                            env._recent_ep_returns.append(max(0.0, float(r_item)))
+                elif "balancer_meta" in payload and "recent_returns" in payload["balancer_meta"]:
+                    # Migrate legacy velocity checkpoint using saved recent_returns from balancer_meta
+                    rec_rets = [max(0.0, float(r)) for r in payload["balancer_meta"]["recent_returns"]]
+                    env._recent_ep_returns.clear()
+                    for r_item in rec_rets[-20:]:
+                        env._recent_ep_returns.append(r_item)
+                    if len(env._recent_ep_returns) > 0:
+                        mean_r = float(np.mean(env._recent_ep_returns))
+                        env.target_return = max(0.0, mean_r)
+                        env.current_return = max(0.0, mean_r)
 
             if "balancer_meta" in payload:
                 bm = payload["balancer_meta"]
