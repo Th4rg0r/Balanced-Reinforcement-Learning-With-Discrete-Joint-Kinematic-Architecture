@@ -3,7 +3,7 @@
 This document provides a comprehensive reference for every configuration parameter in [`config/default_config.yaml`](default_config.yaml). The parameters are grouped into four primary subsystems:
 1. **`la_mcts`**: Generic Latent-Action Monte Carlo Tree Search, Transformer World Model, and Categorical Value Critic.
 2. **`brl`**: Balanced Reinforcement Learning Tri-Agent Curriculum (Agent, Tweaker, Balancer).
-3. **`ant_morph`**: Morphological MuJoCo Ant Environment and Dynamic XML Engine.
+3. **`ant_morph`**: Morphological MuJoCo Ant Environment, Dynamic XML Engine, and Rolling Raw-Return Curriculum.
 4. **`run`**: Experiment Execution, Parallelism, and Hardware Resource Allocation.
 
 ---
@@ -61,25 +61,29 @@ This document provides a comprehensive reference for every configuration paramet
   - All recurrent tree unrolls happen in this latent space without simulating raw MuJoCo physics.
   - Should match `d_model` to avoid bottlenecking information transfer between the representation and dynamics networks.
 
-#### `history_len`
-- **Type**: `int` | **Default**: `8`
-- **Purpose**: Temporal frame-stack horizon. The Transformer ingests a sliding window of past $(o_{t-H:t}, a_{t-H:t})$ transitions.
-- **Training Impact**:
-  - **Higher**: Enables robust system identification under noisy or delayed sensors (e.g., estimating leg mass and friction parameters from motion history). Increases memory footprint in replay buffer.
-  - **Lower**: Struggles to disambiguate unobserved physical parameters (e.g. slippery ice vs. weak actuators) from instantaneous states.
-
 #### `context_dim`
 - **Type**: `int` | **Default**: `18`
 - **Purpose**: Dimensionality of the perceived context/tweak vector $w_{\text{ctx}} \in \mathbb{R}^{18}$ appended to the state representation.
 - **Training Impact**:
   - Must match `brl.num_params`. Informs the Transformer of current body scale distortions and environmental perturbations.
 
+#### `history_len`
+- **Type**: `int` | **Default**: `6`
+- **Purpose**: Temporal frame-stack horizon. The Transformer ingests a sliding window of past $(o_{t-H:t}, a_{t-H:t})$ transitions.
+- **Training Impact**:
+  - **Higher**: Enables robust system identification under noisy or delayed sensors (e.g., estimating leg mass and friction parameters from motion history). Increases memory footprint in replay buffer.
+  - **Lower**: Struggles to disambiguate unobserved physical parameters (e.g. slippery ice vs. weak actuators) from instantaneous states.
+
+#### `latent_ema_decay`
+- **Type**: `float` | **Default**: `0.4`
+- **Purpose**: Exponential moving average weight $\alpha \in [0, 1]$ used to blend cumulative historical latent representations ($z^{\text{cum}}_t = \text{norm}(z_t + \alpha z^{\text{cum}}_{t-1})$) for Actor and Critic readout while keeping latent dynamics transitions un-smeared ($z_t \to z_{t+1}$).
+
 ---
 
 ### 1.2 Policy Prior & Latent Action Space
 
 #### `num_peaks`
-- **Type**: `int` | **Default**: `6`
+- **Type**: `int` | **Default**: `4`
 - **Purpose**: Number of Gaussian mixture modes in the Latent-Action policy prior network $p_\theta(a \mid s)$.
 - **Training Impact**:
   - Locomotion often features multiple discrete gaits (trot, gallop, crawl, turn left, turn right). A multi-modal mixture of Gaussians prevents mode averaging (where the policy would output zero torque trying to average left and right turns).
@@ -87,11 +91,11 @@ This document provides a comprehensive reference for every configuration paramet
   - **Lower (e.g. 1)**: Collapses to a single unimodal Gaussian, which can cause policy stagnation in complex obstacle or terrain traversal.
 
 #### `log_std_bounds`
-- **Type**: `list[float]` | **Default**: `[-3.0, 2.0]`
-- **Purpose**: Clamping bounds $[\log \sigma_{\min}, \log \sigma_{\max}]$ applied to the predicted Gaussian standard deviations ($\sigma \in [e^{-3}, e^2] \approx [0.05, 7.39]$).
+- **Type**: `list[float]` | **Default**: `[-1.8, 0.25]`
+- **Purpose**: Clamping bounds $[\log \sigma_{\min}, \log \sigma_{\max}]$ applied to the predicted Gaussian standard deviations ($\sigma \in [e^{-1.8}, e^{0.25}] \approx [0.165, 1.284]$).
 - **Training Impact**:
-  - **Lower bound (-3.0)**: Prevents the policy covariance from collapsing to zero, which would cause infinite log-likelihood penalties and numerical instability.
-  - **Upper bound (2.0)**: Prevents unbounded variance and pure noise action sampling.
+  - **Lower bound (-1.8)**: Prevents premature covariance collapse while allowing low-noise precision gaits as the agent speeds up.
+  - **Upper bound (0.25)**: Prevents excessive Gaussian action jitter during multi-step locomotion.
 
 ---
 
@@ -123,16 +127,20 @@ This document provides a comprehensive reference for every configuration paramet
 - **Type**: `float` | **Default**: `0.99`
 - **Purpose**: Temporal discount factor $\gamma \in [0, 1)$ for future rewards: $G_t = \sum_{k=0}^\infty \gamma^k r_{t+k}$.
 - **Training Impact**:
-  - Effective planning horizon is $1 / (1 - \gamma) = 100$ simulation steps ($\approx 3.3$ seconds).
+  - Effective planning horizon is $1 / (1 - \gamma) = 100$ simulation steps ($\approx 5.0$ seconds at $\Delta t = 0.05$s).
   - **Higher (e.g. 0.995)**: Encourages long-term forward velocity and energy preservation, but increases value variance.
   - **Lower (e.g. 0.95)**: Focuses myopically on immediate balance; may sacrifice forward progress to avoid falling in the next 10 steps.
 
 #### `td_steps`
 - **Type**: `int` | **Default**: `5`
-- **Purpose**: Multi-step bootstrapping horizon for TD target targets: $z_t = \sum_{i=0}^{k-1} \gamma^i r_{t+i} + \gamma^k V(s_{t+k})$.
+- **Purpose**: Multi-step bootstrapping horizon for TD target values: $z_t = \sum_{i=0}^{k-1} \gamma^i r_{t+i} + \gamma^k V(s_{t+k})$.
 - **Training Impact**:
   - **Higher (e.g. 10)**: Lower value bias, but higher variance due to environment stochasticity.
   - **Lower (e.g. 1)**: Classic TD(0); low variance but slow propagation of sparse distal rewards. 5 steps is the canonical sweet spot for continuous locomotion.
+
+#### `target_tau`
+- **Type**: `float` | **Default**: `0.01`
+- **Purpose**: Polyak EMA update rate ($\theta^- \leftarrow (1 - \tau)\theta^- + \tau\theta$) for the Agent's target backbone, target critic head, and target SimSiam projector.
 
 ---
 
@@ -142,7 +150,7 @@ This document provides a comprehensive reference for every configuration paramet
 - **Type**: `int` | **Default**: `3`
 - **Purpose**: Layer depth of the recurrent latent dynamics MLP $g_\theta(s_t, a_t) \to (\hat{s}_{t+1}, \hat{r}_t)$.
 - **Training Impact**:
-  - Must accurately model nonlinear contact mechanics, ground collisions, and friction. 3 layers with residual skip connections provides adequate expressive capacity without vanishing gradients across unroll steps.
+  - Must accurately model nonlinear contact mechanics, ground collisions, and friction. 3 FiLM residual blocks provide expressive capacity without vanishing gradients across unroll steps.
 
 #### `proj_dim` and `pred_dim`
 - **Type**: `int` | **Default**: `proj_dim: 512`, `pred_dim: 256`
@@ -155,84 +163,73 @@ This document provides a comprehensive reference for every configuration paramet
 - **Purpose**: Number of consecutive future latent steps unrolled during training from replay buffer trajectories.
 - **Training Impact**:
   - Forces the dynamics model $g_\theta$ to remain accurate over multi-step trajectory rollouts, preventing compounding error during MCTS planning.
-  - **Higher**: Improves long-horizon planning accuracy, but increases GPU memory and backpropagation time.
 
-#### `lambda_rep`, `lambda_v`, `lambda_r`, `lambda_p`, `beta_mse`
+#### `lambda_rep`, `beta_mse`, `lambda_v`, `lambda_r`, `lambda_p`, `lambda_ent`
 - **Type**: `float`
 - **Defaults**:
   - `lambda_rep: 2.0`: Weight of the self-supervised latent representation consistency loss.
+  - `beta_mse: 1.0`: Stop-gradient MSE weight inside the hybrid SimSiam cosine + MSE consistency loss.
   - `lambda_v: 0.5`: Weight of the value critic loss.
   - `lambda_r: 1.0`: Weight of the step reward prediction loss.
-  - `lambda_p: 1.0`: Weight of the policy prior cross-entropy loss against MCTS search policy $\pi_{\text{mcts}}$.
-  - `beta_mse: 1.0`: Value loss scale multiplier.
+  - `lambda_p: 0.25`: Weight of the policy prior cross-entropy loss against MCTS search policy $\pi_{\text{mcts}}$.
+  - `lambda_ent: 0.015`: Weight of the policy peak diversity and standard-deviation floor/ceiling regularization bonus.
 - **Training Impact**:
   - Balanced multi-task loss objective:
-    $$\mathcal{L}_{\text{total}} = \lambda_p \mathcal{L}_{\text{policy}} + \lambda_v \mathcal{L}_{\text{value}} + \lambda_r \mathcal{L}_{\text{reward}} + \lambda_{\text{rep}} \mathcal{L}_{\text{rep}} + c_{\text{reg}} \|\theta\|_2^2$$
-  - Increasing `lambda_rep` tightens latent dynamics alignment; increasing `lambda_p` speeds up distillation of MCTS search results into the fast policy prior.
+    $$\mathcal{L}_{\text{total}} = \lambda_p \mathcal{L}_{\text{policy}} + \lambda_v \mathcal{L}_{\text{value}} + \lambda_r \mathcal{L}_{\text{reward}} + \lambda_{\text{rep}} \mathcal{L}_{\text{rep}} - \lambda_{\text{ent}} \mathcal{L}_{\text{ent}} + c_{\text{reg}} \|\theta\|_2^2$$
 
 #### `c_reg`
 - **Type**: `float` | **Default**: `0.0001` ($10^{-4}$)
 - **Purpose**: $L_2$ weight decay regularization penalty applied across network parameters.
-- **Training Impact**:
-  - Prevents weight explosion in high-dimensional Transformer and MLP layers over 3,000 training episodes.
 
 ---
 
-### 1.5 MCTS Tree Search & Action Selection
+### 1.5 MCTS Tree Search & Exploration Annealing
+
+Exploration in LA-MCTS is dynamically annealed using the environment's **rolling 20-episode raw return** over `0 -> exploration_return_ref` (`3000.0`), via progress $\alpha_{\text{explore}} = \text{clip}(\text{current\_return} / 3000.0, 0.0, 1.0)$.
 
 #### `n_sim` and `n_sim_eval`
 - **Type**: `int` | **Default**: `n_sim: 32`, `n_sim_eval: 64`
 - **Purpose**: Number of MCTS simulation trajectories executed per environment step during training (`n_sim`) and evaluation (`n_sim_eval`).
 - **Training Impact**:
-  - **Higher**: Deeper and broader search tree; significantly improves action quality and stability over complex terrain. However, runtime scales linearly with simulation count.
   - **Training (32)**: Exact multiple of `batch_leaf_eval = 16` (2 GPU batches per step), maximizing wall-clock throughput while preserving strong tree planning.
   - **Eval (64)**: 4 GPU batches during evaluation to extract maximum performance from the learned world model.
 
 #### `k_act`
 - **Type**: `int` | **Default**: `16`
 - **Purpose**: Number of candidate continuous actions sampled from the policy prior $p(a \mid s)$ when expanding a tree node.
-- **Training Impact**:
-  - Continuous action spaces cannot be exhaustively expanded. $k_{\text{act}} = 24$ candidates cover diverse gait variations.
-  - **Higher**: Discovers better candidate actions at the cost of branching factor and memory.
-  - **Lower (e.g. 8)**: Risks missing good recovery actions when the robot is perturbed.
 
 #### `c_1` and `c_2`
-- **Type**: `float` | **Default**: `c_1: 1.25`, `c_2: 19652.0`
+- **Type**: `float` | **Default**: `c_1: 1.50`, `c_2: 19652.0`
 - **Purpose**: Hyperparameters governing the polynomial upper confidence bound (pUCT) exploration bonus:
   $$U(s, a) = P(s, a) \cdot \frac{\sqrt{\sum_b N(s, b)}}{1 + N(s, a)} \cdot \left(c_1 + \log\left(\frac{\sum_b N(s, b) + c_2 + 1}{c_2}\right)\right)$$
-- **Training Impact**:
-  - `c_1` sets base exploration weight.
-  - `c_2` slowly increases exploration bonus as visit counts grow into the tens of thousands, preventing premature tree convergence.
-
-#### `root_dirichlet_alpha` and `root_exploration_fraction`
-- **Type**: `float` | **Default**: `root_dirichlet_alpha: 0.3`, `root_exploration_fraction: 0.25`
-- **Purpose**: Injects Dirichlet noise $\text{Dir}(\alpha)$ into the root node policy prior:
-  $$P(s_{\text{root}}, a) = (1 - \epsilon) p(a \mid s_{\text{root}}) + \epsilon \cdot \eta_a, \quad \eta \sim \text{Dir}(\alpha)$$
-- **Training Impact**:
-  - Ensures the tree search explores alternative branches from the current state even if the policy prior has high confidence in one mode.
-  - Crucial during early training to discover locomotion gaits.
 
 #### `root_tau_beta` and `inner_tau_beta`
-- **Type**: `float` | **Default**: `root_tau_beta: 1.25`, `inner_tau_beta: 1.0`
-- **Purpose**: Softmax temperature applied when sampling continuous actions from candidate proposal distributions at root vs. interior nodes.
-- **Training Impact**:
-  - Higher temperature at the root ($1.25$) diversifies sampled action candidates; interior nodes ($1.0$) follow tighter policy sampling.
+- **Type**: `float` | **Default**: `root_tau_beta: 1.0`, `inner_tau_beta: 0.8`
+- **Purpose**: Softmax/proposal temperature applied when sampling continuous actions from the GMM actor at the root node (`1.0`) vs. interior tree nodes (`0.8`).
 
-#### `tau_act_train` and `tau_act_eval`
-- **Type**: `float` | **Default**: `tau_act_train: 1.0`, `tau_act_eval: 0.05`
-- **Purpose**: Temperature used when selecting the executed environment action from root visit counts:
-  $$\pi(a \mid s_{\text{root}}) \propto N(s_{\text{root}}, a)^{1 / \tau_{\text{act}}}$$
-- **Training Impact**:
-  - **Training ($\tau = 1.0$)**: Samples actions stochastically in proportion to visit frequency $N$, providing exploration across similar-value actions.
-  - **Evaluation ($\tau = 0.05$)**: Sharpens the distribution to near-deterministic greedy selection (essentially $\arg\max_a N(s, a)$) for benchmark evaluation.
+#### `root_dirichlet_alpha`, `root_exploration_fraction`, and `root_exploration_fraction_end`
+- **Type**: `float` | **Default**: `root_dirichlet_alpha: 0.3`, `root_exploration_fraction: 0.30`, `root_exploration_fraction_end: 0.10`
+- **Purpose**: Injects Dirichlet noise $\text{Dir}(\alpha)$ into the root node policy prior, with mixing fraction $\epsilon$ annealing linearly from `0.30` (at `0` return) down to `0.10` (at `3000` rolling raw return).
+
+#### `tau_act_train`, `tau_act_train_end`, and `tau_act_eval`
+- **Type**: `float` | **Default**: `tau_act_train: 1.0`, `tau_act_train_end: 0.25`, `tau_act_eval: 0.05`
+- **Purpose**: Temperature used when selecting the executed environment action from root visit counts and normalized Q-values:
+  - **Training (`tau_act_train` $\to$ `tau_act_train_end`)**: Starts at `1.0` for broad root action exploration at `0` return and anneals linearly to `0.25` at `3000` rolling raw return so high-speed gaits execute high-value MCTS branches reliably.
+  - **Evaluation (`tau_act_eval: 0.05`)**: Near-deterministic greedy selection for benchmark evaluation.
+
+#### `adaptive_exploration`, `min_policy_std_target`, `min_policy_std_target_end`, and `exploration_boost_max`
+- **Type**: `bool` / `float` | **Default**: `adaptive_exploration: true`, `min_policy_std_target: 0.22`, `min_policy_std_target_end: 0.12`, `exploration_boost_max: 2.25`
+- **Purpose**:
+  - `min_policy_std_target` $\to$ `min_policy_std_target_end`: Sets the target floor for the actor's Gaussian standard deviation, annealing from `0.22` (at `0` return) down to `0.12` (at `3000` rolling raw return). Used both in `rep_trainer.py`'s std floor bonus and in `agent.py`'s adaptive exploration boost.
+  - When `adaptive_exploration: true` and the actor's current std drops below the annealed target, MCTS temperatures are boosted up to `exploration_boost_max` (`2.25`, which also softens as exploration progress approaches `1.0`).
 
 ---
 
 ### 1.6 Replay Buffer & MuZero Reanalyze
 
 #### `lr`
-- **Type**: `float` | **Default**: `0.0003` ($3 \times 10^{-4}$)
-- **Purpose**: Adam optimizer learning rate for the Agent networks (Transformer representation, dynamics, value critic, and policy prior).
+- **Type**: `float` | **Default**: `0.000085` ($8.5 \times 10^{-5}$)
+- **Purpose**: AdamW optimizer learning rate for the Agent networks (Transformer representation, dynamics, value critic, and policy prior).
 
 #### `batch_size`
 - **Type**: `int` | **Default**: `128`
@@ -240,78 +237,49 @@ This document provides a comprehensive reference for every configuration paramet
 
 #### `buffer_capacity`
 - **Type**: `int` | **Default**: `50000`
-- **Purpose**: Maximum number of step transitions $(o_t, a_t, r_t, o_{t+1}, \pi_t)$ retained in the circular replay buffer.
-- **Training Impact**:
-  - At 1,000 steps per episode, retains transitions from the most recent ~50–100 episodes.
-  - Keeps training focused on recent, high-performing policy data while discarding obsolete early random exploratory steps.
+- **Purpose**: Maximum number of step transitions retained in the trajectory replay buffer (~50 full 1,000-step episodes).
 
 #### `train_every_steps`
 - **Type**: `int` | **Default**: `50`
-- **Purpose**: Frequency of agent gradient descent updates during episode execution. Every 50 environment steps, one training batch is sampled and backpropagated.
-- **Training Impact**:
-  - **Lower (e.g. 20)**: High sample efficiency (more updates per environment step), but slows down wall-clock simulation.
-  - **Higher (e.g. 200)**: Faster wall-clock execution, but requires more environment interactions to learn.
+- **Purpose**: Frequency of agent gradient descent updates during episode execution (1 update every 50 environment steps, plus 1 final update at episode end).
 
 #### `reanalyze_ratio`, `reanalyze_every`, `reanalyze_states`
-- **Type**: `float` / `int` | **Default**: `reanalyze_ratio: 0.25`, `reanalyze_every: 2`, `reanalyze_states: 4`
-- **Purpose**: Implements MuZero Reanalyze. Historical trajectories in the replay buffer have their search policies and value targets refreshed using the latest, more capable world model.
-  - `reanalyze_every: 2`: Runs reanalyze pass every 2 episodes.
-  - `reanalyze_states: 4`: Re-runs MCTS searches on 4 historical states per pass.
-  - `reanalyze_ratio: 0.25`: 25% of training minibatches sample reanalyzed fresh targets.
-- **Training Impact**:
-  - Dramatically improves sample efficiency by reusing past physical interactions with newly improved search policies, preventing policy lag from stale buffer targets.
+- **Type**: `float` / `int` | **Default**: `reanalyze_ratio: 0.25`, `reanalyze_every: 4`, `reanalyze_states: 4`
+- **Purpose**: MuZero Reanalyze schedule. Every `4` episodes, `4` historical states in the replay buffer have their MCTS policy and value targets refreshed using the latest networks.
 
 ---
 
 ## 2. Balanced Reinforcement Learning (`brl`)
 
-The BRL framework sets up an asymmetric three-agent game:
-- **Agent**: Learns to locomote robustly under perturbations.
-- **Tweaker**: Selects an adversarial perturbation vector $w \in [0, 1000]^{18}$ subject to knapsack cost constraints.
-- **Balancer**: Regulates the environmental perturbation budget $B_e$ to maintain the agent's win rate in the **Zone of Proximal Development (ZPD)** ($\approx 50\%$).
-
----
-
 ### 2.1 Perturbation & Knapsack Parameter Space
 
 #### `num_params`
 - **Type**: `int` | **Default**: `18`
-- **Purpose**: Dimensionality of the environmental and perceptual tweak vector $w \in \mathbb{R}^{18}$:
-  - $w_1..w_3$: Leg geometry scaling (front, rear, lateral).
-  - $w_4$: Leg 4 deactivation / amputation.
-  - $w_5$: Torso payload / mass scaling.
-  - $w_6$: Sliding surface friction (ice simulation).
-  - $w_7$: Torsional and rolling friction.
-  - $w_8$: Joint damping and stiffness.
-  - $w_9$: Actuator motor gain reduction.
-  - $w_{10}$: Proprioceptive sensor Gaussian noise.
-  - $w_{11}$: Actuation latency / delay.
-  - $w_{12}$: Terrain unevenness heightfield.
-  - $w_{13}..w_{18}$: Perceptual distortion dimensions (observation shift, scale, and noise).
+- **Purpose**: Dimensionality of the environmental and perceptual tweak vector $w \in [0, 1000]^{18}$ (12 physics/morphology parameters $w_1..w_{12}$ and 6 perception distortion parameters $w_{13}..w_{18}$).
 
 #### `param_max`
 - **Type**: `float` | **Default**: `1000.0`
 - **Purpose**: Maximum allowable intensity on each normalized perturbation channel ($w_i \in [0, 1000]$).
 
 #### `budget_max`
-- **Type**: `float` | **Default**: `18000.0`
-- **Purpose**: Theoretical maximum environmental budget ($18 \times 1000$). The Balancer dynamically allocates a fraction $B_e \in [0, B_{\max}]$ to the Tweaker.
+- **Type**: `float` | **Default**: `4600.0`
+- **Purpose**: Maximum environmental budget $B_{\max}$ that the Balancer can allocate to the Tweaker.
 
 #### `cost_min` and `cost_max`
 - **Type**: `float` | **Default**: `cost_min: 0.1`, `cost_max: 10.0`
-- **Purpose**: Cost bounds for individual tweak dimensions in the continuous knapsack problem. Different perturbations consume different amounts of budget per unit intensity.
+- **Purpose**: Cost bounds for individual tweak dimensions in the continuous knapsack problem.
 
 #### `tau_s`
 - **Type**: `float` | **Default**: `500.0`
-- **Purpose**: Softmax temperature applied to knapsack value-to-cost heuristic ratios during Tweaker perturbation selection.
+- **Purpose**: Temperature scaling parameter for the continuous dominance score sigmoid $\sigma((R - R_{\text{ref}}) / \tau_s)$.
 
-#### `beta_score` and `eta_viol`
-- **Type**: `float` | **Default**: `beta_score: 1.0`, `eta_viol: 2.0`
-- **Purpose**: Exponent on the Tweaker's score-to-cost ratio (`beta_score`) and penalty factor applied if the Tweaker's selected tweaks exceed the Balancer's allocated budget (`eta_viol`).
-
-#### `beta_ent`
-- **Type**: `float` | **Default**: `0.01`
-- **Purpose**: Entropy regularization weight for the Tweaker policy, ensuring diverse exploration across different failure dimensions rather than repeatedly exploiting only one weakness.
+#### `tweaker_lr`, `beta_score`, `eta_viol`, `beta_ent`, and `beta_ent_end`
+- **Type**: `float`
+- **Defaults**:
+  - `tweaker_lr: 0.0003`: Learning rate for the Tweaker's PPO actor-critic network.
+  - `beta_score: 1.0`: Dominance score penalty weight in the Tweaker's reward.
+  - `eta_viol: 2.0`: Pre-projection budget excess penalty factor.
+  - `beta_ent: 0.01` $\to$ `beta_ent_end: 0.002`: Entropy bonus coefficient for the Tweaker's Beta distribution policy, annealing linearly from `0.01` to `0.002` as the agent's rolling 20 raw return progresses from `0` to `3000`.
 
 ---
 
@@ -319,172 +287,107 @@ The BRL framework sets up an asymmetric three-agent game:
 
 #### `target_win_rate`
 - **Type**: `float` | **Default**: `0.50`
-- **Purpose**: The central equilibrium target $\mu^* = 0.50$ for the Zone of Proximal Development.
-- **Training Impact**:
-  - In educational psychology and optimal challenge curriculum learning, learning is fastest when tasks are neither trivially easy (win rate $\approx 1.0$) nor impossibly hard (win rate $\approx 0.0$). The Balancer dynamically adjusts task difficulty to keep the agent succeeding roughly 50% of the time.
+- **Purpose**: Target equilibrium win rate $\rho^* = 0.50$ for the Zone of Proximal Development (ZPD).
 
 #### `ema_beta_w`
 - **Type**: `float` | **Default**: `0.05`
-- **Purpose**: Exponential moving average (EMA) smoothing weight for the agent's tracked win rate:
-  $$\mu_t = (1 - \beta_w) \mu_{t-1} + \beta_w \cdot \mathbf{1}_{\text{win}}$$
-- **Training Impact**:
-  - $\beta_w = 0.05$ creates an effective smoothing window of $1 / 0.05 = 20$ episodes. Prevents erratic budget fluctuations caused by single-episode luck.
+- **Purpose**: Exponential moving average smoothing weight for the agent's tracked win rate ($\approx 20$-episode window).
 
 #### `initial_r_ref` and `benchmark_r_ref`
-- **Type**: `float` | **Default**: `initial_r_ref: 0.0`, `benchmark_r_ref: 6169.54`
-- **Purpose**: Dynamic reference return $R_{\text{ref}}$ used to define an episode "win":
-  $$\text{Episode Win} \iff \text{Return } R \ge R_{\text{ref}}$$
-- **Training Impact**:
-  - `initial_r_ref = 1000.0`: Starting threshold for early training.
-  - `benchmark_r_ref = 6169.54`: Nominal asymptotic performance benchmark for Ant-v5.
-  - As the agent improves, $R_{\text{ref}}$ dynamically ratchets upward via quantile progression, preventing the agent from "winning" through mediocre performance.
+- **Type**: `float` | **Default**: `initial_r_ref: -900.0`, `benchmark_r_ref: 6169.54`
+- **Purpose**: Initial and asymptotic reference returns $R_{\text{ref}}$ used by `WinEvaluator` (calibrated at the end of warmup to the median of the last 20 warmup episode returns).
 
 #### `window_k_w`
 - **Type**: `int` | **Default**: `20`
-- **Purpose**: Sliding window history size (in episodes) used to compute recent failure correlations and agent win rate statistics.
+- **Purpose**: Sliding window size (in episodes) used by the Balancer to track return statistics and failure correlations.
 
 #### `sigma_zpd`
 - **Type**: `float` | **Default**: `0.15`
-- **Purpose**: Standard deviation of the Zone of Proximal Development Gaussian bell curve centered at $\mu^* = 0.50$.
-- **Training Impact**:
-  - Defines the "sweet spot" bandwidth $[0.50 - \sigma, 0.50 + \sigma] = [0.35, 0.65]$. Win rates within this band receive high Balancer equilibrium rewards.
+- **Purpose**: Standard deviation of the ZPD Gaussian gate centered at `target_win_rate = 0.50`.
 
 ---
 
-### 2.3 Balancer Meta-Controller (DDPG)
+### 2.3 Balancer Meta-Controller (DDPG/TD3)
 
-#### `balancer_lr`
-- **Type**: `float` | **Default**: `0.0001` ($10^{-4}$)
-- **Purpose**: Learning rate for the Balancer's DDPG actor and critic networks.
+#### `balancer_lr` and `balancer_tau`
+- **Type**: `float` | **Default**: `balancer_lr: 0.0001`, `balancer_tau: 0.005`
+- **Purpose**: Learning rate and Polyak target smoothing factor for the Balancer's actor and twin Q-critic networks.
 
-#### `balancer_tau`
-- **Type**: `float` | **Default**: `0.005`
-- **Purpose**: Polyak averaging soft update coefficient for target networks: $\theta_{\text{targ}} \leftarrow \tau \theta + (1-\tau)\theta_{\text{targ}}$.
-
-#### `balancer_noise_std`
-- **Type**: `float` | **Default**: `0.05`
-- **Purpose**: Gaussian exploration noise $\mathcal{N}(0, 0.05)$ added to the Balancer's continuous budget action $B_e$.
+#### `balancer_noise_std` and `balancer_noise_std_end`
+- **Type**: `float` | **Default**: `balancer_noise_std: 0.05`, `balancer_noise_std_end: 0.01`
+- **Purpose**: Gaussian exploration noise std added to the Balancer's normalized constraint actions, annealing linearly from `0.05` to `0.01` as the agent's rolling 20 raw return progresses from `0` to `3000`.
 
 #### `alpha_eq`, `alpha_inst`, `alpha_prog`, `lambda_entropy`
-- **Type**: `float`
-- **Defaults**:
-  - `alpha_eq: 10.0`: Reward weight for keeping win rate near target: $-\alpha_{\text{eq}} (\mu - 0.5)^2$.
-  - `alpha_inst: 2.0`: Penalty weight for abrupt win rate volatility: $-\alpha_{\text{inst}} |\mu_t - \mu_{t-1}|$.
-  - `alpha_prog: 5.0`: Reward weight for raising the reference return $R_{\text{ref}}$ over time: $+\alpha_{\text{prog}} \Delta R_{\text{ref}}$.
-  - `lambda_entropy: 0.5`: Entropy incentive for budget exploration.
-- **Training Impact**:
-  - Balancer reward function:
-    $$r_{\text{bal}} = -\alpha_{\text{eq}} (\mu - 0.5)^2 - \alpha_{\text{inst}} |\Delta \mu| + \alpha_{\text{prog}} \Delta R_{\text{ref}} + \lambda_{\text{ent}} \mathcal{H}$$
-  - Balances curriculum stability with continuous pressure to improve.
+- **Type**: `float` | **Default**: `alpha_eq: 10.0`, `alpha_inst: 2.0`, `alpha_prog: 5.0`, `lambda_entropy: 0.5`
+- **Purpose**: Reward weights in the Balancer's objective for win-rate equilibrium (`alpha_eq`), per-episode dominance stability (`alpha_inst`), difficulty progression inside the ZPD (`alpha_prog`), and budget allocation Shannon entropy (`lambda_entropy`).
 
 ---
 
 ### 2.4 Curriculum Schedule & Warmup
 
-#### `warmup_episodes`
-- **Type**: `int` | **Default**: `100`
-- **Purpose**: Number of initial episodes where environmental perturbations are strictly clamped.
-- **Training Impact**:
-  - Allows the agent to learn basic upright posture and stepping before facing severe ice, missing legs, or heavy payloads.
-  - Setting this to 0 can cause premature policy collapse as untrained agents fail continuously under high perturbations.
+#### `warmup_episodes`, `brl_episodes`, and `total_episodes`
+- **Type**: `int` | **Default**: `warmup_episodes: 80`, `brl_episodes: 10000`, `total_episodes: 10000`
+- **Purpose**:
+  - Episodes `1 .. 80`: Warmup phase with mild, fixed constraints (`warmup_limit`, `warmup_budget`) so the agent learns stable standing and initial locomotion.
+  - Episodes `81 .. 10000`: Active co-evolutionary BRL phase.
 
 #### `warmup_limit` and `warmup_budget`
-- **Type**: `float` | **Default**: `warmup_limit: 50.0`, `warmup_budget: 100.0`
-- **Purpose**: Caps on individual tweak intensity ($w_i \le 50.0$) and total budget ($B_e \le 100.0$) during the warmup phase.
-
-#### `brl_episodes` and `total_episodes`
-- **Type**: `int` | **Default**: `brl_episodes: 2500`, `total_episodes: 3000`
-- **Purpose**:
-  - `warmup_episodes`: 0 – 50
-  - `brl_episodes`: 51 – 2550 (active tri-agent curriculum learning)
-  - Remaining episodes: Consolidation / fine-tuning phase.
+- **Type**: `float` | **Default**: `warmup_limit: 30.0`, `warmup_budget: 90.0`
+- **Purpose**: Per-parameter limit ($L_i = 30.0$) and total budget ($B_e = 90.0$) applied during the warmup phase.
 
 ---
 
 ## 3. Ant Morphology Environment (`ant_morph`)
 
-#### `env_id`
-- **Type**: `str` | **Default**: `"Ant-v5"`
-- **Purpose**: Base Gymnasium environment identifier.
+#### `env_id`, `use_contact_forces`, `max_episode_steps`, `xml_rebuild_threshold`, `healthy_z_range`, `max_action_capacity`, `default_num_legs`
+- **Defaults**:
+  - `env_id: "Ant-v5"`
+  - `use_contact_forces: false`
+  - `max_episode_steps: 1000`
+  - `xml_rebuild_threshold: 1.0`
+  - `healthy_z_range: [0.2, 1.0]`
+  - `max_action_capacity: 12` (supports 3-, 4-, and 6-legged morphologies)
+  - `default_num_legs: 4`
 
-#### `use_contact_forces`
-- **Type**: `bool` | **Default**: `false`
-- **Purpose**: Whether to include external contact force sensors (`cfrc_ext`, dimension $1 + 4 \times 3 \times 6$) in the observation vector.
-- **Training Impact**:
-  - When `true`, observation space expands significantly. Requires contact penalty cost adjustments. Keeping `false` aligns with standard benchmark benchmarks.
+#### `action_ema_alpha` and `action_smoothness_coef`
+- **Type**: `float` | **Default**: `action_ema_alpha: 0.06`, `action_smoothness_coef: 0.15`
+- **Purpose**:
+  - `action_ema_alpha`: Initial exponential moving average action filter weight ($a_t^{\text{env}} = \alpha_{\text{ema}} a_t + (1 - \alpha_{\text{ema}}) a_{t-1}^{\text{env}}$). Interpolates linearly from `action_ema_alpha` to `1.0` (unfiltered agility) as `current_return` progresses from `0` to `torque_return_ref` (`1000.0`).
+  - `action_smoothness_coef`: Penalty weight on squared action changes $\|a_t - a_{t-1}\|_2^2$. Scaled by $(1 - \alpha_{\text{torque}})$ so the smoothness penalty vanishes completely once `current_return` reaches `torque_return_ref` (`1000.0`).
 
-#### `max_episode_steps`
-- **Type**: `int` | **Default**: `1000`
-- **Purpose**: Truncation step horizon for each training episode ($\approx 33.3$ seconds at $\Delta t = 0.05$s).
-- **Training Impact**:
-  - Episodes reaching 1,000 steps without falling receive the `[TRUNCATED - MOVING]` designation and maximize return.
+#### `torque_return_ref` and `exploration_return_ref`
+- **Type**: `float` | **Default**: `torque_return_ref: 1000.0`, `exploration_return_ref: 3000.0`
+- **Purpose**: Reference thresholds for the **rolling 20-episode raw environment return** curriculum (`self._recent_ep_returns`, recorded across full 1,000-step healthy episodes with negative returns clamped to `0.0`):
+  - **`torque_return_ref: 1000.0`**: Scales $\alpha_{\text{torque}} = \text{clip}(\text{current\_return} / 1000.0, 0.0, 1.0)$ from `0` to `1000` return, reducing the smoothness penalty to `0` and opening `action_ema_alpha` to `1.0`.
+  - **`exploration_return_ref: 3000.0`**: Scales $\alpha_{\text{explore}} = \text{clip}(\text{current\_return} / 3000.0, 0.0, 1.0)$ from `0` to `3000` return, annealing MCTS action temperature (`tau_act_train`), Dirichlet noise (`root_exploration_fraction`), policy std target (`min_policy_std_target`), Balancer noise, and Tweaker entropy bonus.
 
-#### `xml_rebuild_threshold`
-- **Type**: `float` | **Default**: `1.0`
-- **Purpose**: Sensitivity threshold for triggering dynamic MJCF XML recompilation when morphological tweaks ($w_1..w_4$) or leg counts change.
-- **Training Impact**:
-  - Recompiling MuJoCo XML requires a few milliseconds. The threshold prevents tiny floating-point changes from triggering unnecessary model rebuilds while ensuring substantial morphology changes (e.g. tripod or hexapod) are compiled cleanly.
+#### `vel_shift_factor`
+- **Type**: `float` | **Default**: `3000.0`
+- **Purpose**: Per-step smoothing divisor governing how quickly `current_return` shifts toward the rolling 20-episode mean `target_return` ($\Delta = \text{target\_return} / \text{vel\_shift\_factor}$ per environment step, taking ~3 full episodes to traverse a shift).
 
-#### `healthy_z_range`
-- **Type**: `list[float]` | **Default**: `[0.2, 1.0]`
-- **Purpose**: Allowed vertical torso height $[z_{\min}, z_{\max}]$. If the torso drops below $0.2$m (falling over) or exceeds $1.0$m (flipping into the air), the episode terminates early as a fall.
-
-#### `max_action_capacity`
-- **Type**: `int` | **Default**: `12`
-- **Purpose**: Maximum action buffer capacity allocated to support morphology scaling (e.g. up to 6 legs with 2 actuators each = 12 channels).
-
-#### `default_num_legs`
-- **Type**: `int` | **Default**: `4`
-- **Purpose**: Default number of legs for the nominal creature.
+#### `action_smoothness_end_step`, `benchmark_vel_ref`, `vel_std_threshold`, `upside_down_time_limit`, `upside_down_penalty`
+- **Defaults**: `action_smoothness_end_step: 500000`, `benchmark_vel_ref: 0.20`, `vel_std_threshold: 0.20`, `upside_down_time_limit: 0.0`, `upside_down_penalty: 0.0`
+- **Purpose**: Kept for backward compatibility; upside-down penalties/terminations are disabled (`0.0`) so only native `Ant-v5` `healthy_z_range` terminates episodes, and curriculum progression is driven directly by the rolling 20 raw return (`torque_return_ref` and `exploration_return_ref`).
 
 ---
 
 ## 4. Run Execution & Infrastructure (`run`)
 
 #### `seeds` and `seed_offset`
-- **Type**: `int` | **Default**: `seeds: 3`, `seed_offset: 42`
-- **Purpose**: Number of independent training runs to execute and the starting seed index (runs seeds `42`, `43`, `44`).
-- **Training Impact**:
-  - Provides statistical rigor by verifying policy convergence across multiple stochastic seeds.
+- **Type**: `int` | **Default**: `seeds: 10`, `seed_offset: 42`
+- **Purpose**: Number of independent training seeds and starting seed offset (`42 .. 51`).
 
 #### `episodes` and `max_steps`
-- **Type**: `int` | **Default**: `0` (automatic)
-- **Purpose**: Execution overrides:
-  - `episodes: 0` $\implies$ uses `brl.total_episodes` (3000).
-  - `max_steps: 0` $\implies$ uses `ant_morph.max_episode_steps` (1000).
+- **Type**: `int` | **Default**: `0` (automatic: uses `brl.total_episodes = 10000` and `ant_morph.max_episode_steps = 1000`).
 
 #### `device`
 - **Type**: `str` | **Default**: `"cuda"`
-- **Purpose**: PyTorch device for neural network tensors (`"cuda"` or `"cpu"`).
-- **Training Impact**:
-  - CUDA dramatically accelerates Transformer representation and MCTS batched evaluations.
+- **Purpose**: PyTorch compute device (`"cuda"` or `"cpu"`).
 
-#### `eval_interval`
-- **Type**: `int` | **Default**: `0` (automatic, every 10 episodes)
-- **Purpose**: Frequency of benchmark evaluation runs across all 5 standard validation scenarios (Standard, Tripod, Spider, Heavy-Ice, Hexapod).
+#### `eval_interval` and `checkpoint_interval`
+- **Type**: `int` | **Default**: `eval_interval: 25`, `checkpoint_interval: 500`
+- **Purpose**: Runs the 5-scenario benchmark evaluation suite every `25` episodes and saves permanent milestone checkpoints every `500` episodes (in addition to `latest_checkpoint.pt` and `best_model.pt`).
 
-#### `checkpoint_interval`
-- **Type**: `int` | **Default**: `500`
-- **Purpose**: Saves permanent milestone checkpoints every 500 episodes (e.g. `checkpoint_ep_0500.pt`, `checkpoint_ep_1000.pt`), in addition to `latest_checkpoint.pt` and `best_model.pt`.
-
-#### `parallel_seeds`
-- **Type**: `int` | **Default**: `3`
-- **Purpose**: Number of concurrent Python multiprocessing workers running independent seeds.
-- **Training Impact**:
-  - When set to 3, seeds 42, 43, and 44 train simultaneously across available CPU cores and GPU memory, reducing wall-clock experiment time by ~3x.
-
-#### `gpu_mem_fraction`
-- **Type**: `float` | **Default**: `0.0`
-- **Purpose**: Per-process CUDA memory allocation limit fraction. `0.0` allows PyTorch to dynamically manage CUDA memory allocation.
-
----
-
-## Quick Reference: Tuning Guide for Common Scenarios
-
-| Objective | Key Parameters to Adjust | Recommended Change |
-| :--- | :--- | :--- |
-| **Speed up wall-clock training** | `n_sim`, `train_every_steps`, `history_len` | Decrease `n_sim` (e.g. 36 $\to$ 20), increase `train_every_steps` (80 $\to$ 120). |
-| **Improve complex terrain locomotion** | `n_sim`, `k_act`, `unroll_steps` | Increase `n_sim` (36 $\to$ 50), increase `k_act` (24 $\to$ 32), increase `unroll_steps` (5 $\to$ 8). |
-| **Prevent early falls / policy collapse** | `warmup_episodes`, `target_win_rate`, `alpha_eq` | Increase `warmup_episodes` (50 $\to$ 100), verify `target_win_rate = 0.50`. |
-| **Encourage more aggressive gait discovery** | `num_peaks`, `root_exploration_fraction`, `tau_act_train` | Increase `num_peaks` (6 $\to$ 8), increase `root_exploration_fraction` (0.25 $\to$ 0.35). |
-| **Fine-tune evaluation performance** | `n_sim_eval`, `tau_act_eval` | Increase `n_sim_eval` (64 $\to$ 128), lower `tau_act_eval` (0.05 $\to$ 0.01). |
+#### `parallel_seeds` and `gpu_mem_fraction`
+- **Type**: `int` / `float` | **Default**: `parallel_seeds: 3`, `gpu_mem_fraction: 0.0`
+- **Purpose**: Number of seeds trained concurrently in parallel worker processes (`3`) and optional per-process CUDA memory cap (`0.0` = dynamic).

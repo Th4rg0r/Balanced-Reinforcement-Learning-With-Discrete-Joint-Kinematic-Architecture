@@ -63,7 +63,7 @@ brl:
   target_win_rate: 0.50
   ema_beta_w: 0.05
   tau_s: 500.0
-  initial_r_ref: -900.0
+  initial_r_ref: 300.0
   benchmark_r_ref: 6169.54
   window_k_w: 20
   alpha_eq: 10.0
@@ -94,14 +94,14 @@ ant_morph:
   healthy_z_range: [0.2, 1.0]
   max_action_capacity: 12
   default_num_legs: 4
-  action_ema_alpha: 0.75 #smoothness 0.8
-  action_smoothness_coef: 0.06 # smoothness 0.06
+  action_ema_alpha: 0.06 #smoothness 0.8
+  action_smoothness_coef: 0.15 # smoothness 0.06
   action_smoothness_end_step: 500000
   benchmark_vel_ref: 0.20
   torque_return_ref: 1000.0
   exploration_return_ref: 3000.0
   vel_std_threshold: 0.20
-  vel_shift_factor: 5000.0
+  vel_shift_factor: 3000.0
   upside_down_time_limit: 0.0
   upside_down_penalty: 0.0
 
