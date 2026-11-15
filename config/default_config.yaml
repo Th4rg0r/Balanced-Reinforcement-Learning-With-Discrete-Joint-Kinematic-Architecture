@@ -57,7 +57,7 @@ la_mcts:
 brl:
   num_params: 18
   param_max: 1000.0
-  budget_max: 4600.0
+  budget_max: 8500.0
   cost_min: 0.1
   cost_max: 10.0
   target_win_rate: 0.50
@@ -94,7 +94,7 @@ ant_morph:
   healthy_z_range: [0.2, 1.0]
   max_action_capacity: 12
   default_num_legs: 4
-  action_ema_alpha: 0.06 #smoothness 0.8
+  action_ema_alpha: 0.6 #smoothness 0.8
   action_smoothness_coef: 0.15 # smoothness 0.06
   action_smoothness_end_step: 500000
   benchmark_vel_ref: 0.20
