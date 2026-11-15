@@ -82,7 +82,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self.vel_shift_factor = max(1.0, float(vel_shift_factor))
         self.upside_down_time_limit = max(0.0, float(upside_down_time_limit))
         self.upside_down_penalty = max(0.0, float(upside_down_penalty))
-        self._recent_ep_velocities: Deque[float] = deque(maxlen=3)
+        self._recent_ep_velocities: Deque[float] = deque(maxlen=4)
         self.target_vel: float = 0.0
         self.current_vel: float = 0.0
         self._eval_mode: bool = False
@@ -468,12 +468,12 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         required_steps: int = 1000,
         terminated_unhealthy: bool = False,
     ) -> Tuple[float, float]:
-        """Updates target_vel from the last 3 full (1000-step) episodes' mean forward velocities (m/s).
+        """Updates target_vel from the last 4 full (1000-step) episodes' mean forward velocities (m/s).
 
         Only episodes that reach `required_steps` (default 1000) without unhealthy termination
         are recorded and used to update `target_vel`. Negative episode velocities are clamped to
-        0.0, and `target_vel` is monotonically non-decreasing so the smoothness/torque punishment
-        can only become smaller (never stricter) once a velocity threshold has been reached.
+        0.0 for curriculum / torque-penalty control so `target_vel` can move up or down with
+        recent performance, but never below 0.0.
         """
         if int(ep_steps) < int(required_steps) or bool(terminated_unhealthy):
             return self.target_vel, self.current_vel
@@ -482,10 +482,9 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         vals = np.maximum(0.0, np.asarray(self._recent_ep_velocities, dtype=np.float64))
         std_v = float(np.std(vals)) if len(vals) >= 2 else 0.0
         if std_v <= self.vel_std_threshold:
-            candidate_vel = max(0.0, float(np.mean(vals)))
+            self.target_vel = max(0.0, float(np.mean(vals)))
         else:
-            candidate_vel = max(0.0, float(np.min(vals)))
-        self.target_vel = max(0.0, float(self.target_vel), candidate_vel)
+            self.target_vel = max(0.0, float(np.min(vals)))
         return self.target_vel, self.current_vel
 
     def reset(
@@ -598,9 +597,14 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         if not self._eval_mode:
             self.target_vel = max(0.0, float(self.target_vel))
             self.current_vel = max(0.0, float(self.current_vel))
+            ref_mag = (
+                abs(self.target_vel) if self.target_vel > 0.0 else abs(self.current_vel)
+            )
+            step_delta = ref_mag / max(self.vel_shift_factor, 1.0)
             if self.current_vel < self.target_vel:
-                step_delta = abs(self.target_vel) / max(self.vel_shift_factor, 1.0)
                 self.current_vel = min(self.target_vel, self.current_vel + step_delta)
+            elif self.current_vel > self.target_vel:
+                self.current_vel = max(self.target_vel, self.current_vel - step_delta)
 
         cur_smooth_coef = self.get_current_smoothness_coef()
         eff_ema_alpha = self.get_current_action_ema_alpha()
