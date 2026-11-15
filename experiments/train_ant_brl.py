@@ -535,12 +535,14 @@ def run_single_seed(
 
             if "vel_curriculum" in payload:
                 vc_d = payload["vel_curriculum"]
-                env.target_vel = float(vc_d.get("target_vel", env.target_vel))
-                env.current_vel = float(vc_d.get("current_vel", env.current_vel))
+                restored_target = max(0.0, float(vc_d.get("target_vel", env.target_vel)))
+                restored_current = max(0.0, float(vc_d.get("current_vel", env.current_vel)))
+                env.current_vel = restored_current
+                env.target_vel = max(restored_target, restored_current)
                 if "recent_ep_velocities" in vc_d:
                     env._recent_ep_velocities.clear()
                     for v_item in vc_d["recent_ep_velocities"]:
-                        env._recent_ep_velocities.append(float(v_item))
+                        env._recent_ep_velocities.append(max(0.0, float(v_item)))
 
             if "balancer_meta" in payload:
                 bm = payload["balancer_meta"]

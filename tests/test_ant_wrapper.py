@@ -263,6 +263,26 @@ def test_fixed_smoothness_and_velocity_curriculum_reward_blending() -> None:
         assert wrapper.get_current_action_ema_alpha() == pytest.approx(0.9, abs=1e-7)
         wrapper.current_vel = 6.0
         assert wrapper.get_current_action_ema_alpha() == pytest.approx(1.0, abs=1e-7)
+
+        # 7. Negative velocities clamp to 0.0 for curriculum / torque-penalty control, and target_vel / current_vel are monotonically non-decreasing
+        wrapper._recent_ep_velocities.clear()
+        wrapper.target_vel = 0.0
+        wrapper.current_vel = 0.0
+        wrapper.update_velocity_curriculum(-1.5, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        wrapper.update_velocity_curriculum(0.3, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        wrapper.update_velocity_curriculum(0.3, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        assert list(wrapper._recent_ep_velocities) == pytest.approx([0.0, 0.3, 0.3], abs=1e-7)
+        # std([0.0, 0.3, 0.3]) = 0.14142 <= 0.15 -> mean = 0.20 (would have been 0.0 if -1.5 wasn't clamped to 0.0!)
+        assert wrapper.target_vel == pytest.approx(0.20, abs=1e-6)
+        # Subsequent lower velocities (e.g., 0.05) first raise mean([0.3, 0.3, 0.05]) to 0.216667, and then must NOT reduce target_vel below 0.216667
+        wrapper.update_velocity_curriculum(0.05, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        assert wrapper.target_vel == pytest.approx(0.65 / 3.0, abs=1e-6)
+        wrapper.update_velocity_curriculum(0.05, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        wrapper.update_velocity_curriculum(0.05, ep_steps=1000, required_steps=1000, terminated_unhealthy=False)
+        assert wrapper.target_vel == pytest.approx(0.65 / 3.0, abs=1e-6)
+        wrapper.current_vel = -0.5
+        assert wrapper.get_reward_blend_alpha() == pytest.approx(0.0, abs=1e-7)
+        assert wrapper.get_current_action_ema_alpha() == pytest.approx(0.8, abs=1e-7)
     finally:
         wrapper.close()
 
