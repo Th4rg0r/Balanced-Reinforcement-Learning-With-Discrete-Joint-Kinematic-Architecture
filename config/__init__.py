@@ -42,7 +42,7 @@ class LAMCTSConfig:
     c_reg: float = 1e-4
     n_sim: int = 32
     n_sim_eval: int = 64
-    k_act: int = 16
+    k_act: int = 8
     c_1: float = 1.50
     c_2: float = 19652.0
     root_tau_beta: float = 1.0
@@ -51,7 +51,7 @@ class LAMCTSConfig:
     root_exploration_fraction: float = 0.30
     root_exploration_fraction_end: float = 0.10
     tau_act_train: float = 1.0
-    tau_act_train_end: float = 0.25
+    tau_act_train_end: float = 0.15
     tau_act_eval: float = 0.05
     adaptive_exploration: bool = True
     min_policy_std_target: float = 0.22
@@ -64,6 +64,9 @@ class LAMCTSConfig:
     lambda_peak_ent: float = 0.15
     lambda_peak_ent_end: float = 0.02
     peak_entropy_floor_ratio: float = 0.70
+    lambda_peak_sep: float = 0.25
+    lambda_peak_sep_end: float = 0.05
+    min_peak_separation: float = 0.40
     critic_warmup_steps: int = 5000
     lr: float = 3e-4
     batch_size: int = 128

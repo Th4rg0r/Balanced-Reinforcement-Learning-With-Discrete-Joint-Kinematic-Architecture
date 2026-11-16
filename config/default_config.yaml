@@ -23,12 +23,12 @@ la_mcts:
   beta_mse: 1.0
   lambda_v: 0.5
   lambda_r: 1.0
-  lambda_p: 0.25
+  lambda_p: 1.0
   lambda_ent: 0.03
   c_reg: 0.0001
   n_sim: 32
   n_sim_eval: 64
-  k_act: 16
+  k_act: 8
   c_1: 2.00
   c_2: 19652.0
   root_tau_beta: 1.0
@@ -37,7 +37,7 @@ la_mcts:
   root_exploration_fraction: 0.40
   root_exploration_fraction_end: 0.12
   tau_act_train: 1.0
-  tau_act_train_end: 0.25
+  tau_act_train_end: 0.15
   tau_act_eval: 0.05
   adaptive_exploration: true
   min_policy_std_target: 0.22
@@ -50,8 +50,11 @@ la_mcts:
   lambda_peak_ent: 0.15
   lambda_peak_ent_end: 0.02
   peak_entropy_floor_ratio: 0.70
+  lambda_peak_sep: 0.25
+  lambda_peak_sep_end: 0.05
+  min_peak_separation: 0.40
   critic_warmup_steps: 5000
-  lr: 0.000085
+  lr: 0.00018
   batch_size: 128
   buffer_capacity: 50000
   context_dim: 18
@@ -104,7 +107,7 @@ ant_morph:
   healthy_z_range: [0.2, 1.0]
   max_action_capacity: 12
   default_num_legs: 4
-  action_ema_alpha: 0.8 # smoothness 0.8
+  action_ema_alpha: 0.35 # smooth early 50ms jitter -> scales to 1.0 at 1000 return
   action_smoothness_coef: 0.05 # smoothness 0.06
   action_smoothness_end_step: 500000
   forward_reward_weight: 4.0 # training-only agent_reward forward scale (Eval/raw Ant-v5 stays standard 1.0)
@@ -117,8 +120,8 @@ ant_morph:
   vel_shift_factor: 3000.0
   upside_down_time_limit: 0.0
   upside_down_penalty: 0.0
-  min_healthy_vel: 0.08     # training-only: scale healthy_reward by clip(v_x / min_healthy_vel, 0, 1); 0.0 disables
-  stationary_penalty_coef: 0.85  # training-only: extra per-step penalty coef * (1 - vel_gate) fed into MCTS rewards; 0.0 disables
+  min_healthy_vel: 0.05     # training-only: scale healthy_reward by clip(v_x / min_healthy_vel, 0, 1); 0.0 disables
+  stationary_penalty_coef: 0.35  # training-only: extra per-step penalty coef * (1 - vel_gate) fed into MCTS rewards; 0.0 disables
   stationary_vel_window: 20      # steps (~1.0s) of rolling-mean x-velocity used for the velocity gate
 
 # Run protocol defaults for experiments/train_ant_brl.py (CLI flags override; 0 = automatic)

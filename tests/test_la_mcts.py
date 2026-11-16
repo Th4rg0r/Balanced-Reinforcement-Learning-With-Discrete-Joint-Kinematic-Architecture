@@ -171,8 +171,16 @@ def test_gate1_mcts_root_dirichlet_noise() -> None:
     assert np.all(root_node_noisy.prior_weights >= 0.0)
     assert abs(float(np.sum(root_node_noisy.prior_weights)) - 1.0) <= 1e-6
 
-    # 2. Deterministic search disables Dirichlet noise completely
-    # In deterministic mode, root.prior_weights must match pure actor head sample_actions priors exactly
+    # 2. Deterministic search disables Dirichlet noise and evaluates noise-free peak centers
+    _, expected_det_priors = actor_head.sample_actions(
+        z_root, k_act=8, temperature=mcts_noisy.root_tau_beta, deterministic_candidates=True
+    )
+    expected_det_priors_np = expected_det_priors.detach().cpu().numpy()
+
+    _, _, _, _, root_node_det = mcts_noisy.search(z_root, deterministic=True)
+    np.testing.assert_allclose(root_node_det.prior_weights, expected_det_priors_np, atol=1e-6)
+
+    # 3. Fraction = 0.0 disables noise even when deterministic=False
     torch.manual_seed(42)
     np.random.seed(42)
     _, expected_priors = actor_head.sample_actions(
@@ -180,12 +188,6 @@ def test_gate1_mcts_root_dirichlet_noise() -> None:
     )
     expected_priors_np = expected_priors.detach().cpu().numpy()
 
-    torch.manual_seed(42)
-    np.random.seed(42)
-    _, _, _, _, root_node_det = mcts_noisy.search(z_root, deterministic=True)
-    np.testing.assert_allclose(root_node_det.prior_weights, expected_priors_np, atol=1e-6)
-
-    # 3. Fraction = 0.0 disables noise even when deterministic=False
     mcts_no_frac = SampledContinuousMCTS(
         actor_head=actor_head,
         critic_head=critic_head,
@@ -638,15 +640,15 @@ def test_needle_point_d_critic_warmup_and_config_defaults() -> None:
     )
     agent = LatentActionMCTSAgent(cfg, device=torch.device("cpu"))
     assert np.isclose(agent.get_critic_warmup_scale(), 0.15)
-    assert np.isclose(agent.get_current_q_advantage_weight(), 0.30)
+    assert np.isclose(agent.get_current_q_advantage_weight(), 0.60)
 
     agent.total_transitions_observed = 50
     assert np.isclose(agent.get_critic_warmup_scale(), 0.50)
-    assert np.isclose(agent.get_current_q_advantage_weight(), 1.00)
+    assert np.isclose(agent.get_current_q_advantage_weight(), 2.00)
 
     agent.total_transitions_observed = 200
     assert np.isclose(agent.get_critic_warmup_scale(), 1.0)
-    assert np.isclose(agent.get_current_q_advantage_weight(), 2.0)
+    assert np.isclose(agent.get_current_q_advantage_weight(), 4.0)
 
     sd = agent.state_dict()
     agent2 = LatentActionMCTSAgent(cfg, device=torch.device("cpu"))
@@ -661,8 +663,145 @@ def test_needle_point_d_critic_warmup_and_config_defaults() -> None:
     assert np.isclose(sys_cfg.la_mcts.latent_noise_std, 0.08)
     assert sys_cfg.la_mcts.mode_hold_steps == 8
     assert np.isclose(sys_cfg.la_mcts.lambda_peak_ent, 0.15)
+    assert np.isclose(sys_cfg.la_mcts.lambda_peak_sep, 0.25)
+    assert sys_cfg.la_mcts.k_act == 8
     assert sys_cfg.la_mcts.critic_warmup_steps == 5000
     assert sys_cfg.brl.warmup_episodes == 150
+
+
+def test_deterministic_eval_searches_noise_free_mode_centers() -> None:
+    """Verifies deterministic=True MCTS uses exact GMM peak centers without stochastic jitter."""
+    torch.manual_seed(55)
+    cfg = LAMCTSConfig(
+        obs_dim=12,
+        max_action_dim=4,
+        context_dim=6,
+        history_len=2,
+        k_tok=4,
+        d_model=32,
+        n_heads=2,
+        l_enc=1,
+        latent_dim=32,
+        l_dyn=1,
+        proj_dim=32,
+        pred_dim=32,
+        n_sim=8,
+        n_sim_eval=8,
+        k_act=8,
+        num_peaks=4,
+    )
+    agent = LatentActionMCTSAgent(cfg, device=torch.device("cpu"))
+    obs = np.ones(12, dtype=np.float32) * 0.25
+
+    agent.set_episode_context()
+    a1 = agent.select_action(obs, deterministic=True)
+    agent.set_episode_context()
+    a2 = agent.select_action(obs, deterministic=True)
+    np.testing.assert_allclose(a1, a2, atol=1e-6)
+
+    # Also verify include_peak_means anchors slots 0..num_peaks-1 during training sampling
+    z = torch.rand(32)
+    _, mu_targ, _ = agent.actor_head.get_distribution_params(z)
+    expected_centers = torch.tanh(mu_targ)
+    sampled, priors = agent.actor_head.sample_actions(
+        z, k_act=8, temperature=1.0, include_peak_means=True
+    )
+    assert sampled.shape == (8, 4)
+    torch.testing.assert_close(sampled[:4], expected_centers, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(priors.sum(), torch.tensor(1.0), atol=1e-5)
+
+
+def test_peak_mean_separation_regularization_gradient() -> None:
+    """Verifies lambda_peak_sep produces nonzero repulsion gradient when peak means overlap."""
+    torch.manual_seed(77)
+    backbone = SelfAttentionBackbone(
+        obs_dim=10, max_action_dim=4, context_dim=6, k_tok=4, d_model=32, n_heads=2, l_enc=1, latent_dim=32, history_len=2
+    )
+    actor_head = MultiPeakGMMActorHead(latent_dim=32, action_dim=4, num_peaks=4)
+    critic_head = SupportCriticHead(latent_dim=32, use_categorical=False)
+    rep_trainer = ModelRepresentationTrainer(
+        latent_dim=32, action_dim=4, num_blocks=1, proj_dim=32, pred_dim=32
+    )
+
+    # Force all peaks to have nearly identical means initially
+    with torch.no_grad():
+        actor_head.limb_head.mu_head.weight.zero_()
+        actor_head.limb_head.mu_head.bias.zero_()
+
+    obs_seq = torch.randn(2, 3, 10)
+    act_seq = torch.zeros(2, 2, 4)
+    rew_seq = torch.zeros(2, 2)
+    val_seq = torch.zeros(2, 3)
+    samples = torch.zeros(2, 3, 4, 4)
+    weights = torch.full((2, 3, 4), 0.25)
+
+    actor_head.zero_grad()
+    loss, metrics = rep_trainer.compute_unrolled_loss(
+        obs_seq=obs_seq,
+        action_seq=act_seq,
+        reward_seq=rew_seq,
+        target_value_seq=val_seq,
+        mcts_policy_samples=samples,
+        mcts_policy_weights=weights,
+        backbone=backbone,
+        actor_head=actor_head,
+        critic_head=critic_head,
+        lambda_p=0.0,
+        lambda_v=0.0,
+        lambda_r=0.0,
+        lambda_rep=0.0,
+        lambda_ent=0.0,
+        lambda_peak_ent=0.0,
+        c_reg=0.0,
+        lambda_peak_sep=0.25,
+        min_peak_separation=0.40,
+    )
+    assert metrics["peak_mean_sep"] < 0.05
+    assert metrics["loss_peak_sep"] > 0.05
+    loss.backward()
+    mu_grad = actor_head.limb_head.mu_head.bias.grad
+    assert mu_grad is not None and float(mu_grad.abs().sum().item()) > 0.0
+
+
+def test_balancer_slew_rate_and_low_win_gating() -> None:
+    """Verifies Balancer never spikes budget post-warmup and refuses upward climbs at low win rate."""
+    from config import BRLConfig
+    from brl_core.balancer import DDPGBalancer
+
+    brl_cfg = BRLConfig(
+        num_params=6,
+        budget_max=8500.0,
+        warmup_limit=30.0,
+        warmup_budget=90.0,
+    )
+    balancer = DDPGBalancer(brl_cfg, device="cpu")
+    # Force actor final linear bias strongly positive (wanting budget ~ 8500)
+    with torch.no_grad():
+        balancer.actor.net[-2].bias.fill_(5.0)
+
+    # Low win rate (0.05 < 0.35) must not increase budget above warmup_budget (90.0)
+    bal_state_low = balancer.build_state(ema_win_rate=0.05, last_win=0, dominance_score=0.1)
+    _, budget_low, _, _ = balancer.select_constraints(
+        state=bal_state_low,
+        warmup=False,
+        deterministic=False,
+        exploration_progress=0.1,
+        ema_win_rate=0.05,
+    )
+    assert budget_low <= 90.0 + 1e-5
+
+    # Healthy win rate (0.55) allows gradual slew-limited progression, capped by exploration_progress
+    bal_state_ok = balancer.build_state(ema_win_rate=0.55, last_win=1, dominance_score=0.6)
+    _, budget_step1, _, _ = balancer.select_constraints(
+        state=bal_state_ok,
+        warmup=False,
+        deterministic=False,
+        exploration_progress=0.0,
+        ema_win_rate=0.55,
+    )
+    assert 90.0 < budget_step1 <= 190.0 + 1e-5  # 90 + max(100, 0.15*90) = 190
+    assert budget_step1 <= 250.0  # exploration_progress=0.0 cap
+
 
 
 

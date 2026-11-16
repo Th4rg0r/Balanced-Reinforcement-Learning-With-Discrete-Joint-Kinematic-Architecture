@@ -442,6 +442,12 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         start = float(getattr(self.cfg, "peak_entropy_floor_ratio", 0.70))
         return float(max(0.0, start * (1.0 - self.exploration_progress)))
 
+    def get_current_lambda_peak_sep(self) -> float:
+        """Returns annealed pairwise GMM peak-mean separation regularization weight."""
+        start = float(getattr(self.cfg, "lambda_peak_sep", 0.25))
+        end = float(getattr(self.cfg, "lambda_peak_sep_end", 0.05))
+        return float(max(0.0, start + self.exploration_progress * (end - start)))
+
     def get_critic_warmup_scale(self) -> float:
         """Returns [0.15, 1.0] critic pre-conditioning ramp factor over critic_warmup_steps (Point D)."""
         warmup_steps = int(getattr(self.cfg, "critic_warmup_steps", 5000))
@@ -454,7 +460,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
 
     def get_current_q_advantage_weight(self) -> float:
         """Returns Q-advantage sharpening weight in MCTS policy selection scaled by critic warmup (Point D)."""
-        return float(2.0 * self.get_critic_warmup_scale())
+        return float(4.0 * self.get_critic_warmup_scale())
 
     def _refresh_latent_noise(self, rho: float = 0.5) -> None:
         """Updates temporally correlated unit-scale latent noise direction in z-space (Point A)."""
@@ -591,7 +597,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 z_actor_root = None
                 commit_peak_in = None
                 commit_prob_in = 0.0
-                q_adv_weight = 2.0
+                q_adv_weight = 4.0
                 eff_hold_steps = 1
                 starting_new_window = False
             else:
@@ -1030,6 +1036,8 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         eff_lambda_p = float(self.cfg.lambda_p) * warmup_scale
         eff_lambda_peak_ent = self.get_current_lambda_peak_ent()
         eff_peak_floor_ratio = self.get_current_peak_entropy_floor_ratio()
+        eff_lambda_peak_sep = self.get_current_lambda_peak_sep()
+        eff_min_peak_sep = float(getattr(self.cfg, "min_peak_separation", 0.40))
         self._diagnostics["critic_warmup_scale"] = warmup_scale
         self._diagnostics["effective_lambda_peak_ent"] = eff_lambda_peak_ent
 
@@ -1059,6 +1067,8 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             min_policy_std_target=self.get_current_std_target(),
             lambda_peak_ent=eff_lambda_peak_ent,
             peak_entropy_floor_ratio=eff_peak_floor_ratio,
+            lambda_peak_sep=eff_lambda_peak_sep,
+            min_peak_separation=eff_min_peak_sep,
         )
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(

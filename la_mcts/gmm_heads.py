@@ -784,12 +784,15 @@ class MultiPeakGMMActorHead(nn.Module):
         committed_peak: Optional[int] = None,
         mode_commitment_prob: float = 0.0,
         return_peaks: bool = False,
+        deterministic_candidates: bool = False,
+        include_peak_means: bool = True,
     ) -> Tuple[torch.Tensor, ...]:
         """Samples K_act actions from beta(. | z_t) and returns (actions, prior_weights[, peak_indices]).
 
-        When `committed_peak` and `mode_commitment_prob > 0` are given, mixes the proposal
-        mode probabilities with a one-hot on `committed_peak` to achieve temporally persistent
-        multi-step mode commitment while keeping `1 - mode_commitment_prob` mass on other modes.
+        When `deterministic_candidates=True`, returns the exact noise-free GMM mode centers
+        `tanh(mu_targ)` with priors `softmax(logits_targ)` (eliminating sampling chatter in eval).
+        When `deterministic_candidates=False` and `include_peak_means=True` with `k_act > num_peaks`,
+        anchors the first `num_peaks` candidate slots to `tanh(mu_targ)` alongside stochastic samples.
         """
         single = z_t.dim() == 1
         if single:
@@ -799,6 +802,27 @@ class MultiPeakGMMActorHead(nn.Module):
         logits_targ, mu_targ, std_targ = self.get_distribution_params(
             z_t, temperature=1.0, limb_kinematics=limb_kinematics
         )
+
+        if deterministic_candidates:
+            sampled = torch.tanh(mu_targ)
+            if action_mask is not None:
+                sampled = sampled * action_mask
+            prior_weights = F.softmax(logits_targ, dim=-1)
+            comp_indices = (
+                torch.arange(self.num_peaks, device=z_t.device, dtype=torch.long)
+                .unsqueeze(0)
+                .expand(bsz, self.num_peaks)
+            )
+            peaks_out = comp_indices.squeeze(0) if single else comp_indices
+            self.last_sampled_peaks = peaks_out.detach()
+            if single:
+                if return_peaks:
+                    return sampled.squeeze(0), prior_weights.squeeze(0), peaks_out
+                return sampled.squeeze(0), prior_weights.squeeze(0)
+            if return_peaks:
+                return sampled, prior_weights, peaks_out
+            return sampled, prior_weights
+
         if temperature != 1.0 and temperature > 0.0:
             logits_prop = logits_targ / temperature
             std_prop = torch.clamp(
@@ -837,13 +861,28 @@ class MultiPeakGMMActorHead(nn.Module):
             logits_prop_eff = logits_prop
             logits_targ_eff = logits_targ
 
-        # Draw K_act mixture indices per batch item: (B, K_act)
-        comp_indices = torch.multinomial(probs_prop, num_samples=k_act, replacement=True)
-        idx_exp = comp_indices.unsqueeze(-1).expand(bsz, k_act, self.action_dim)
+        anchor_modes = include_peak_means and k_act > self.num_peaks
+        if anchor_modes:
+            n_rand = k_act - self.num_peaks
+            rand_indices = torch.multinomial(probs_prop, num_samples=n_rand, replacement=True)
+            anchor_indices = (
+                torch.arange(self.num_peaks, device=z_t.device, dtype=torch.long)
+                .unsqueeze(0)
+                .expand(bsz, self.num_peaks)
+            )
+            comp_indices = torch.cat([anchor_indices, rand_indices], dim=-1)
+            rand_exp = rand_indices.unsqueeze(-1).expand(bsz, n_rand, self.action_dim)
+            rand_mu = torch.gather(mu_prop, dim=1, index=rand_exp)
+            rand_std = torch.gather(std_prop, dim=1, index=rand_exp)
+            u_rand = rand_mu + rand_std * torch.randn_like(rand_mu)
+            u = torch.cat([mu_targ, u_rand], dim=1)
+        else:
+            comp_indices = torch.multinomial(probs_prop, num_samples=k_act, replacement=True)
+            idx_exp = comp_indices.unsqueeze(-1).expand(bsz, k_act, self.action_dim)
+            chosen_mu = torch.gather(mu_prop, dim=1, index=idx_exp)  # (B, K_act, N)
+            chosen_std = torch.gather(std_prop, dim=1, index=idx_exp)  # (B, K_act, N)
+            u = chosen_mu + chosen_std * torch.randn_like(chosen_mu)
 
-        chosen_mu = torch.gather(mu_prop, dim=1, index=idx_exp)  # (B, K_act, N)
-        chosen_std = torch.gather(std_prop, dim=1, index=idx_exp)  # (B, K_act, N)
-        u = chosen_mu + chosen_std * torch.randn_like(chosen_mu)
         sampled = torch.tanh(u)
         if action_mask is not None:
             sampled = sampled * action_mask
@@ -979,7 +1018,8 @@ class MultiPeakGMMActorHead(nn.Module):
         action_mask: Optional[torch.Tensor] = None,
         temperature: float = 1.0,
         limb_kinematics: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_mu: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
         """Evaluates pre-tanh GMM log_prob together with entropy stats in a single actor forward pass."""
         logits, mu, std = self.get_distribution_params(
             z_t, temperature=temperature, limb_kinematics=limb_kinematics
@@ -990,6 +1030,8 @@ class MultiPeakGMMActorHead(nn.Module):
         total_ent, peak_ent, mean_std = self._compute_entropy_stats(
             logits, std, action_mask=action_mask
         )
+        if return_mu:
+            return lp, total_ent, peak_ent, mean_std, mu
         return lp, total_ent, peak_ent, mean_std
 
     def entropy_proxy(

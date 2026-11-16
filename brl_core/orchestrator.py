@@ -97,6 +97,7 @@ class BRLTrainingOrchestrator:
             warmup=is_warmup,
             deterministic=is_consolidation,
             exploration_progress=exp_progress,
+            ema_win_rate=self.win_evaluator.ema_win_rate,
         )
 
         # 2. Tweaker samples valid parameter vector w_e under Knapsack constraints

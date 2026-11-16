@@ -194,6 +194,8 @@ class ModelRepresentationTrainer(nn.Module):
         min_policy_std_target: float = 0.22,
         lambda_peak_ent: float = 0.15,
         peak_entropy_floor_ratio: float = 0.70,
+        lambda_peak_sep: float = 0.25,
+        min_peak_separation: float = 0.40,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Computes K-step unrolled total loss with SimSiam representation consistency.
 
@@ -304,9 +306,13 @@ class ModelRepresentationTrainer(nn.Module):
         samples_flat = mcts_policy_samples[:, :n_steps].reshape(
             bsz * n_steps, mcts_policy_samples.size(2), mcts_policy_samples.size(3)
         )
-        log_probs_flat, policy_entropy, peak_entropy, mean_policy_std = (
+        log_probs_flat, policy_entropy, peak_entropy, mean_policy_std, mu_flat = (
             actor_head.compute_log_prob_pre_tanh_and_entropy(
-                cum_flat, samples_flat, action_mask=mask_flat, limb_kinematics=kin_flat
+                cum_flat,
+                samples_flat,
+                action_mask=mask_flat,
+                limb_kinematics=kin_flat,
+                return_mu=True,
             )
         )
         log_probs_seq = log_probs_flat.view(bsz, n_steps, -1)
@@ -340,6 +346,34 @@ class ModelRepresentationTrainer(nn.Module):
         eff_lambda_peak = max(0.0, float(lambda_peak_ent))
         loss_peak_ent = eff_lambda_peak * (peak_floor_penalty - peak_entropy.mean())
 
+        # Pairwise geometric separation between GMM peak means tanh(mu_i), tanh(mu_j)
+        # so multi-step mode commitment explores genuinely distinct gaits/postures.
+        m_peaks = mu_flat.size(1)
+        if m_peaks >= 2:
+            squash_mu = torch.tanh(mu_flat)
+            diff = squash_mu.unsqueeze(2) - squash_mu.unsqueeze(1)
+            if mask_flat is not None:
+                if mask_flat.dim() == 1:
+                    m_exp = mask_flat.view(1, 1, 1, -1)
+                    denom_sep = mask_flat.sum().clamp_min(1.0)
+                else:
+                    m_exp = mask_flat.unsqueeze(1).unsqueeze(1)
+                    denom_sep = mask_flat.sum(dim=-1).clamp_min(1.0).view(-1, 1, 1)
+                rms_dist = torch.sqrt((diff.pow(2) * m_exp).sum(dim=-1) / denom_sep + 1e-6)
+            else:
+                rms_dist = torch.sqrt(diff.pow(2).mean(dim=-1) + 1e-6)
+            triu_mask = torch.triu(
+                torch.ones((m_peaks, m_peaks), device=mu_flat.device, dtype=torch.bool),
+                diagonal=1,
+            )
+            pair_dist = rms_dist[:, triu_mask]
+            peak_mean_sep = pair_dist.mean()
+            eff_lambda_sep = max(0.0, float(lambda_peak_sep))
+            loss_peak_sep = eff_lambda_sep * F.relu(float(min_peak_separation) - pair_dist).mean()
+        else:
+            peak_mean_sep = torch.tensor(0.0, device=obs_seq.device, dtype=obs_seq.dtype)
+            loss_peak_sep = torch.tensor(0.0, device=obs_seq.device, dtype=obs_seq.dtype)
+
         # Per-joint Gaussian std bounds [std_floor, std_ceil]
         std_floor = max(0.05, float(min_policy_std_target))
         std_ceil = max(std_floor + 0.15, 0.45)
@@ -354,6 +388,7 @@ class ModelRepresentationTrainer(nn.Module):
             + lambda_rep * loss_rep
             - lambda_ent * loss_ent
             + loss_peak_ent
+            + loss_peak_sep
             + c_reg * reg_loss
         )
 
@@ -364,9 +399,11 @@ class ModelRepresentationTrainer(nn.Module):
             "loss_r": float(loss_r.detach().item()),
             "loss_rep": float(loss_rep.detach().item()),
             "loss_peak_ent": float(loss_peak_ent.detach().item()),
+            "loss_peak_sep": float(loss_peak_sep.detach().item()),
             "policy_entropy": float(policy_entropy.mean().detach().item()),
             "peak_entropy": float(peak_entropy.mean().detach().item()),
             "peak_ent_floor": float(peak_ent_floor),
+            "peak_mean_sep": float(peak_mean_sep.detach().item()),
             "policy_std": float(mean_policy_std.mean().detach().item()),
         }
         return total_loss, metrics

@@ -104,7 +104,7 @@ class SampledContinuousMCTS:
         root_tau_beta: float = 1.25,
         inner_tau_beta: float = 1.0,
         tau_act: float = 1.0,
-        batch_leaf_eval: int = 16,
+        batch_leaf_eval: int = 4,
         root_dirichlet_alpha: float = 0.3,
         root_exploration_fraction: float = 0.25,
         latent_ema_decay: float = 0.4,
@@ -160,6 +160,7 @@ class SampledContinuousMCTS:
         z_actor_state: Optional[torch.Tensor] = None,
         committed_peak: Optional[int] = None,
         mode_commitment_prob: float = 0.0,
+        deterministic_candidates: bool = False,
     ) -> MCTSNode:
         """Evaluates actor and critic heads on cumulative latent state to initialize an MCTSNode.
 
@@ -177,6 +178,7 @@ class SampledContinuousMCTS:
             committed_peak=committed_peak,
             mode_commitment_prob=mode_commitment_prob,
             return_peaks=True,
+            deterministic_candidates=deterministic_candidates,
         )
         v_val = float(self.critic_head(cum_state.unsqueeze(0)).squeeze().item())
         return MCTSNode(
@@ -203,7 +205,7 @@ class SampledContinuousMCTS:
         z_actor_root: Optional[torch.Tensor] = None,
         committed_peak: Optional[int] = None,
         mode_commitment_prob: float = 0.0,
-        q_advantage_weight: float = 2.0,
+        q_advantage_weight: float = 4.0,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, MCTSNode]:
         """Executes N_sim MCTS simulations from z_root using virtual-loss leaf batching.
 
@@ -249,9 +251,11 @@ class SampledContinuousMCTS:
                 z_actor_state=(None if deterministic else z_actor_root),
                 committed_peak=(None if deterministic else committed_peak),
                 mode_commitment_prob=(0.0 if deterministic else float(mode_commitment_prob)),
+                deterministic_candidates=deterministic,
             )
-            if not deterministic and eff_root_exp > 0.0:
-                noise = np.random.dirichlet([self.root_dirichlet_alpha] * self.k_act)
+            eff_k_act = len(root.prior_weights)
+            if not deterministic and eff_root_exp > 0.0 and eff_k_act > 0:
+                noise = np.random.dirichlet([self.root_dirichlet_alpha] * eff_k_act)
                 root.prior_weights = (
                     (1.0 - eff_root_exp) * root.prior_weights
                     + eff_root_exp * noise
@@ -327,6 +331,7 @@ class SampledContinuousMCTS:
                         temperature=self.inner_tau_beta,
                         action_mask=action_mask,
                         limb_kinematics=limb_kinematics,
+                        deterministic_candidates=deterministic,
                     )
                     priors_np = prior_weights_batch.detach().cpu().numpy()
                 else:
@@ -396,10 +401,10 @@ class SampledContinuousMCTS:
                 if sum_pow > 0.0:
                     policy_weights = exp_w / sum_pow
                 else:
-                    policy_weights = np.full(self.k_act, 1.0 / self.k_act, dtype=np.float64)
+                    policy_weights = np.full(eff_k_act, 1.0 / max(1, eff_k_act), dtype=np.float64)
                 # Ensure exact normalization within floating-point precision
                 policy_weights = policy_weights / np.sum(policy_weights)
-                chosen_idx = int(np.random.choice(self.k_act, p=policy_weights))
+                chosen_idx = int(np.random.choice(eff_k_act, p=policy_weights))
 
             if root.sampled_peaks is not None and 0 <= chosen_idx < len(root.sampled_peaks):
                 root.chosen_peak = int(root.sampled_peaks[chosen_idx])

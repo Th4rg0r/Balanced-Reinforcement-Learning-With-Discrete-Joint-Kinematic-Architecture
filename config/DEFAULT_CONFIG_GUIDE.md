@@ -171,12 +171,13 @@ This document provides a comprehensive reference for every configuration paramet
   - `beta_mse: 1.0`: Stop-gradient MSE weight inside the hybrid SimSiam cosine + MSE consistency loss.
   - `lambda_v: 0.5`: Weight of the value critic loss.
   - `lambda_r: 1.0`: Weight of the step reward prediction loss.
-  - `lambda_p: 0.25`: Weight of the policy prior cross-entropy loss against MCTS search policy $\pi_{\text{mcts}}$ (ramped by `critic_warmup_steps` during pre-conditioning).
+  - `lambda_p: 1.0`: Weight of the policy prior cross-entropy loss against MCTS search policy $\pi_{\text{mcts}}$ (ramped by `critic_warmup_steps` during pre-conditioning).
   - `lambda_ent: 0.03`: Weight of the per-joint Gaussian standard-deviation floor/ceiling regularization (`std_floor` $\to$ `std_ceil`).
   - `lambda_peak_ent: 0.15` $\to$ `lambda_peak_ent_end: 0.02`: Decaying weight on the GMM categorical mixture-weight entropy $H(\pi)$ (with `peak_entropy_floor_ratio: 0.70` $\to$ `0.0`) to prevent premature mode collapse without forcing destructive per-joint variance.
+  - `lambda_peak_sep: 0.25` $\to$ `lambda_peak_sep_end: 0.05` (`min_peak_separation: 0.40`): Decaying pairwise RMS separation penalty between GMM peak means $\tanh(\mu_i), \tanh(\mu_j)$ so modes represent genuinely distinct gaits/postures.
 - **Training Impact**:
   - Balanced multi-task loss objective:
-    $$\mathcal{L}_{\text{total}} = \lambda_p \mathcal{L}_{\text{policy}} + \lambda_v \mathcal{L}_{\text{value}} + \lambda_r \mathcal{L}_{\text{reward}} + \lambda_{\text{rep}} \mathcal{L}_{\text{rep}} - \lambda_{\text{ent}} \mathcal{L}_{\text{ent}} + \mathcal{L}_{\text{peak\_ent}} + c_{\text{reg}} \|\theta\|_2^2$$
+    $$\mathcal{L}_{\text{total}} = \lambda_p \mathcal{L}_{\text{policy}} + \lambda_v \mathcal{L}_{\text{value}} + \lambda_r \mathcal{L}_{\text{reward}} + \lambda_{\text{rep}} \mathcal{L}_{\text{rep}} - \lambda_{\text{ent}} \mathcal{L}_{\text{ent}} + \mathcal{L}_{\text{peak\_ent}} + \mathcal{L}_{\text{peak\_sep}} + c_{\text{reg}} \|\theta\|_2^2$$
 
 #### `c_reg`
 - **Type**: `float` | **Default**: `0.0001` ($10^{-4}$)
@@ -196,8 +197,8 @@ Exploration in LA-MCTS is dynamically annealed using the environment's **rolling
   - **Eval (64)**: 4 GPU batches during evaluation to extract maximum performance from the learned world model.
 
 #### `k_act`
-- **Type**: `int` | **Default**: `16`
-- **Purpose**: Number of candidate continuous actions sampled from the policy prior $p(a \mid s)$ when expanding a tree node.
+- **Type**: `int` | **Default**: `8`
+- **Purpose**: Number of candidate continuous actions per tree node (anchoring the `num_peaks` deterministic peak centers alongside exploratory Gaussian samples during training, and evaluating exact noise-free mode centers during `deterministic=True` evaluation).
 
 #### `c_1` and `c_2`
 - **Type**: `float` | **Default**: `c_1: 1.50`, `c_2: 19652.0`
@@ -213,9 +214,9 @@ Exploration in LA-MCTS is dynamically annealed using the environment's **rolling
 - **Purpose**: Injects Dirichlet noise $\text{Dir}(\alpha)$ into the root node policy prior, with mixing fraction $\epsilon$ annealing linearly from `0.40` (at `0` return) down to `0.12` (at `3000` rolling raw return).
 
 #### `tau_act_train`, `tau_act_train_end`, and `tau_act_eval`
-- **Type**: `float` | **Default**: `tau_act_train: 1.0`, `tau_act_train_end: 0.25`, `tau_act_eval: 0.05`
+- **Type**: `float` | **Default**: `tau_act_train: 1.0`, `tau_act_train_end: 0.15`, `tau_act_eval: 0.05`
 - **Purpose**: Temperature used when selecting the executed environment action from root visit counts and normalized Q-values:
-  - **Training (`tau_act_train` $\to$ `tau_act_train_end`)**: Starts at `1.0` for broad root action exploration at `0` return and anneals linearly to `0.25` at `3000` rolling raw return so high-speed gaits execute high-value MCTS branches reliably.
+  - **Training (`tau_act_train` $\to$ `tau_act_train_end`)**: Starts at `1.0` for broad root action exploration at `0` return and anneals linearly to `0.15` at `3000` rolling raw return so high-speed gaits execute high-value MCTS branches reliably.
   - **Evaluation (`tau_act_eval: 0.05`)**: Near-deterministic greedy selection for benchmark evaluation.
 
 #### `adaptive_exploration`, `min_policy_std_target`, `min_policy_std_target_end`, and `exploration_boost_max`
@@ -235,7 +236,7 @@ Exploration in LA-MCTS is dynamically annealed using the environment's **rolling
 ### 1.6 Replay Buffer & MuZero Reanalyze
 
 #### `lr`
-- **Type**: `float` | **Default**: `0.000085` ($8.5 \times 10^{-5}$)
+- **Type**: `float` | **Default**: `0.00018` ($1.8 \times 10^{-4}$)
 - **Purpose**: AdamW optimizer learning rate for the Agent networks (Transformer representation, dynamics, value critic, and policy prior).
 
 #### `batch_size`
@@ -357,7 +358,7 @@ Exploration in LA-MCTS is dynamically annealed using the environment's **rolling
   - `default_num_legs: 4`
 
 #### `action_ema_alpha` and `action_smoothness_coef`
-- **Type**: `float` | **Default**: `action_ema_alpha: 0.06`, `action_smoothness_coef: 0.15`
+- **Type**: `float` | **Default**: `action_ema_alpha: 0.35`, `action_smoothness_coef: 0.05`
 - **Purpose**:
   - `action_ema_alpha`: Initial exponential moving average action filter weight ($a_t^{\text{env}} = \alpha_{\text{ema}} a_t + (1 - \alpha_{\text{ema}}) a_{t-1}^{\text{env}}$). Interpolates linearly from `action_ema_alpha` to `1.0` (unfiltered agility) as `current_return` progresses from `0` to `torque_return_ref` (`1000.0`).
   - `action_smoothness_coef`: Penalty weight on squared action changes $\|a_t - a_{t-1}\|_2^2$. Scaled by $(1 - \alpha_{\text{torque}})$ so the smoothness penalty vanishes completely once `current_return` reaches `torque_return_ref` (`1000.0`).

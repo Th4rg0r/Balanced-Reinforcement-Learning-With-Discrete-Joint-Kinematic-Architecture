@@ -273,6 +273,7 @@ class DDPGBalancer(nn.Module):
         warmup: bool = False,
         deterministic: bool = False,
         exploration_progress: float = 0.0,
+        ema_win_rate: Optional[float] = None,
     ) -> Tuple[np.ndarray, float, np.ndarray, np.ndarray]:
         """Emits (L_e, B_e, C_e, raw_action) for episode e."""
         if warmup:
@@ -304,6 +305,21 @@ class DDPGBalancer(nn.Module):
             raw_act = np.clip(raw_act + noise, 0.01, 0.99)
 
         limits, budget, costs = self._decode_raw_action(raw_act)
+        if not deterministic:
+            eff_win = float(state[0]) if ema_win_rate is None else float(ema_win_rate)
+            eff_budget_cap = min(
+                float(self.cfg.budget_max),
+                250.0 + prog * max(0.0, float(self.cfg.budget_max) - 250.0),
+            )
+            if eff_win < 0.35:
+                budget = min(budget, float(self.last_budget))
+            else:
+                max_step_up = max(100.0, 0.15 * float(self.last_budget))
+                budget = min(budget, float(self.last_budget) + max_step_up)
+            budget = float(np.clip(budget, 0.0, eff_budget_cap))
+            raw_act[self.P] = float(
+                np.clip(budget / max(float(self.cfg.budget_max), 1e-6), 0.0, 1.0)
+            )
         self.last_limits = limits
         self.last_budget = budget
         self.last_costs = costs
@@ -384,14 +400,14 @@ class DDPGBalancer(nn.Module):
             rho_fail = states[:, 5 + self.P : 5 + 2 * self.P]
 
             # When imbalance < 0 (env wins too much), reduce limits/budget and raise costs on failing params
-            target_scale = torch.clamp(0.5 + 1.5 * imbalance, 0.05, 0.95)
+            target_scale = torch.clamp(0.4 + 1.5 * imbalance, 0.02, 0.95)
             target_costs = torch.clamp(0.2 + 0.6 * F.relu(rho_fail), 0.05, 0.95)
             cyber_reg = (
                 F.mse_loss(pred_actions[:, : self.P + 1], target_scale.expand(-1, self.P + 1))
                 + F.mse_loss(pred_actions[:, self.P + 1 :], target_costs)
             )
 
-            actor_loss = -q1_pred.mean() + 0.25 * cyber_reg
+            actor_loss = -q1_pred.mean() + 2.5 * cyber_reg
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=2.0)
