@@ -15,7 +15,11 @@ import torch.optim as optim
 from brl_core.interfaces import AbstractBRLSolverAgent
 from config import LAMCTSConfig
 from la_mcts.backbone import SelfAttentionBackbone, combine_cumulative_rep, min_max_normalize
-from la_mcts.gmm_heads import MultiPeakGMMActorHead, SupportCriticHead
+from la_mcts.gmm_heads import (
+    DeterministicActorHead,
+    MultiPeakGMMActorHead,
+    SupportCriticHead,
+)
 from la_mcts.rep_trainer import ModelRepresentationTrainer
 from la_mcts.sampled_mcts import SampledContinuousMCTS
 
@@ -275,13 +279,22 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             max_action_dim=self.cfg.max_action_dim,
         ).to(self.device)
 
-        self.actor_head = MultiPeakGMMActorHead(
-            latent_dim=self.cfg.latent_dim,
-            action_dim=self.cfg.max_action_dim,
-            num_peaks=self.cfg.num_peaks,
-            log_std_bounds=self.cfg.log_std_bounds,
-            joints_per_limb=(2 if self.cfg.obs_dim <= 35 else None),
-        ).to(self.device)
+        actor_type = str(getattr(self.cfg, "actor_type", "deterministic")).lower()
+        joints_per_limb = 2 if self.cfg.obs_dim <= 35 else None
+        if actor_type == "gmm":
+            self.actor_head: MultiPeakGMMActorHead | DeterministicActorHead = MultiPeakGMMActorHead(
+                latent_dim=self.cfg.latent_dim,
+                action_dim=self.cfg.max_action_dim,
+                num_peaks=self.cfg.num_peaks,
+                log_std_bounds=self.cfg.log_std_bounds,
+                joints_per_limb=joints_per_limb,
+            ).to(self.device)
+        else:
+            self.actor_head = DeterministicActorHead(
+                latent_dim=self.cfg.latent_dim,
+                action_dim=self.cfg.max_action_dim,
+                joints_per_limb=joints_per_limb,
+            ).to(self.device)
 
         self.critic_head = SupportCriticHead(
             latent_dim=self.cfg.latent_dim,
@@ -462,6 +475,17 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         """Returns Q-advantage sharpening weight in MCTS policy selection scaled by critic warmup (Point D)."""
         return float(4.0 * self.get_critic_warmup_scale())
 
+    def get_current_action_explore_std(self) -> float:
+        """Returns annealed exploratory action noise std around deterministic proposals."""
+        start = float(getattr(self.cfg, "action_explore_std", 0.12))
+        end = float(getattr(self.cfg, "action_explore_std_end", 0.02))
+        return float(max(0.0, start + self.exploration_progress * (end - start)))
+
+    def get_current_lambda_dpg(self) -> float:
+        """Returns DPG weight gated by critic/world-model warmup (Point D)."""
+        base = float(getattr(self.cfg, "lambda_dpg", 0.50))
+        return float(max(0.0, base * self.get_critic_warmup_scale()))
+
     def _refresh_latent_noise(self, rho: float = 0.5) -> None:
         """Updates temporally correlated unit-scale latent noise direction in z-space (Point A)."""
         eps = torch.randn(self.cfg.latent_dim, device=self.device, dtype=torch.float32)
@@ -600,6 +624,8 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 q_adv_weight = 4.0
                 eff_hold_steps = 1
                 starting_new_window = False
+                eff_lat_noise = 0.0
+                eff_act_noise = 0.0
             else:
                 eff_hold_steps = self.get_current_mode_hold_steps()
                 eff_commit_prob = self.get_current_mode_commitment_prob()
@@ -620,8 +646,9 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 std_target = self.get_current_std_target()
                 base_tau_act = self.get_current_tau_act_train()
                 base_root_exp = self.get_current_root_exploration_fraction()
+                is_det_head = bool(getattr(self.actor_head, "is_deterministic", False))
                 explore_scale = 1.0
-                if self.cfg.adaptive_exploration:
+                if self.cfg.adaptive_exploration and not is_det_head:
                     cur_std = float(
                         self._diagnostics.get("policy_std", std_target)
                     )
@@ -635,11 +662,11 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                             max(1.0, boost_cap),
                         )
                     )
+                eff_lat_noise = self.get_current_latent_noise_std()
+                eff_act_noise = self.get_current_action_explore_std()
                 self._diagnostics["exploration_scale"] = explore_scale
                 self._diagnostics["effective_std_target"] = std_target
-                self._diagnostics["effective_latent_noise_std"] = (
-                    self.get_current_latent_noise_std()
-                )
+                self._diagnostics["effective_latent_noise_std"] = eff_lat_noise
                 self._diagnostics["critic_warmup_scale"] = self.get_critic_warmup_scale()
                 tau_act = base_tau_act * explore_scale
                 self._diagnostics["effective_tau_act"] = tau_act
@@ -662,6 +689,8 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     committed_peak=commit_peak_in,
                     mode_commitment_prob=commit_prob_in,
                     q_advantage_weight=q_adv_weight,
+                    latent_noise_std=eff_lat_noise,
+                    action_noise_std=eff_act_noise,
                 )
             )
             if not deterministic:
@@ -862,6 +891,8 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     root_exploration_fraction=self.get_current_root_exploration_fraction(),
                     prev_cum_state=prev_cum_root,
                     q_advantage_weight=self.get_current_q_advantage_weight(),
+                    latent_noise_std=self.get_current_latent_noise_std(),
+                    action_noise_std=self.get_current_action_explore_std(),
                 )
                 traj.mcts_policy_samples[step] = root_samples
                 traj.mcts_policy_weights[step] = policy_weights
@@ -1071,6 +1102,23 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             min_peak_separation=eff_min_peak_sep,
         )
         total_loss.backward()
+        eff_lambda_dpg = self.get_current_lambda_dpg()
+        if eff_lambda_dpg > 0.0 and self.rep_trainer._last_root_latents is not None:
+            z_0_det, cum_0_det = self.rep_trainer._last_root_latents
+            loss_dpg, dpg_metrics = self.rep_trainer.compute_deterministic_policy_loss(
+                z_0=z_0_det,
+                cum_0=cum_0_det,
+                actor_head=self.actor_head,
+                critic_head=self.critic_head,
+                action_mask=mask_batch,
+                limb_kinematics=kin_batch,
+                gamma=self.cfg.gamma,
+                dpg_horizon=int(getattr(self.cfg, "dpg_horizon", 2)),
+                lambda_dpg=eff_lambda_dpg,
+            )
+            loss_dpg.backward()
+            metrics.update(dpg_metrics)
+
         torch.nn.utils.clip_grad_norm_(
             list(self.backbone.parameters())
             + list(self.actor_head.parameters())

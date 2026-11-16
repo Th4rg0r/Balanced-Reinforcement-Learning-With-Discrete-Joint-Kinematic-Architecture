@@ -304,7 +304,14 @@ def load_training_checkpoint(
     payload: Dict[str, Any] = torch.load(
         ckpt_path, map_location=torch.device(device), weights_only=False
     )
-    cfg = config_from_dict(payload.get("config", {}))
+    raw_cfg = dict(payload.get("config", {}) or {})
+    raw_la = dict(raw_cfg.get("la_mcts", {}) or {})
+    if "actor_type" not in raw_la:
+        actor_sd = (payload.get("agent_state_dict", {}) or {}).get("actor_head", {}) or {}
+        if "logits_net.weight" in actor_sd:
+            raw_la["actor_type"] = "gmm"
+    raw_cfg["la_mcts"] = raw_la
+    cfg = config_from_dict(raw_cfg)
     la_cfg = replace(
         cfg.la_mcts,
         max_action_dim=cfg.ant_morph.max_action_capacity,
@@ -523,7 +530,7 @@ def run_single_seed(
             resume_count = int(prev_prog.get("resume_count", 0)) + 1
             step_milestones_reached = set(prev_prog.get("step_milestones_reached", []))
 
-            _, _, _, _, payload = load_training_checkpoint(ckpt_to_resume, device=device)
+            resumed_agent, _, _, _, payload = load_training_checkpoint(ckpt_to_resume, device=device)
             completed_episodes = int(payload.get("episode", 0))
             total_env_steps = int(payload.get("total_env_steps", 0))
             env.set_total_env_steps(total_env_steps)
@@ -532,7 +539,12 @@ def run_single_seed(
             if (seed_ckpt_dir / "best_model.pt").exists():
                 best_checkpoint_path = str(seed_ckpt_dir / "best_model.pt")
 
-            if "agent_state_dict" in payload:
+            if getattr(resumed_agent.actor_head, "is_deterministic", False) != getattr(
+                agent.actor_head, "is_deterministic", False
+            ):
+                agent = resumed_agent
+                orchestrator.agent = agent
+            elif "agent_state_dict" in payload:
                 agent.load_state_dict(payload["agent_state_dict"])
             agent.total_transitions_observed = max(
                 getattr(agent, "total_transitions_observed", 0),

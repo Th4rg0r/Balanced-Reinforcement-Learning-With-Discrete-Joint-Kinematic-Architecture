@@ -1,13 +1,184 @@
-"""Multi-Peak GMM Actor Head and Categorical Support Critic Head for LA-MCTS."""
+"""Actor Heads (Deterministic & Multi-Peak GMM) and Categorical Support Critic Head for LA-MCTS."""
 
 from __future__ import annotations
 
 import math
-from typing import Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions as D
+
+from la_mcts.backbone import min_max_normalize
+
+
+def encode_limb_kinematics(kinematics: torch.Tensor) -> torch.Tensor:
+    """Projects (..., 11) [x, y, z, yaw, pitch, diff_rx..rz, world_rx..rz] (or legacy 5D/8D) into (..., 26) harmonic embedding."""
+    x = kinematics[..., 0:1]
+    y = kinematics[..., 1:2]
+    z = kinematics[..., 2:3]
+    yaw = kinematics[..., 3:4]
+    pitch = kinematics[..., 4:5]
+
+    two_pi_yaw = 2.0 * math.pi * yaw
+    pi_pitch = math.pi * pitch
+
+    cos_yaw = torch.cos(two_pi_yaw)
+    sin_yaw = torch.sin(two_pi_yaw)
+    sin_pitch = torch.sin(pi_pitch)
+
+    if kinematics.shape[-1] >= 8:
+        diff_rx = kinematics[..., 5:6]
+        diff_ry = kinematics[..., 6:7]
+        diff_rz = kinematics[..., 7:8]
+    else:
+        diff_rx = torch.zeros_like(x)
+        diff_ry = torch.zeros_like(x)
+        diff_rz = torch.zeros_like(x)
+
+    if kinematics.shape[-1] >= 11:
+        world_rx = kinematics[..., 8:9]
+        world_ry = kinematics[..., 9:10]
+        world_rz = kinematics[..., 10:11]
+    else:
+        world_rx = torch.zeros_like(x)
+        world_ry = torch.zeros_like(x)
+        world_rz = torch.zeros_like(x)
+
+    pi_rx = math.pi * diff_rx
+    pi_ry = math.pi * diff_ry
+    pi_rz = math.pi * diff_rz
+
+    pi_wrx = math.pi * world_rx
+    pi_wry = math.pi * world_ry
+    pi_wrz = math.pi * world_rz
+
+    return torch.cat(
+        [
+            x, y, z,
+            yaw, cos_yaw, sin_yaw,
+            pitch, sin_pitch,
+            diff_rx, torch.cos(pi_rx), torch.sin(pi_rx),
+            diff_ry, torch.cos(pi_ry), torch.sin(pi_ry),
+            diff_rz, torch.cos(pi_rz), torch.sin(pi_rz),
+            world_rx, torch.cos(pi_wrx), torch.sin(pi_wrx),
+            world_ry, torch.cos(pi_wry), torch.sin(pi_wry),
+            world_rz, torch.cos(pi_wrz), torch.sin(pi_wrz),
+        ],
+        dim=-1,
+    )
+
+
+def _pack_single_limb_kinematics(
+    anchor: Tuple[float, float, float] | Sequence[float] | torch.Tensor,
+    yaw: float | torch.Tensor,
+    pitch: float | torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+    angle_diff: Optional[Tuple[float, float, float] | Sequence[float] | torch.Tensor] = None,
+    world_euler: Optional[Tuple[float, float, float] | Sequence[float] | torch.Tensor] = None,
+) -> torch.Tensor:
+    """Packs scalar/tensor single-limb anchor and angles into (N, 11) tensor."""
+    anchor_t = (
+        anchor.to(device=device, dtype=dtype)
+        if torch.is_tensor(anchor)
+        else torch.tensor(anchor, dtype=dtype, device=device)
+    )
+    yaw_t = (
+        yaw.to(device=device, dtype=dtype).view(-1)
+        if torch.is_tensor(yaw)
+        else torch.tensor([yaw], dtype=dtype, device=device)
+    )
+    pitch_t = (
+        pitch.to(device=device, dtype=dtype).view(-1)
+        if torch.is_tensor(pitch)
+        else torch.tensor([pitch], dtype=dtype, device=device)
+    )
+    n_rows = anchor_t.view(-1, 3).shape[0]
+    if angle_diff is None:
+        diff_t = torch.zeros(n_rows, 3, dtype=dtype, device=device)
+    elif not torch.is_tensor(angle_diff):
+        diff_t = torch.tensor(angle_diff, dtype=dtype, device=device).view(-1, 3)
+    else:
+        diff_t = angle_diff.to(device=device, dtype=dtype).view(-1, 3)
+
+    if world_euler is None:
+        world_t = torch.zeros(n_rows, 3, dtype=dtype, device=device)
+    elif not torch.is_tensor(world_euler):
+        world_t = torch.tensor(world_euler, dtype=dtype, device=device).view(-1, 3)
+    else:
+        world_t = world_euler.to(device=device, dtype=dtype).view(-1, 3)
+
+    return torch.cat(
+        [anchor_t.view(-1, 3), yaw_t.view(-1, 1), pitch_t.view(-1, 1), diff_t, world_t],
+        dim=-1,
+    )
+
+
+def _build_default_morphology(
+    action_dim: int, joints_per_limb: Optional[int] = None
+) -> Tuple[List[int], int, torch.Tensor]:
+    """Builds canonical per-limb joint counts, max joints per limb, and default kinematics."""
+    if action_dim == 8:
+        default_joint_counts = [2, 2, 2, 2]
+        max_j = 2
+        def_kin = torch.tensor([
+            [ 0.2,  0.2, 0.0, 0.625, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [-0.2,  0.2, 0.0, 0.875, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [-0.2, -0.2, 0.0, 0.125, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [ 0.2, -0.2, 0.0, 0.375, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ], dtype=torch.float32)
+    elif action_dim == 12:
+        j_lim = joints_per_limb if joints_per_limb is not None else 3
+        default_joint_counts = [j_lim] * 4
+        max_j = 3
+        def_kin = torch.tensor([
+            [ 0.188, -0.08, 0.0, 0.064, 0.286, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [ 0.188,  0.08, 0.0, 0.938, 0.260, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [-0.188, -0.08, 0.0, 0.060, 0.256, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [-0.188,  0.08, 0.0, 0.946, 0.261, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ], dtype=torch.float32)
+    elif action_dim == 17:
+        default_joint_counts = [3, 4, 4, 3, 3]
+        max_j = 4
+        def_kin = torch.tensor([
+            [ 0.000,  0.000,  0.000, 0.500, 0.500, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [-0.010, -0.100, -0.465, 0.741, 0.008, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [-0.008,  0.100, -0.465, 0.364, 0.004, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [ 0.000, -0.170,  0.060, 0.376, 0.303, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [ 0.000,  0.170,  0.060, 0.623, 0.302, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ], dtype=torch.float32)
+    else:
+        j_per = max(1, action_dim // 4)
+        rem = action_dim - j_per * 3
+        default_joint_counts = [j_per, j_per, j_per, rem]
+        max_j = max(j_per, rem)
+        def_kin = torch.tensor([
+            [ 0.2,  0.2, 0.0, 0.125, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [-0.2,  0.2, 0.0, 0.875, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [-0.2, -0.2, 0.0, 0.375, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [ 0.2, -0.2, 0.0, 0.625, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ], dtype=torch.float32)
+    effective_max_j = joints_per_limb if joints_per_limb is not None else max_j
+    return default_joint_counts, effective_max_j, def_kin
+
+
+def _flatten_kinematics_batch(
+    limb_kinematics: torch.Tensor, bsz: int
+) -> Tuple[torch.Tensor, int]:
+    """Normalizes (n_limbs, K) or (B, n_limbs, K) or (*, n_limbs, K) to (bsz, n_limbs, K)."""
+    kin_dim = limb_kinematics.shape[-1]
+    if limb_kinematics.dim() == 2:
+        n_limbs = limb_kinematics.shape[0]
+        kin_flat = limb_kinematics.unsqueeze(0).expand(bsz, n_limbs, kin_dim)
+    elif limb_kinematics.dim() >= 3:
+        n_limbs = limb_kinematics.shape[-2]
+        kin_flat = limb_kinematics.reshape(-1, n_limbs, kin_dim)
+        if kin_flat.shape[0] == 1 and bsz > 1:
+            kin_flat = kin_flat.expand(bsz, n_limbs, kin_dim)
+    else:
+        raise ValueError(f"Unsupported limb_kinematics shape: {limb_kinematics.shape}")
+    return kin_flat, n_limbs
 
 
 class TanhMixtureSameFamily:
@@ -228,59 +399,7 @@ class MorphologicalLimbHead(nn.Module):
     @staticmethod
     def encode_kinematics(kinematics: torch.Tensor) -> torch.Tensor:
         """Projects (..., 11) [x, y, z, yaw, pitch, diff_rx..rz, world_rx..rz] (or legacy 5D/8D) into (..., 26) harmonic kinematic representation."""
-        x = kinematics[..., 0:1]
-        y = kinematics[..., 1:2]
-        z = kinematics[..., 2:3]
-        yaw = kinematics[..., 3:4]
-        pitch = kinematics[..., 4:5]
-
-        two_pi_yaw = 2.0 * math.pi * yaw
-        pi_pitch = math.pi * pitch
-
-        cos_yaw = torch.cos(two_pi_yaw)
-        sin_yaw = torch.sin(two_pi_yaw)
-        sin_pitch = torch.sin(pi_pitch)
-
-        if kinematics.shape[-1] >= 8:
-            diff_rx = kinematics[..., 5:6]
-            diff_ry = kinematics[..., 6:7]
-            diff_rz = kinematics[..., 7:8]
-        else:
-            diff_rx = torch.zeros_like(x)
-            diff_ry = torch.zeros_like(x)
-            diff_rz = torch.zeros_like(x)
-
-        if kinematics.shape[-1] >= 11:
-            world_rx = kinematics[..., 8:9]
-            world_ry = kinematics[..., 9:10]
-            world_rz = kinematics[..., 10:11]
-        else:
-            world_rx = torch.zeros_like(x)
-            world_ry = torch.zeros_like(x)
-            world_rz = torch.zeros_like(x)
-
-        pi_rx = math.pi * diff_rx
-        pi_ry = math.pi * diff_ry
-        pi_rz = math.pi * diff_rz
-
-        pi_wrx = math.pi * world_rx
-        pi_wry = math.pi * world_ry
-        pi_wrz = math.pi * world_rz
-
-        return torch.cat(
-            [
-                x, y, z,
-                yaw, cos_yaw, sin_yaw,
-                pitch, sin_pitch,
-                diff_rx, torch.cos(pi_rx), torch.sin(pi_rx),
-                diff_ry, torch.cos(pi_ry), torch.sin(pi_ry),
-                diff_rz, torch.cos(pi_rz), torch.sin(pi_rz),
-                world_rx, torch.cos(pi_wrx), torch.sin(pi_wrx),
-                world_ry, torch.cos(pi_wry), torch.sin(pi_wry),
-                world_rz, torch.cos(pi_wrz), torch.sin(pi_wrz),
-            ],
-            dim=-1,
-        )
+        return encode_limb_kinematics(kinematics)
 
     def _encode_and_decode(
         self,
@@ -333,37 +452,8 @@ class MorphologicalLimbHead(nn.Module):
         """Computes per-peak (mu, log_std) [and weight when return_weights=True] for a single limb."""
         device = z_t.device
         dtype = z_t.dtype
-        if not torch.is_tensor(anchor):
-            anchor_t = torch.tensor(anchor, dtype=dtype, device=device)
-        else:
-            anchor_t = anchor.to(device=device, dtype=dtype)
-        if not torch.is_tensor(yaw):
-            yaw_t = torch.tensor([yaw], dtype=dtype, device=device)
-        else:
-            yaw_t = yaw.to(device=device, dtype=dtype).view(-1)
-        if not torch.is_tensor(pitch):
-            pitch_t = torch.tensor([pitch], dtype=dtype, device=device)
-        else:
-            pitch_t = pitch.to(device=device, dtype=dtype).view(-1)
-
-        n_rows = anchor_t.view(-1, 3).shape[0]
-        if angle_diff is None:
-            diff_t = torch.zeros(n_rows, 3, dtype=dtype, device=device)
-        elif not torch.is_tensor(angle_diff):
-            diff_t = torch.tensor(angle_diff, dtype=dtype, device=device).view(-1, 3)
-        else:
-            diff_t = angle_diff.to(device=device, dtype=dtype).view(-1, 3)
-
-        if world_euler is None:
-            world_t = torch.zeros(n_rows, 3, dtype=dtype, device=device)
-        elif not torch.is_tensor(world_euler):
-            world_t = torch.tensor(world_euler, dtype=dtype, device=device).view(-1, 3)
-        else:
-            world_t = world_euler.to(device=device, dtype=dtype).view(-1, 3)
-
-        kin_11d = torch.cat(
-            [anchor_t.view(-1, 3), yaw_t.view(-1, 1), pitch_t.view(-1, 1), diff_t, world_t],
-            dim=-1,
+        kin_11d = _pack_single_limb_kinematics(
+            anchor, yaw, pitch, device=device, dtype=dtype, angle_diff=angle_diff, world_euler=world_euler
         )
         geom = self.encode_kinematics(kin_11d).unsqueeze(1)  # (B_or_1, 1, 26)
 
@@ -508,53 +598,11 @@ class MultiPeakGMMActorHead(nn.Module):
         self.log_std_net = nn.Linear(latent_dim, num_peaks * action_dim)
 
         # Configure default kinematics and joint partitioning based on action_dim
-        if action_dim == 8:
-            # Ant (4 legs, 2 joints each)
-            self.default_joint_counts = [2, 2, 2, 2]
-            max_j = 2
-            def_kin = torch.tensor([
-                [ 0.2,  0.2, 0.0, 0.625, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [-0.2,  0.2, 0.0, 0.875, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [-0.2, -0.2, 0.0, 0.125, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [ 0.2, -0.2, 0.0, 0.375, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            ], dtype=torch.float32)
-        elif action_dim == 12:
-            # Dog / Hexapod (4 legs * 3 joints, or 6 legs * 2 joints)
-            j_lim = joints_per_limb if joints_per_limb is not None else 3
-            self.default_joint_counts = [j_lim] * 4
-            max_j = 3
-            def_kin = torch.tensor([
-                [ 0.188, -0.08, 0.0, 0.064, 0.286, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [ 0.188,  0.08, 0.0, 0.938, 0.260, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [-0.188, -0.08, 0.0, 0.060, 0.256, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [-0.188,  0.08, 0.0, 0.946, 0.261, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            ], dtype=torch.float32)
-        elif action_dim == 17:
-            # Humanoid (waist: 3, r_leg: 4, l_leg: 4, r_arm: 3, l_arm: 3)
-            self.default_joint_counts = [3, 4, 4, 3, 3]
-            max_j = 4
-            def_kin = torch.tensor([
-                [ 0.000,  0.000,  0.000, 0.500, 0.500, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [-0.010, -0.100, -0.465, 0.741, 0.008, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [-0.008,  0.100, -0.465, 0.364, 0.004, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [ 0.000, -0.170,  0.060, 0.376, 0.303, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [ 0.000,  0.170,  0.060, 0.623, 0.302, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            ], dtype=torch.float32)
-        else:
-            j_per = max(1, action_dim // 4)
-            rem = action_dim - j_per * 3
-            self.default_joint_counts = [j_per, j_per, j_per, rem]
-            max_j = max(j_per, rem)
-            def_kin = torch.tensor([
-                [ 0.2,  0.2, 0.0, 0.125, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [-0.2,  0.2, 0.0, 0.875, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [-0.2, -0.2, 0.0, 0.375, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [ 0.2, -0.2, 0.0, 0.625, 0.50, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            ], dtype=torch.float32)
-
+        self.default_joint_counts, effective_max_j, def_kin = _build_default_morphology(
+            action_dim, joints_per_limb=joints_per_limb
+        )
         self.register_buffer("default_limb_kinematics", def_kin)
 
-        effective_max_j = joints_per_limb if joints_per_limb is not None else max_j
         self.limb_head = MorphologicalLimbHead(
             latent_dim=latent_dim,
             num_peaks=num_peaks,
@@ -1133,3 +1181,365 @@ class SupportCriticHead(nn.Module):
         target_dist = self.scalar_to_two_hot(target_values)
         log_probs = F.log_softmax(logits, dim=-1)
         return -torch.sum(target_dist * log_probs, dim=-1).mean()
+
+
+class DeterministicLimbHead(nn.Module):
+    """Universal Deterministic Morphological Limb Network f_phi(z_t, c_i) -> a_i in [-1, 1]^J.
+
+    Replaces composite GMM distribution outputs (peak logits, means, log_stds) with direct
+    deterministic per-limb torque predictions via a Pre-LN Transformer Encoder over
+    [global_z, limb_1, ..., limb_L], eliminating variance dilution and enabling exact
+    analytical per-limb gradients dQ / da_i.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = 256,
+        max_joints_per_limb: int = 4,
+        hidden_dim: int = 128,
+        n_heads: int = 4,
+        n_enc_layers: int = 2,
+    ) -> None:
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.max_joints_per_limb = max_joints_per_limb
+        self.hidden_dim = hidden_dim
+        self.n_heads = n_heads
+        self.geom_dim = 26
+
+        self.global_proj = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.kin_proj = nn.Sequential(
+            nn.Linear(self.geom_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.global_type_emb = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+        self.limb_type_emb = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=n_heads,
+            dim_feedforward=hidden_dim * 2,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(
+            enc_layer, num_layers=n_enc_layers, enable_nested_tensor=False
+        )
+        self.out_ln = nn.LayerNorm(hidden_dim)
+        self.mu_head = nn.Linear(hidden_dim, max_joints_per_limb)
+
+    @staticmethod
+    def encode_kinematics(kinematics: torch.Tensor) -> torch.Tensor:
+        return encode_limb_kinematics(kinematics)
+
+    def _encode_limbs(
+        self, z_flat: torch.Tensor, limb_geom: torch.Tensor
+    ) -> torch.Tensor:
+        """Runs self-attention over [global_z, limb_tokens] -> limb hidden states (B, N_limbs, D)."""
+        e_global = self.global_proj(z_flat).unsqueeze(1) + self.global_type_emb
+        e_limbs = self.kin_proj(limb_geom) + self.limb_type_emb
+        enc_seq = torch.cat([e_global, e_limbs], dim=1)
+        enc_out = self.out_ln(self.encoder(enc_seq))
+        return enc_out[:, 1:, :]
+
+    def forward_single_limb(
+        self,
+        z_t: torch.Tensor,
+        anchor: Tuple[float, float, float] | Sequence[float] | torch.Tensor,
+        yaw: float | torch.Tensor,
+        pitch: float | torch.Tensor,
+        num_joints: Optional[int] = None,
+        all_limbs_kinematics: Optional[torch.Tensor] = None,
+        angle_diff: Optional[Tuple[float, float, float] | Sequence[float] | torch.Tensor] = None,
+        world_euler: Optional[Tuple[float, float, float] | Sequence[float] | torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Computes deterministic bounded action in [-1, 1]^{n_j} for a single queried limb."""
+        device = z_t.device
+        dtype = z_t.dtype
+        kin_11d = _pack_single_limb_kinematics(
+            anchor, yaw, pitch, device=device, dtype=dtype, angle_diff=angle_diff, world_euler=world_euler
+        )
+        geom_q = self.encode_kinematics(kin_11d).unsqueeze(1)  # (1, 1, 26)
+        z_in = z_t.unsqueeze(0) if z_t.dim() == 1 else z_t
+        bsz = z_in.shape[0]
+        if geom_q.shape[0] == 1 and bsz > 1:
+            geom_q = geom_q.expand(bsz, -1, -1)
+
+        if all_limbs_kinematics is not None:
+            ctx_t = all_limbs_kinematics.to(device=device, dtype=dtype)
+            if ctx_t.dim() == 2:
+                ctx_t = ctx_t.unsqueeze(0).expand(bsz, -1, -1)
+            ctx_geom = self.encode_kinematics(ctx_t)
+            # Reuse matching limb token if anchor corresponds to an existing body limb
+            dists = torch.norm(ctx_t[0, :, :3] - kin_11d[0, :3].unsqueeze(0), dim=-1)
+            best_idx = int(torch.argmin(dists).item())
+            if float(dists[best_idx].item()) < 1e-3:
+                h_limbs = self._encode_limbs(z_in, ctx_geom)
+                h_target = h_limbs[:, best_idx, :]
+            else:
+                h_limbs = self._encode_limbs(z_in, torch.cat([ctx_geom, geom_q], dim=1))
+                h_target = h_limbs[:, -1, :]
+        else:
+            h_target = self._encode_limbs(z_in, geom_q)[:, 0, :]
+
+        n_j = num_joints if num_joints is not None else self.max_joints_per_limb
+        act = torch.tanh(self.mu_head(h_target)[..., :n_j])
+        return act.squeeze(0) if z_t.dim() == 1 else act
+
+    def forward_all_limbs(
+        self,
+        z_t: torch.Tensor,
+        limb_kinematics: torch.Tensor,
+        limb_joint_counts: Optional[Sequence[int]] = None,
+        target_action_dim: Optional[int] = None,
+        return_pre_tanh: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+        """Vectorized deterministic forward pass across all creature limbs."""
+        orig_shape = z_t.shape[:-1]
+        z_flat = z_t.reshape(-1, self.latent_dim)
+        bsz = z_flat.shape[0]
+
+        kin_flat, n_limbs = _flatten_kinematics_batch(limb_kinematics, bsz)
+        geom_emb = self.encode_kinematics(kin_flat)
+        h = self._encode_limbs(z_flat, geom_emb)
+        mu_limbs = self.mu_head(h)  # (bsz, n_limbs, max_joints_per_limb)
+
+        if limb_joint_counts is not None:
+            pieces = [
+                mu_limbs[:, i, :j_count]
+                for i, j_count in enumerate(limb_joint_counts)
+                if i < n_limbs and j_count > 0
+            ]
+            pre_assembled = torch.cat(pieces, dim=-1)
+        else:
+            pre_assembled = mu_limbs.reshape(bsz, n_limbs * self.max_joints_per_limb)
+
+        act_assembled = torch.tanh(pre_assembled)
+
+        if target_action_dim is not None:
+            cur_dim = act_assembled.shape[-1]
+            if cur_dim < target_action_dim:
+                pad_size = target_action_dim - cur_dim
+                zero_pad = torch.zeros(
+                    bsz, pad_size, device=z_t.device, dtype=z_t.dtype
+                )
+                act_assembled = torch.cat([act_assembled, zero_pad], dim=-1)
+                pre_assembled = torch.cat([pre_assembled, zero_pad], dim=-1)
+            elif cur_dim > target_action_dim:
+                act_assembled = act_assembled[..., :target_action_dim]
+                pre_assembled = pre_assembled[..., :target_action_dim]
+
+        if orig_shape:
+            act_assembled = act_assembled.view(*orig_shape, act_assembled.shape[-1])
+            pre_assembled = pre_assembled.view(*orig_shape, pre_assembled.shape[-1])
+
+        if return_pre_tanh:
+            return act_assembled, pre_assembled
+        return act_assembled
+
+
+class DeterministicActorHead(nn.Module):
+    """Deterministic Morphological Actor Head operating directly on z_t.
+
+    Outputs exact deterministic continuous joint actions via `DeterministicLimbHead`
+    and synthesizes coherent whole-body MCTS candidate branches by querying altered
+    global latent intentions z + delta_z (needle.md Point A) plus light TD3 exploration noise.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = 256,
+        action_dim: int = 8,
+        hidden_dim: int = 128,
+        joints_per_limb: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.is_deterministic: bool = True
+        self.num_peaks: int = 1
+        self.latent_dim = latent_dim
+        self.action_dim = action_dim
+        self.joints_per_limb = joints_per_limb
+
+        self.default_joint_counts, effective_max_j, def_kin = _build_default_morphology(
+            action_dim, joints_per_limb=joints_per_limb
+        )
+        self.register_buffer("default_limb_kinematics", def_kin)
+
+        self.limb_head = DeterministicLimbHead(
+            latent_dim=latent_dim,
+            max_joints_per_limb=effective_max_j,
+            hidden_dim=hidden_dim,
+        )
+        self.last_pre_tanh: Optional[torch.Tensor] = None
+        self.last_sampled_peaks: Optional[torch.Tensor] = None
+
+    def _resolve_kinematics(
+        self, limb_kinematics: Optional[torch.Tensor], device: torch.device
+    ) -> Tuple[torch.Tensor, Optional[List[int]]]:
+        kin = limb_kinematics
+        if kin is None:
+            kin = self.default_limb_kinematics.to(device)
+        elif not torch.is_tensor(kin):
+            kin = torch.as_tensor(kin, dtype=torch.float32, device=device)
+
+        n_limbs = kin.shape[-2]
+        if self.joints_per_limb is not None:
+            counts: Optional[List[int]] = [self.joints_per_limb] * n_limbs
+        elif len(self.default_joint_counts) == n_limbs:
+            counts = self.default_joint_counts
+        else:
+            counts = None
+        return kin, counts
+
+    @staticmethod
+    def _apply_mask(actions: torch.Tensor, action_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if action_mask is None:
+            return actions
+        if action_mask.dim() == 1:
+            return actions * action_mask
+        while action_mask.dim() < actions.dim():
+            action_mask = action_mask.unsqueeze(-2)
+        return actions * action_mask
+
+    def forward(
+        self,
+        z_t: torch.Tensor,
+        limb_kinematics: Optional[torch.Tensor] = None,
+        action_mask: Optional[torch.Tensor] = None,
+        return_pre_tanh: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+        """Computes exact deterministic action(s) in [-1, 1]^N."""
+        kin, counts = self._resolve_kinematics(limb_kinematics, z_t.device)
+        act, pre_tanh = self.limb_head.forward_all_limbs(
+            z_t,
+            kin,
+            limb_joint_counts=counts,
+            target_action_dim=self.action_dim,
+            return_pre_tanh=True,
+        )
+        act = self._apply_mask(act, action_mask)
+        self.last_pre_tanh = pre_tanh
+        if return_pre_tanh:
+            return act, pre_tanh
+        return act
+
+    def get_limb_action(
+        self,
+        z_t: torch.Tensor,
+        anchor: Tuple[float, float, float] | Sequence[float],
+        yaw: float,
+        pitch: float,
+        num_joints: Optional[int] = None,
+        deterministic: bool = True,
+        peak_idx: Optional[int | torch.Tensor] = None,
+        all_limbs_kinematics: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Queries deterministic action vector for a single limb given 3D anchor and direction."""
+        return self.limb_head.forward_single_limb(
+            z_t,
+            anchor=anchor,
+            yaw=yaw,
+            pitch=pitch,
+            num_joints=num_joints,
+            all_limbs_kinematics=all_limbs_kinematics,
+        )
+
+    def sample_actions(
+        self,
+        z_t: torch.Tensor,
+        k_act: int = 8,
+        temperature: float = 1.0,
+        action_mask: Optional[torch.Tensor] = None,
+        limb_kinematics: Optional[torch.Tensor] = None,
+        committed_peak: Optional[int] = None,
+        mode_commitment_prob: float = 0.0,
+        return_peaks: bool = False,
+        deterministic_candidates: bool = False,
+        include_peak_means: bool = True,
+        latent_noise_std: float = 0.08,
+        action_noise_std: float = 0.12,
+    ) -> Tuple[torch.Tensor, ...]:
+        """Generates deterministic action + coherent latent-perturbed candidates for MCTS search."""
+        single = z_t.dim() == 1
+        z_in = z_t.unsqueeze(0) if single else z_t
+        bsz = z_in.shape[0]
+
+        if deterministic_candidates or k_act <= 1:
+            a_det = self.forward(z_in, limb_kinematics=limb_kinematics, action_mask=action_mask)
+            sampled = a_det.unsqueeze(1)  # (B, 1, N)
+            prior_weights = torch.ones((bsz, 1), device=z_t.device, dtype=z_t.dtype)
+            peaks = torch.zeros((bsz, 1), device=z_t.device, dtype=torch.long)
+            self.last_sampled_peaks = (peaks.squeeze(0) if single else peaks).detach()
+            if single:
+                if return_peaks:
+                    return sampled.squeeze(0), prior_weights.squeeze(0), peaks.squeeze(0)
+                return sampled.squeeze(0), prior_weights.squeeze(0)
+            if return_peaks:
+                return sampled, prior_weights, peaks
+            return sampled, prior_weights
+
+        # Generate k_act candidates: slot 0 = clean deterministic policy,
+        # slots 1..n_lat = coherent latent-perturbed policies f(norm(z + delta_z)),
+        # slots n_lat+1..k_act-1 = light exploration perturbations around a_det.
+        kin, counts = self._resolve_kinematics(limb_kinematics, z_in.device)
+        n_lat = max(1, (k_act - 1) // 2)
+        n_act = (k_act - 1) - n_lat
+        eff_lat_std = max(0.02, float(latent_noise_std)) * math.sqrt(max(float(temperature), 0.25))
+        eff_act_std = max(0.02, float(action_noise_std)) * math.sqrt(max(float(temperature), 0.25))
+
+        z_pert = min_max_normalize(
+            z_in.unsqueeze(1)
+            + eff_lat_std * torch.randn(bsz, n_lat, self.latent_dim, device=z_t.device, dtype=z_t.dtype),
+            eps=1e-6,
+        )
+        z_stack = torch.cat([z_in.unsqueeze(1), z_pert], dim=1)  # (B, 1 + n_lat, D)
+        flat_z = z_stack.reshape(bsz * (1 + n_lat), self.latent_dim)
+        if kin.dim() >= 3:
+            kin_stack = (
+                kin.unsqueeze(1)
+                .expand(bsz, 1 + n_lat, kin.shape[-2], kin.shape[-1])
+                .reshape(bsz * (1 + n_lat), kin.shape[-2], kin.shape[-1])
+            )
+        else:
+            kin_stack = kin
+
+        acts_core = self.limb_head.forward_all_limbs(
+            flat_z, kin_stack, limb_joint_counts=counts, target_action_dim=self.action_dim
+        ).view(bsz, 1 + n_lat, self.action_dim)
+
+        a_det = acts_core[:, 0:1, :]
+        if n_act > 0:
+            a_noisy = torch.clamp(
+                a_det + eff_act_std * torch.randn(bsz, n_act, self.action_dim, device=z_t.device, dtype=z_t.dtype),
+                -1.0,
+                1.0,
+            )
+            sampled = torch.cat([acts_core, a_noisy], dim=1)
+        else:
+            sampled = acts_core
+
+        sampled = self._apply_mask(sampled, action_mask)
+
+        # Anchor slightly higher prior on the deterministic baseline slot 0 while exploring alternatives
+        priors = torch.ones((bsz, k_act), device=z_t.device, dtype=z_t.dtype)
+        priors[:, 0] = 2.0
+        prior_weights = priors / priors.sum(dim=-1, keepdim=True)
+        peaks = torch.zeros((bsz, k_act), device=z_t.device, dtype=torch.long)
+        peaks_out = peaks.squeeze(0) if single else peaks
+        self.last_sampled_peaks = peaks_out.detach()
+
+        if single:
+            if return_peaks:
+                return sampled.squeeze(0), prior_weights.squeeze(0), peaks_out
+            return sampled.squeeze(0), prior_weights.squeeze(0)
+        if return_peaks:
+            return sampled, prior_weights, peaks_out
+        return sampled, prior_weights

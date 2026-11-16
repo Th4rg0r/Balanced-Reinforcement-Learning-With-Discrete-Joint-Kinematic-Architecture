@@ -660,6 +660,10 @@ def test_needle_point_d_critic_warmup_and_config_defaults() -> None:
         warnings.simplefilter("always")
         sys_cfg = load_config("config/default_config.yaml")
     assert not caught, f"Unexpected config warnings: {[str(w.message) for w in caught]}"
+    assert sys_cfg.la_mcts.actor_type == "deterministic"
+    assert np.isclose(sys_cfg.la_mcts.lambda_dpg, 0.50)
+    assert sys_cfg.la_mcts.dpg_horizon == 2
+    assert np.isclose(sys_cfg.la_mcts.action_explore_std, 0.12)
     assert np.isclose(sys_cfg.la_mcts.latent_noise_std, 0.08)
     assert sys_cfg.la_mcts.mode_hold_steps == 8
     assert np.isclose(sys_cfg.la_mcts.lambda_peak_ent, 0.15)
@@ -685,6 +689,7 @@ def test_deterministic_eval_searches_noise_free_mode_centers() -> None:
         l_dyn=1,
         proj_dim=32,
         pred_dim=32,
+        actor_type="gmm",
         n_sim=8,
         n_sim_eval=8,
         k_act=8,
@@ -801,6 +806,132 @@ def test_balancer_slew_rate_and_low_win_gating() -> None:
     )
     assert 90.0 < budget_step1 <= 190.0 + 1e-5  # 90 + max(100, 0.15*90) = 190
     assert budget_step1 <= 250.0  # exploration_progress=0.0 cap
+
+
+def test_deterministic_limb_actor_head_and_single_limb_sharing() -> None:
+    """Verifies DeterministicActorHead outputs exact morphology-invariant actions without GMM noise."""
+    from la_mcts.gmm_heads import DeterministicActorHead
+
+    torch.manual_seed(91)
+    for act_dim, joints in [(8, 2), (12, 3), (17, None)]:
+        actor = DeterministicActorHead(
+            latent_dim=64, action_dim=act_dim, hidden_dim=32, joints_per_limb=joints
+        )
+        actor.eval()
+        z = torch.randn(2, 64)
+        a1 = actor(z)
+        a2 = actor(z)
+        assert a1.shape == (2, act_dim)
+        assert float(a1.min().item()) >= -1.0 and float(a1.max().item()) <= 1.0
+        torch.testing.assert_close(a1, a2)
+
+    # Verify single-limb query matches corresponding joints in vectorized forward pass
+    ant_actor = DeterministicActorHead(latent_dim=64, action_dim=8, hidden_dim=32, joints_per_limb=2)
+    ant_actor.eval()
+    z1 = torch.randn(64)
+    kin = ant_actor.default_limb_kinematics
+    all_act = ant_actor(z1.unsqueeze(0), limb_kinematics=kin).squeeze(0)
+    leg0_single = ant_actor.get_limb_action(
+        z1,
+        anchor=kin[0, :3],
+        yaw=kin[0, 3],
+        pitch=kin[0, 4],
+        num_joints=2,
+        all_limbs_kinematics=kin,
+    )
+    torch.testing.assert_close(leg0_single, all_act[:2], atol=1e-5, rtol=1e-5)
+
+
+def test_model_based_dpg_gradients_and_world_model_freeze() -> None:
+    """Verifies Model-Based DPG gives analytical per-limb gradients without modifying world model/critic."""
+    from la_mcts.gmm_heads import DeterministicActorHead
+
+    torch.manual_seed(101)
+    actor = DeterministicActorHead(latent_dim=32, action_dim=4, hidden_dim=32)
+    critic = SupportCriticHead(latent_dim=32, use_categorical=True, support_min=-20, support_max=20, num_bins=41)
+    rep = ModelRepresentationTrainer(latent_dim=32, action_dim=4, num_blocks=1, proj_dim=32, pred_dim=32)
+
+    z_0 = torch.rand(4, 32)
+    cum_0 = torch.rand(4, 32)
+    actor.zero_grad()
+    rep.zero_grad()
+    critic.zero_grad()
+
+    loss_dpg, dpg_metrics = rep.compute_deterministic_policy_loss(
+        z_0=z_0,
+        cum_0=cum_0,
+        actor_head=actor,
+        critic_head=critic,
+        gamma=0.99,
+        dpg_horizon=2,
+        lambda_dpg=0.50,
+    )
+    assert np.isfinite(dpg_metrics["loss_dpg"])
+    assert np.isfinite(dpg_metrics["dpg_q_mean"])
+    assert dpg_metrics["dpg_q_scale"] >= 1.0
+
+    loss_dpg.backward()
+    actor_grad_norm = sum(
+        float(p.grad.abs().sum().item()) for p in actor.parameters() if p.grad is not None
+    )
+    assert actor_grad_norm > 0.0
+    # World model and critic weights must remain completely untouched by DPG backward pass
+    assert all(p.grad is None for p in rep.parameters())
+    assert all(p.grad is None for p in critic.parameters())
+
+
+def test_deterministic_agent_end_to_end_mcts_and_dpg_step() -> None:
+    """Verifies Deterministic Network 2 agent runs O(1) eval, latent MCTS search, reanalyze, and DPG training."""
+    torch.manual_seed(111)
+    cfg = LAMCTSConfig(
+        obs_dim=12,
+        max_action_dim=4,
+        context_dim=6,
+        history_len=2,
+        k_tok=4,
+        d_model=32,
+        n_heads=2,
+        l_enc=1,
+        latent_dim=32,
+        l_dyn=1,
+        proj_dim=32,
+        pred_dim=32,
+        actor_type="deterministic",
+        lambda_dpg=0.50,
+        dpg_horizon=2,
+        n_sim=8,
+        n_sim_eval=8,
+        k_act=6,
+        unroll_steps=2,
+        batch_size=2,
+        support_min=-20,
+        support_max=20,
+        num_bins=41,
+        critic_warmup_steps=10,
+    )
+    agent = LatentActionMCTSAgent(cfg, device=torch.device("cpu"))
+    assert getattr(agent.actor_head, "is_deterministic", False) is True
+
+    agent.set_episode_context()
+    obs = np.random.randn(12).astype(np.float32)
+    det_a1 = agent.select_action(obs, deterministic=True)
+    agent.set_episode_context()
+    det_a2 = agent.select_action(obs, deterministic=True)
+    np.testing.assert_allclose(det_a1, det_a2, atol=1e-6)
+
+    for step in range(6):
+        act = agent.select_action(obs, deterministic=False)
+        next_obs = np.random.randn(12).astype(np.float32)
+        agent.observe_transition(
+            obs, act, 0.5, next_obs, terminated=(step == 5), truncated=False, info={}
+        )
+        obs = next_obs
+
+    metrics = agent.train_step()
+    assert "loss_dpg" in metrics and np.isfinite(metrics["loss_dpg"])
+    assert "dpg_q_mean" in metrics and np.isfinite(metrics["dpg_q_mean"])
+    agent.reanalyze_batch(num_states=2)
+
 
 
 

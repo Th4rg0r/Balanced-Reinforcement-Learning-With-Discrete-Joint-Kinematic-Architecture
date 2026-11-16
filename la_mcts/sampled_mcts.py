@@ -8,7 +8,11 @@ import numpy as np
 import torch
 
 from la_mcts.backbone import combine_cumulative_rep
-from la_mcts.gmm_heads import MultiPeakGMMActorHead, SupportCriticHead
+from la_mcts.gmm_heads import (
+    DeterministicActorHead,
+    MultiPeakGMMActorHead,
+    SupportCriticHead,
+)
 from la_mcts.rep_trainer import ModelRepresentationTrainer
 
 
@@ -93,7 +97,7 @@ class SampledContinuousMCTS:
 
     def __init__(
         self,
-        actor_head: MultiPeakGMMActorHead,
+        actor_head: MultiPeakGMMActorHead | DeterministicActorHead,
         critic_head: SupportCriticHead,
         rep_trainer: ModelRepresentationTrainer,
         n_sim: int = 50,
@@ -149,6 +153,48 @@ class SampledContinuousMCTS:
             scores = np.where(unexpanded_busy, -np.inf, scores)
         return int(np.argmax(scores))
 
+    def _sample_node_candidates(
+        self,
+        state: torch.Tensor,
+        temperature: float,
+        action_mask: Optional[torch.Tensor],
+        limb_kinematics: Optional[torch.Tensor],
+        committed_peak: Optional[int] = None,
+        mode_commitment_prob: float = 0.0,
+        return_peaks: bool = False,
+        deterministic_candidates: bool = False,
+        latent_noise_std: Optional[float] = None,
+        action_noise_std: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, ...]:
+        """Dispatches candidate sampling uniformly to GMM or Deterministic actor heads."""
+        if getattr(self.actor_head, "is_deterministic", False):
+            kwargs: Dict[str, object] = {}
+            if latent_noise_std is not None:
+                kwargs["latent_noise_std"] = float(latent_noise_std)
+            if action_noise_std is not None:
+                kwargs["action_noise_std"] = float(action_noise_std)
+            return self.actor_head.sample_actions(
+                state,
+                k_act=self.k_act,
+                temperature=temperature,
+                action_mask=action_mask,
+                limb_kinematics=limb_kinematics,
+                return_peaks=return_peaks,
+                deterministic_candidates=deterministic_candidates,
+                **kwargs,  # type: ignore[arg-type]
+            )
+        return self.actor_head.sample_actions(
+            state,
+            k_act=self.k_act,
+            temperature=temperature,
+            action_mask=action_mask,
+            limb_kinematics=limb_kinematics,
+            committed_peak=committed_peak,
+            mode_commitment_prob=mode_commitment_prob,
+            return_peaks=return_peaks,
+            deterministic_candidates=deterministic_candidates,
+        )
+
     def _expand_node(
         self,
         z_state: torch.Tensor,
@@ -161,6 +207,8 @@ class SampledContinuousMCTS:
         committed_peak: Optional[int] = None,
         mode_commitment_prob: float = 0.0,
         deterministic_candidates: bool = False,
+        latent_noise_std: Optional[float] = None,
+        action_noise_std: Optional[float] = None,
     ) -> MCTSNode:
         """Evaluates actor and critic heads on cumulative latent state to initialize an MCTSNode.
 
@@ -169,9 +217,8 @@ class SampledContinuousMCTS:
         """
         cum_state = z_cum_state if z_cum_state is not None else z_state
         actor_state = z_actor_state if z_actor_state is not None else cum_state
-        sampled_actions, prior_weights_t, sampled_peaks_t = self.actor_head.sample_actions(
+        sampled_actions, prior_weights_t, sampled_peaks_t = self._sample_node_candidates(
             actor_state,
-            k_act=self.k_act,
             temperature=temperature,
             action_mask=action_mask,
             limb_kinematics=limb_kinematics,
@@ -179,6 +226,8 @@ class SampledContinuousMCTS:
             mode_commitment_prob=mode_commitment_prob,
             return_peaks=True,
             deterministic_candidates=deterministic_candidates,
+            latent_noise_std=latent_noise_std,
+            action_noise_std=action_noise_std,
         )
         v_val = float(self.critic_head(cum_state.unsqueeze(0)).squeeze().item())
         return MCTSNode(
@@ -206,6 +255,8 @@ class SampledContinuousMCTS:
         committed_peak: Optional[int] = None,
         mode_commitment_prob: float = 0.0,
         q_advantage_weight: float = 4.0,
+        latent_noise_std: Optional[float] = None,
+        action_noise_std: Optional[float] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, MCTSNode]:
         """Executes N_sim MCTS simulations from z_root using virtual-loss leaf batching.
 
@@ -252,8 +303,22 @@ class SampledContinuousMCTS:
                 committed_peak=(None if deterministic else committed_peak),
                 mode_commitment_prob=(0.0 if deterministic else float(mode_commitment_prob)),
                 deterministic_candidates=deterministic,
+                latent_noise_std=latent_noise_std,
+                action_noise_std=action_noise_std,
             )
             eff_k_act = len(root.prior_weights)
+            if deterministic and eff_k_act == 1:
+                root_actions_np = root.sampled_actions.detach().cpu().numpy()
+                root.chosen_peak = (
+                    int(root.sampled_peaks[0]) if root.sampled_peaks is not None else 0
+                )
+                return (
+                    root_actions_np[0].astype(np.float32),
+                    np.array([1.0], dtype=np.float32),
+                    root_actions_np.astype(np.float32),
+                    root.v_value,
+                    root,
+                )
             if not deterministic and eff_root_exp > 0.0 and eff_k_act > 0:
                 noise = np.random.dirichlet([self.root_dirichlet_alpha] * eff_k_act)
                 root.prior_weights = (
@@ -325,13 +390,15 @@ class SampledContinuousMCTS:
                 v_next_batch = self.critic_head(z_cum_next_batch).squeeze(-1)
                 is_final_batch = (sims_done + len(pending_paths)) >= num_simulations
                 if not is_final_batch:
-                    sampled_acts_batch, prior_weights_batch = self.actor_head.sample_actions(
+                    sampled_acts_batch, prior_weights_batch = self._sample_node_candidates(
                         z_cum_next_batch,
-                        k_act=self.k_act,
                         temperature=self.inner_tau_beta,
                         action_mask=action_mask,
                         limb_kinematics=limb_kinematics,
+                        return_peaks=False,
                         deterministic_candidates=deterministic,
+                        latent_noise_std=latent_noise_std,
+                        action_noise_std=action_noise_std,
                     )
                     priors_np = prior_weights_batch.detach().cpu().numpy()
                 else:

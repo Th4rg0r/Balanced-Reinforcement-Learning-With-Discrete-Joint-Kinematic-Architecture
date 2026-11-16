@@ -395,6 +395,7 @@ def test_entropy_regularization_and_adaptive_exploration():
     cfg = LAMCTSConfig(
         obs_dim=27,
         max_action_dim=8,
+        actor_type="gmm",
         n_sim=4,
         k_act=4,
         unroll_steps=2,

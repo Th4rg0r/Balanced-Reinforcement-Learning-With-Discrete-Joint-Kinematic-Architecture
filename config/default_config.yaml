@@ -9,6 +9,11 @@ la_mcts:
   num_peaks: 4
   log_std_bounds: [-1.8, 0.25]
   use_categorical_critic: true
+  actor_type: "deterministic"
+  lambda_dpg: 0.50
+  dpg_horizon: 2
+  action_explore_std: 0.12
+  action_explore_std_end: 0.02
   support_min: -150
   support_max: 150
   num_bins: 301
@@ -23,7 +28,7 @@ la_mcts:
   beta_mse: 1.0
   lambda_v: 0.5
   lambda_r: 1.0
-  lambda_p: 1.0
+  lambda_p: 0.50
   lambda_ent: 0.03
   c_reg: 0.0001
   n_sim: 32

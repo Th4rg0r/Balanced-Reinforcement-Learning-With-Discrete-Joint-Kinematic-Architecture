@@ -9,7 +9,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from la_mcts.backbone import min_max_normalize, SelfAttentionBackbone, combine_cumulative_rep
-from la_mcts.gmm_heads import MultiPeakGMMActorHead, SupportCriticHead
+from la_mcts.gmm_heads import (
+    DeterministicActorHead,
+    MultiPeakGMMActorHead,
+    SupportCriticHead,
+)
 
 
 class SimSiamConsistencyHead(nn.Module):
@@ -125,6 +129,8 @@ class ModelRepresentationTrainer(nn.Module):
             pred_dim=pred_dim,
             beta_mse=beta_mse,
         )
+        self._dpg_q_scale: float = 1.0
+        self._last_root_latents: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     def _align_action_dim(self, action: torch.Tensor) -> torch.Tensor:
         cur_dim = action.shape[-1]
@@ -177,7 +183,7 @@ class ModelRepresentationTrainer(nn.Module):
         mcts_policy_samples: torch.Tensor,
         mcts_policy_weights: torch.Tensor,
         backbone: SelfAttentionBackbone,
-        actor_head: MultiPeakGMMActorHead,
+        actor_head: MultiPeakGMMActorHead | DeterministicActorHead,
         critic_head: SupportCriticHead,
         context: Optional[torch.Tensor] = None,
         history: Optional[torch.Tensor] = None,
@@ -217,6 +223,7 @@ class ModelRepresentationTrainer(nn.Module):
             context, hist_0, alpha=self.latent_ema_decay
         )
         cum_hat = combine_cumulative_rep(z_hat, prev_cum_0, alpha=self.latent_ema_decay)
+        self._last_root_latents = (z_hat.detach(), cum_hat.detach())
 
         # Encode k = 1..K target representations under no_grad using target_backbone when provided
         z_target_seq: Optional[torch.Tensor] = None
@@ -306,6 +313,66 @@ class ModelRepresentationTrainer(nn.Module):
         samples_flat = mcts_policy_samples[:, :n_steps].reshape(
             bsz * n_steps, mcts_policy_samples.size(2), mcts_policy_samples.size(3)
         )
+        weights_seq = mcts_policy_weights[:, :n_steps]
+        is_det_actor = bool(getattr(actor_head, "is_deterministic", False))
+
+        if is_det_actor:
+            a_det_flat, pre_tanh_flat = actor_head(
+                cum_flat, limb_kinematics=kin_flat, action_mask=mask_flat, return_pre_tanh=True
+            )
+            best_idx = torch.argmax(weights_seq, dim=-1)  # (B, n_steps)
+            n_act_dim = mcts_policy_samples.size(3)
+            best_idx_exp = best_idx.unsqueeze(-1).unsqueeze(-1).expand(bsz, n_steps, 1, n_act_dim)
+            a_best = torch.gather(mcts_policy_samples[:, :n_steps], dim=2, index=best_idx_exp).squeeze(2)
+            a_det_seq = a_det_flat.view(bsz, n_steps, -1)
+            sq_err = (a_det_seq - a_best).pow(2)
+            pre_tanh_sq = pre_tanh_flat.view(bsz, n_steps, -1).pow(2)
+            if action_mask is not None:
+                m_seq = action_mask.view(1, 1, -1) if action_mask.dim() == 1 else action_mask.unsqueeze(1)
+                loss_p = ((sq_err * m_seq).sum(dim=-1) / active_dims).mean(dim=0).sum()
+                pre_tanh_reg = ((pre_tanh_sq * m_seq).sum(dim=-1) / active_dims).mean()
+            else:
+                loss_p = (sq_err.sum(dim=-1) / active_dims).mean(dim=0).sum()
+                pre_tanh_reg = pre_tanh_sq.mean()
+            loss_p = loss_p + 1e-3 * pre_tanh_reg
+
+            # Normalize over unroll horizon
+            loss_v = loss_v / float(k_plus_1)
+            loss_p = loss_p / float(k_plus_1)
+            if unroll_k > 0:
+                loss_r = loss_r / float(unroll_k)
+                loss_rep = loss_rep / float(unroll_k)
+
+            reg_loss = torch.tensor(0.0, device=obs_seq.device, dtype=obs_seq.dtype)
+            if c_reg > 0.0:
+                for p in self.parameters():
+                    reg_loss = reg_loss + p.pow(2).sum()
+                for p in backbone.parameters():
+                    reg_loss = reg_loss + p.pow(2).sum()
+
+            total_loss = (
+                lambda_v * loss_v
+                + lambda_p * loss_p
+                + lambda_r * loss_r
+                + lambda_rep * loss_rep
+                + c_reg * reg_loss
+            )
+            metrics = {
+                "loss_total": float(total_loss.detach().item()),
+                "loss_v": float(loss_v.detach().item()),
+                "loss_p": float(loss_p.detach().item()),
+                "loss_r": float(loss_r.detach().item()),
+                "loss_rep": float(loss_rep.detach().item()),
+                "loss_peak_ent": 0.0,
+                "loss_peak_sep": 0.0,
+                "policy_entropy": 0.0,
+                "peak_entropy": 0.0,
+                "peak_ent_floor": 0.0,
+                "peak_mean_sep": 0.0,
+                "policy_std": 0.0,
+            }
+            return total_loss, metrics
+
         log_probs_flat, policy_entropy, peak_entropy, mean_policy_std, mu_flat = (
             actor_head.compute_log_prob_pre_tanh_and_entropy(
                 cum_flat,
@@ -316,7 +383,6 @@ class ModelRepresentationTrainer(nn.Module):
             )
         )
         log_probs_seq = log_probs_flat.view(bsz, n_steps, -1)
-        weights_seq = mcts_policy_weights[:, :n_steps]
         loss_p = (
             -torch.sum(weights_seq * log_probs_seq, dim=-1) / active_dims
         ).mean(dim=0).sum()
@@ -407,3 +473,105 @@ class ModelRepresentationTrainer(nn.Module):
             "policy_std": float(mean_policy_std.mean().detach().item()),
         }
         return total_loss, metrics
+
+    def compute_deterministic_policy_loss(
+        self,
+        z_0: torch.Tensor,
+        cum_0: torch.Tensor,
+        actor_head: MultiPeakGMMActorHead | DeterministicActorHead,
+        critic_head: SupportCriticHead,
+        action_mask: Optional[torch.Tensor] = None,
+        limb_kinematics: Optional[torch.Tensor] = None,
+        gamma: float = 0.99,
+        dpg_horizon: int = 2,
+        lambda_dpg: float = 0.50,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Computes analytical Deterministic Policy Gradient loss over a frozen latent world-model rollout.
+
+        Backpropagates d/d_phi [sum gamma^h r_hat + gamma^H V(z_cum)] directly into `actor_head`
+        without modifying `rep_trainer` or `critic_head` weights.
+        """
+        z_det = z_0.detach()
+        cum_det = cum_0.detach()
+        horizon = max(1, int(dpg_horizon))
+
+        frozen_params = list(self.parameters()) + list(critic_head.parameters())
+        prev_flags = [p.requires_grad for p in frozen_params]
+        for p in frozen_params:
+            p.requires_grad_(False)
+
+        try:
+            is_det = bool(getattr(actor_head, "is_deterministic", False))
+            bsz = z_det.shape[0]
+            q_total = torch.zeros(bsz, device=z_det.device, dtype=z_det.dtype)
+            pre_tanh_reg = torch.tensor(0.0, device=z_det.device, dtype=z_det.dtype)
+            discount = 1.0
+            z_cur = z_det
+            cum_cur = cum_det
+
+            if is_det:
+                for h in range(horizon):
+                    if limb_kinematics is not None and limb_kinematics.dim() == 4:
+                        kin_h = limb_kinematics[:, min(h, limb_kinematics.size(1) - 1)]
+                    else:
+                        kin_h = limb_kinematics
+                    act_h, pre_h = actor_head(
+                        cum_cur, limb_kinematics=kin_h, action_mask=action_mask, return_pre_tanh=True
+                    )
+                    pre_tanh_reg = pre_tanh_reg + pre_h.pow(2).mean()
+                    z_next, r_hat = self.forward(z_cur, act_h)
+                    cum_next = combine_cumulative_rep(
+                        z_next, cum_cur, alpha=self.latent_ema_decay, assume_nonzero=True
+                    )
+                    q_total = q_total + discount * r_hat.squeeze(-1)
+                    discount *= float(gamma)
+                    z_cur = z_next
+                    cum_cur = cum_next
+                v_boot = critic_head(cum_cur).squeeze(-1)
+                q_total = q_total + discount * v_boot
+            else:
+                kin_0 = (
+                    limb_kinematics[:, 0]
+                    if (limb_kinematics is not None and limb_kinematics.dim() == 4)
+                    else limb_kinematics
+                )
+                logits, mu, _ = actor_head.get_distribution_params(
+                    cum_cur, temperature=1.0, limb_kinematics=kin_0
+                )
+                probs = F.softmax(logits, dim=-1).detach()  # (B, M)
+                best_k = torch.argmax(probs, dim=-1)
+                idx = best_k.unsqueeze(-1).unsqueeze(-1).expand(bsz, 1, mu.shape[-1])
+                mu_best = torch.gather(mu, dim=1, index=idx).squeeze(1)
+                act_0 = torch.tanh(mu_best)
+                if action_mask is not None:
+                    act_0 = act_0 * action_mask
+                pre_tanh_reg = mu_best.pow(2).mean()
+                z_next, r_hat = self.forward(z_cur, act_0)
+                cum_next = combine_cumulative_rep(
+                    z_next, cum_cur, alpha=self.latent_ema_decay, assume_nonzero=True
+                )
+                v_boot = critic_head(cum_next).squeeze(-1)
+                q_total = r_hat.squeeze(-1) + float(gamma) * v_boot
+
+            with torch.no_grad():
+                if q_total.numel() >= 2:
+                    q_span = float(
+                        max(1.0, (torch.quantile(q_total, 0.95) - torch.quantile(q_total, 0.05)).item())
+                    )
+                else:
+                    q_span = max(1.0, float(q_total.abs().mean().item()))
+                self._dpg_q_scale = 0.95 * self._dpg_q_scale + 0.05 * q_span
+                scale = max(1.0, float(self._dpg_q_scale))
+
+            loss_dpg = -float(lambda_dpg) * (q_total / scale).mean() + 1e-3 * (
+                pre_tanh_reg / float(horizon)
+            )
+            dpg_metrics = {
+                "loss_dpg": float(loss_dpg.detach().item()),
+                "dpg_q_mean": float(q_total.mean().detach().item()),
+                "dpg_q_scale": float(scale),
+            }
+            return loss_dpg, dpg_metrics
+        finally:
+            for p, flag in zip(frozen_params, prev_flags):
+                p.requires_grad_(flag)

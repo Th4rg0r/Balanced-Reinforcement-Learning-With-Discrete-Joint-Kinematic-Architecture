@@ -23,6 +23,11 @@ class LAMCTSConfig:
     num_peaks: int = 4
     log_std_bounds: Tuple[float, float] = (-1.5, 0.25)
     use_categorical_critic: bool = True
+    actor_type: str = "deterministic"
+    lambda_dpg: float = 0.50
+    dpg_horizon: int = 2
+    action_explore_std: float = 0.12
+    action_explore_std_end: float = 0.02
     support_min: int = -150
     support_max: int = 150
     num_bins: int = 301

@@ -80,7 +80,16 @@ This document provides a comprehensive reference for every configuration paramet
 
 ---
 
-### 1.2 Policy Prior & Latent Action Space
+### 1.2 Policy Architecture & Actor Optimization
+
+#### `actor_type`, `lambda_dpg`, `dpg_horizon`, `action_explore_std`, and `action_explore_std_end`
+- **Defaults**:
+  - `actor_type: "deterministic"`: Selects Network 2 implementation:
+    - `"deterministic"` (Default): Uses `DeterministicActorHead` (`DeterministicLimbHead`), mapping `(z_t, c_i) -> a_i in [-1, 1]^J` directly via Pre-LN self-attention without composite GMM sampling, trained via analytical Model-Based DPG (`lambda_dpg`) plus MCTS anchor MSE (`lambda_p`).
+    - `"gmm"`: Legacy `MultiPeakGMMActorHead` outputting multi-peak `(logits, mu, log_std)` distribution parameters.
+  - `lambda_dpg: 0.50`: Weight of the analytical Deterministic Policy Gradient (`d/d_phi [sum gamma^h r_hat + gamma^H V(z_cum)]`) backpropagated per limb through the frozen world model and critic (gated by `critic_warmup_steps`).
+  - `dpg_horizon: 2`: Latent rollout horizon (`2 * 50ms = 100ms`) differentiated per DPG update.
+  - `action_explore_std: 0.12` $\to$ `action_explore_std_end: 0.02`: Exploration noise std around deterministic MCTS proposals during training, annealing linearly over `0 -> exploration_return_ref` (`3000`).
 
 #### `num_peaks`
 - **Type**: `int` | **Default**: `4`
@@ -171,7 +180,7 @@ This document provides a comprehensive reference for every configuration paramet
   - `beta_mse: 1.0`: Stop-gradient MSE weight inside the hybrid SimSiam cosine + MSE consistency loss.
   - `lambda_v: 0.5`: Weight of the value critic loss.
   - `lambda_r: 1.0`: Weight of the step reward prediction loss.
-  - `lambda_p: 1.0`: Weight of the policy prior cross-entropy loss against MCTS search policy $\pi_{\text{mcts}}$ (ramped by `critic_warmup_steps` during pre-conditioning).
+  - `lambda_p: 0.50`: Weight of the policy anchor loss against MCTS search targets (masked MSE to MCTS winning candidate when `actor_type: "deterministic"`, or cross-entropy log-prob when `"gmm"`, ramped by `critic_warmup_steps`).
   - `lambda_ent: 0.03`: Weight of the per-joint Gaussian standard-deviation floor/ceiling regularization (`std_floor` $\to$ `std_ceil`).
   - `lambda_peak_ent: 0.15` $\to$ `lambda_peak_ent_end: 0.02`: Decaying weight on the GMM categorical mixture-weight entropy $H(\pi)$ (with `peak_entropy_floor_ratio: 0.70` $\to$ `0.0`) to prevent premature mode collapse without forcing destructive per-joint variance.
   - `lambda_peak_sep: 0.25` $\to$ `lambda_peak_sep_end: 0.05` (`min_peak_separation: 0.40`): Decaying pairwise RMS separation penalty between GMM peak means $\tanh(\mu_i), \tanh(\mu_j)$ so modes represent genuinely distinct gaits/postures.
@@ -193,8 +202,8 @@ Exploration in LA-MCTS is dynamically annealed using the environment's **rolling
 - **Type**: `int` | **Default**: `n_sim: 32`, `n_sim_eval: 64`
 - **Purpose**: Number of MCTS simulation trajectories executed per environment step during training (`n_sim`) and evaluation (`n_sim_eval`).
 - **Training Impact**:
-  - **Training (32)**: Exact multiple of `batch_leaf_eval = 16` (2 GPU batches per step), maximizing wall-clock throughput while preserving strong tree planning.
-  - **Eval (64)**: 4 GPU batches during evaluation to extract maximum performance from the learned world model.
+  - **Training (32)**: `4` sequential PUCT waves (`batch_leaf_eval = 8`) per step for multi-step tree depth without hurting throughput.
+  - **Eval (64)**: Used when evaluating `"gmm"` peak centers (`"deterministic"` mode evaluates `DeterministicActorHead` noise-free in O(1)).
 
 #### `k_act`
 - **Type**: `int` | **Default**: `8`
