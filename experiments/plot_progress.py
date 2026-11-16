@@ -120,6 +120,14 @@ def parse_progress_jsonl(jsonl_path: Path) -> Dict[str, Any]:
     episodes = np.array([r.get("episode", i + 1) for i, r in enumerate(records)], dtype=np.int32)
     total_env_steps = np.array([r.get("total_env_steps", 0) for r in records], dtype=np.int64)
     returns = np.array([r.get("return", 0.0) for r in records], dtype=np.float64)
+    has_agent_return = any("agent_return" in r for r in records)
+    if has_agent_return:
+        agent_returns = np.array(
+            [float(r.get("agent_return", r.get("return", 0.0))) for r in records],
+            dtype=np.float64,
+        )
+    else:
+        agent_returns = np.full(len(records), np.nan, dtype=np.float64)
     steps = np.array([r.get("steps", 0) for r in records], dtype=np.int32)
     losses = np.array([r.get("loss_total", 0.0) for r in records], dtype=np.float64)
     win_rates = np.array([r.get("ema_win_rate", 0.0) for r in records], dtype=np.float64)
@@ -157,6 +165,8 @@ def parse_progress_jsonl(jsonl_path: Path) -> Dict[str, Any]:
         "episodes": episodes,
         "total_env_steps": total_env_steps,
         "returns": returns,
+        "agent_returns": agent_returns,
+        "has_agent_return": has_agent_return,
         "steps": steps,
         "losses": losses,
         "win_rates": win_rates,
@@ -243,6 +253,8 @@ def plot_single_progress(
     episodes = data["episodes"]
     env_steps = data["total_env_steps"]
     returns = data["returns"]
+    agent_returns = data.get("agent_returns", np.full_like(returns, np.nan))
+    has_agent_return = bool(data.get("has_agent_return", False)) and not np.all(np.isnan(agent_returns))
     steps = data["steps"]
     losses = data["losses"]
     win_rates = data["win_rates"]
@@ -265,15 +277,19 @@ def plot_single_progress(
     ax1 = axes[0, 0]
     ax1.set_facecolor("#ffffff")
     ax1.scatter(episodes, returns, color="#4a90e2", alpha=0.30, s=12, label="Raw Return")
-    ax1.plot(episodes, ret_rolling, color="#1b4f72", linewidth=2.0, label=f"Rolling Mean (w={rolling_window})")
+    ax1.plot(episodes, ret_rolling, color="#1b4f72", linewidth=2.0, label=f"Raw Rolling (w={rolling_window})")
+    if has_agent_return:
+        ag_rolling = compute_rolling_mean(agent_returns, rolling_window)
+        ax1.scatter(episodes, agent_returns, color="#9b59b6", alpha=0.20, s=10, label="Agent Return (Shaped)")
+        ax1.plot(episodes, ag_rolling, color="#6c3483", linewidth=1.8, linestyle="-.", label=f"Agent Rolling (w={rolling_window})")
     if len(r_refs) > 0 and not np.all(r_refs == 0.0):
         ax1.plot(episodes, r_refs, color="#e67e22", linestyle="--", linewidth=1.5, label="Win Threshold (R_ref)")
     ax1.axhline(0.0, color="#7f8c8d", linestyle=":", linewidth=1.0)
-    ax1.set_title("1. Cumulative Episode Return", fontsize=12, fontweight="bold", pad=8)
+    ax1.set_title("1. Cumulative Episode Return (Raw vs Shaped)", fontsize=12, fontweight="bold", pad=8)
     ax1.set_xlabel("Episode")
     ax1.set_ylabel("Return")
     ax1.grid(True, linestyle="--", alpha=0.4)
-    ax1.legend(loc="lower right", fontsize=8, framealpha=0.9)
+    ax1.legend(loc="best", fontsize=7.5, framealpha=0.9)
 
     # -------------------------------------------------------------
     # Panel 2: Locomotion Distance (Meters Traveled)
@@ -501,11 +517,21 @@ def plot_single_progress(
         if has_direct_dist and not np.all(np.isnan(distances))
         else "Dist: N/A"
     )
+    vel_str = (
+        f" | Vel(Max/Last): {np.nanmax(velocities):+.3f} / {velocities[-1]:+.3f} m/s"
+        if has_direct_vel and not np.all(np.isnan(velocities))
+        else ""
+    )
+    ag_ret_str = (
+        f" | AgRet(Last20/Last): {np.nanmean(agent_returns[-20:]):+.1f} / {agent_returns[-1]:+.1f}"
+        if has_agent_return
+        else ""
+    )
     main_title = f"LA-MCTS + Balanced RL Performance Dashboard [Seed {seed}] {title_suffix}"
     sub_title = (
         f"Episodes: {len(episodes)} | Env Steps: {total_steps_str} | "
-        f"Return(Min/Max/Last): {np.min(returns):.1f} / {np.max(returns):.1f} / {returns[-1]:.1f} | "
-        f"{dist_str} | Best Eval: {best_eval_score_str} | Mean EpTime: {mean_dur_str}"
+        f"Return(Min/Max/Last): {np.min(returns):.1f} / {np.max(returns):.1f} / {returns[-1]:.1f}"
+        f"{ag_ret_str} | {dist_str}{vel_str} | Best Eval: {best_eval_score_str} | Mean EpTime: {mean_dur_str}"
     )
     plt.suptitle(f"{main_title}\n{sub_title}", fontsize=13.5, fontweight="bold", y=0.985)
     plt.tight_layout(rect=[0.015, 0.015, 0.985, 0.94])
@@ -533,8 +559,18 @@ def plot_multi_seed_progress(
         eps = d["episodes"]
         lbl = f"Seed {seed}"
 
-        # 1. Returns
+        # 1. Returns (Raw + Shaped Agent Return when recorded)
         axes[0, 0].plot(eps, compute_rolling_mean(d["returns"], rolling_window), color=color, linewidth=2.0, label=lbl)
+        if d.get("has_agent_return") and not np.all(np.isnan(d["agent_returns"])):
+            axes[0, 0].plot(
+                eps,
+                compute_rolling_mean(d["agent_returns"], rolling_window),
+                color=color,
+                linewidth=1.4,
+                linestyle="--",
+                alpha=0.8,
+                label=f"{lbl} (Shaped)",
+            )
 
         # 2. Distance
         if d.get("has_direct_dist") and not np.all(np.isnan(d["distances"])):
@@ -610,6 +646,7 @@ def plot_multi_seed_progress(
         if ax.get_legend_handles_labels()[0]:
             ax.legend(fontsize=8, framealpha=0.9)
 
+    axes[0, 0].axhline(0.0, color="#7f8c8d", linestyle=":", alpha=0.7)
     axes[0, 1].axhline(0.0, color="#7f8c8d", linestyle=":", alpha=0.7)
     axes[0, 2].axhline(0.0, color="#7f8c8d", linestyle=":", alpha=0.7)
     axes[1, 0].axhline(1000, color="#e74c3c", linestyle="--", alpha=0.7)
@@ -655,6 +692,13 @@ def export_stats_json(data: Dict[str, Any], output_path: Path) -> Path:
         "final_budget": float(data["budgets"][-1]) if len(data.get("budgets", [])) > 0 else 0.0,
     }
 
+    if data.get("has_agent_return") and not np.all(np.isnan(data.get("agent_returns", np.array([np.nan])))):
+        ag_ret = data["agent_returns"]
+        stats["agent_return_mean"] = float(np.nanmean(ag_ret))
+        stats["agent_return_best"] = float(np.nanmax(ag_ret))
+        stats["agent_return_min"] = float(np.nanmin(ag_ret))
+        stats["agent_return_last20_mean"] = float(np.nanmean(ag_ret[-20:]))
+
     if data.get("has_direct_dist") and not np.all(np.isnan(distances)):
         stats["distance_mean"] = float(np.nanmean(distances))
         stats["distance_best"] = float(np.nanmax(distances))
@@ -674,6 +718,10 @@ def export_stats_json(data: Dict[str, Any], output_path: Path) -> Path:
         latest_ep = max(eval_summary.keys())
         stats["eval_best_ep"] = int(best_ep)
         stats["eval_best_score"] = float(eval_summary[best_ep]["score"])
+        if not np.isnan(eval_summary[best_ep]["std_ant"]):
+            stats["eval_best_std_ant"] = float(eval_summary[best_ep]["std_ant"])
+        if not np.isnan(eval_summary[best_ep]["ood"]):
+            stats["eval_best_ood"] = float(eval_summary[best_ep]["ood"])
         stats["eval_latest_ep"] = int(latest_ep)
         stats["eval_latest_score"] = float(eval_summary[latest_ep]["score"])
         if not np.isnan(eval_summary[latest_ep]["std_ant"]):
@@ -684,6 +732,12 @@ def export_stats_json(data: Dict[str, Any], output_path: Path) -> Path:
     if eval_by_ep:
         latest_eval_ep = max(eval_by_ep.keys())
         stats["eval_latest_by_scenario"] = eval_by_ep[latest_eval_ep]
+        lat_vels = [v["x_velocity"] for v in eval_by_ep[latest_eval_ep].values() if "x_velocity" in v]
+        lat_dists = [v["total_distance"] for v in eval_by_ep[latest_eval_ep].values() if "total_distance" in v]
+        if lat_vels:
+            stats["eval_latest_mean_vel"] = float(np.mean(lat_vels))
+        if lat_dists:
+            stats["eval_latest_mean_dist"] = float(np.mean(lat_dists))
 
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)

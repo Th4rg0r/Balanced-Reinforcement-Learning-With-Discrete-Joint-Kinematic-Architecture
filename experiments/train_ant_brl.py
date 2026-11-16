@@ -454,6 +454,8 @@ def run_single_seed(
         upside_down_time_limit=sys_cfg.ant_morph.upside_down_time_limit,
         upside_down_penalty=sys_cfg.ant_morph.upside_down_penalty,
         min_healthy_vel=sys_cfg.ant_morph.min_healthy_vel,
+        stationary_penalty_coef=sys_cfg.ant_morph.stationary_penalty_coef,
+        stationary_vel_window=sys_cfg.ant_morph.stationary_vel_window,
     )
 
     agent = LatentActionMCTSAgent(config=sys_cfg.la_mcts, device=device)
@@ -715,7 +717,7 @@ def run_single_seed(
         if parallel_mode:
             line = (
                 f"[Seed {seed:2d} ({seed_idx + 1}/{total_seeds}) | Ep {ep:4d}/{episodes} | {total_env_steps:7,d} steps] "
-                f"Ret: {summary['episode_return']:+6.1f} | Dist: {dist_val:+5.2f}m | Vel: {vel_val:+5.2f} m/s | "
+                f"Ret: {summary['episode_return']:+6.1f} | AgRet: {float(summary.get('agent_episode_return', 0.0)):+6.1f} | Dist: {dist_val:+5.2f}m | Vel: {vel_val:+5.2f} m/s | "
                 f"WinRate: {summary['ema_win_rate']:4.1%} [{win_tag}] | "
                 f"Loss: {loss_str} | EpTime: {format_time_duration(ep_duration)} | ETA: {format_time_duration(seed_eta)}"
             )
@@ -725,6 +727,7 @@ def run_single_seed(
                 f"\r[Seed {seed_idx + 1}/{total_seeds} | Ep {ep:3d}/{episodes}] "
                 f"Steps: {summary['steps']:3d}/{max_steps} | "
                 f"Return: {summary['episode_return']:+6.1f} (R_ref: {r_ref_val:4.0f}) | "
+                f"AgRet: {float(summary.get('agent_episode_return', 0.0)):+6.1f} | "
                 f"Dist: {dist_val:+5.2f}m | Vel: {vel_val:+5.2f} m/s | "
                 f"WinRate: {summary['ema_win_rate']:4.1%} [{win_tag}] | "
                 f"Budget: {budget_val:5.0f} | "
@@ -911,6 +914,7 @@ def run_single_seed(
                     "steps": ep_steps,
                     "total_env_steps": total_env_steps,
                     "return": float(summary.get("episode_return", 0.0)),
+                    "agent_return": float(summary.get("agent_episode_return", 0.0)),
                     "total_distance": float(summary.get("total_distance", 0.0)),
                     "x_velocity": float(summary.get("x_velocity", 0.0)),
                     "ema_win_rate": float(summary.get("ema_win_rate", 0.0)),

@@ -132,6 +132,8 @@ class AntMorphConfig:
     upside_down_time_limit: float = 0.0
     upside_down_penalty: float = 0.0
     min_healthy_vel: float = 0.10
+    stationary_penalty_coef: float = 0.50
+    stationary_vel_window: int = 20
 
 
 @dataclass

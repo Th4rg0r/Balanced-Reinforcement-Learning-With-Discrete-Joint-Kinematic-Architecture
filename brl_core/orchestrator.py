@@ -197,6 +197,7 @@ class BRLTrainingOrchestrator:
 
         unhealthy_term = bool(terminated and steps < step_limit)
         x_vel = float(brl_info.get("x_velocity", ep_return / max(steps, 1)))
+        # Curriculum/blending tracks the raw Ant-v5 episode return (0 -> torque_return_ref / exploration_return_ref)
         if hasattr(self.env, "update_return_curriculum"):
             self.env.update_return_curriculum(
                 ep_return,

@@ -387,3 +387,75 @@ def test_velocity_gated_healthy_reward_and_win_evaluator() -> None:
         wrapper.close()
 
 
+def test_stationary_penalty_smoothed_gate_and_mcts_gradients() -> None:
+    """Stationary ant gets net-negative shaped reward (fed to MCTS); eval stays raw; gradients stay finite."""
+    import torch
+    from config import LAMCTSConfig
+    from la_mcts.agent import LatentActionMCTSAgent
+
+    wrapper = MorphologicalAntBRLWrapper(
+        max_action_capacity=12,
+        fixed_action_space=True,
+        action_ema_alpha=1.0,
+        action_smoothness_coef=0.0,
+        min_healthy_vel=0.10,
+        stationary_penalty_coef=0.50,
+        stationary_vel_window=20,
+    )
+    try:
+        zero_act = np.zeros(12, dtype=np.float32)
+        wrapper.reset(seed=42, options={"eval_mode": False})
+        agent_sum, raw_sum = 0.0, 0.0
+        infos = []
+        for _ in range(300):  # beyond the ~100-step post-reset settling rock
+            _, r, term, trunc, info = wrapper.step(zero_act)
+            agent_sum += float(r)
+            raw_sum += float(info["raw_env_reward"])
+            infos.append(info)
+            if term or trunc:
+                break
+        # Standing still: raw Ant-v5 reward is positive, shaped agent reward is net negative
+        assert raw_sum > 0.0
+        assert agent_sum < 0.0
+        last = infos[-1]
+        assert last["stationary_penalty"] > 0.0
+        assert len(wrapper._recent_step_vels) == 20
+        assert last["smooth_x_vel"] == pytest.approx(float(np.mean(list(wrapper._recent_step_vels))), abs=1e-9)
+
+        # Single-step jitter cannot bypass the smoothed gate: one big positive spike in a stationary window
+        wrapper._recent_step_vels.clear()
+        for v in [0.0] * 19:
+            wrapper._recent_step_vels.append(v)
+        wrapper._recent_step_vels.append(1.0)  # instantaneous spike
+        smooth = float(np.mean(list(wrapper._recent_step_vels)))
+        assert smooth == pytest.approx(0.05, abs=1e-9)
+        assert float(np.clip(smooth / 0.10, 0.0, 1.0)) < 1.0
+
+        # Eval mode keeps the raw Ant-v5 reward (no healthy/stationary shaping)
+        wrapper.reset(seed=42, options={"eval_mode": True})
+        assert len(wrapper._recent_step_vels) == 0
+        _, eval_r, _, _, eval_info = wrapper.step(zero_act)
+        assert eval_info["stationary_penalty"] == 0.0
+        assert eval_r == pytest.approx(float(eval_info["raw_env_reward"]), abs=1e-6)
+    finally:
+        wrapper.close()
+
+    # Negative stationary rewards flow into MCTS training without NaNs
+    cfg = LAMCTSConfig(batch_size=4, n_sim=4, k_act=4, unroll_steps=2, td_steps=2)
+    agent = LatentActionMCTSAgent(config=cfg, device="cpu")
+    obs_dim = cfg.obs_dim
+    obs = np.zeros(obs_dim, dtype=np.float32)
+    for _ in range(3):
+        for t in range(12):
+            act = np.zeros(cfg.max_action_dim, dtype=np.float32)
+            nxt = obs + 0.01
+            agent.observe_transition(obs, act, -0.5, nxt, False, t == 11, {})
+            obs = nxt
+    metrics = agent.train_step()
+    if metrics:
+        assert all(np.isfinite(float(v)) for v in metrics.values() if isinstance(v, (int, float)))
+    for p in agent.parameters() if hasattr(agent, "parameters") else []:
+        if p.grad is not None:
+            assert torch.isfinite(p.grad).all()
+
+
