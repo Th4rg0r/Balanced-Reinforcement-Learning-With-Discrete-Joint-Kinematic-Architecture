@@ -702,7 +702,7 @@ def test_deterministic_eval_searches_noise_free_mode_centers() -> None:
     # Also verify include_peak_means anchors slots 0..num_peaks-1 during training sampling
     z = torch.rand(32)
     _, mu_targ, _ = agent.actor_head.get_distribution_params(z)
-    expected_centers = torch.tanh(mu_targ)
+    expected_centers = torch.tanh(mu_targ).squeeze(0)
     sampled, priors = agent.actor_head.sample_actions(
         z, k_act=8, temperature=1.0, include_peak_means=True
     )
@@ -723,9 +723,9 @@ def test_peak_mean_separation_regularization_gradient() -> None:
         latent_dim=32, action_dim=4, num_blocks=1, proj_dim=32, pred_dim=32
     )
 
-    # Force all peaks to have nearly identical means initially
+    # Force all peaks to have nearly identical means initially (tiny non-zero weight so diff > 0)
     with torch.no_grad():
-        actor_head.limb_head.mu_head.weight.zero_()
+        actor_head.limb_head.mu_head.weight.fill_(1e-3)
         actor_head.limb_head.mu_head.bias.zero_()
 
     obs_seq = torch.randn(2, 3, 10)
@@ -759,8 +759,8 @@ def test_peak_mean_separation_regularization_gradient() -> None:
     assert metrics["peak_mean_sep"] < 0.05
     assert metrics["loss_peak_sep"] > 0.05
     loss.backward()
-    mu_grad = actor_head.limb_head.mu_head.bias.grad
-    assert mu_grad is not None and float(mu_grad.abs().sum().item()) > 0.0
+    mu_w_grad = actor_head.limb_head.mu_head.weight.grad
+    assert mu_w_grad is not None and float(mu_w_grad.abs().sum().item()) > 0.0
 
 
 def test_balancer_slew_rate_and_low_win_gating() -> None:

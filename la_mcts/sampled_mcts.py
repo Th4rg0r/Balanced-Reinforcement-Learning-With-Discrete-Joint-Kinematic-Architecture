@@ -104,7 +104,7 @@ class SampledContinuousMCTS:
         root_tau_beta: float = 1.25,
         inner_tau_beta: float = 1.0,
         tau_act: float = 1.0,
-        batch_leaf_eval: int = 4,
+        batch_leaf_eval: int = 8,
         root_dirichlet_alpha: float = 0.3,
         root_exploration_fraction: float = 0.25,
         latent_ema_decay: float = 0.4,
