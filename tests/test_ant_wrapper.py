@@ -474,10 +474,13 @@ def test_training_shaping_preserves_standard_benchmark_eval() -> None:
     )
     try:
         assert wrapper.get_current_forward_reward_weight() == pytest.approx(2.5, abs=1e-6)
+        assert wrapper.get_current_ctrl_cost_weight() == pytest.approx(0.15, abs=1e-6)
         wrapper.current_return = 2500.0
         assert wrapper.get_current_forward_reward_weight() == pytest.approx(1.75, abs=1e-6)
+        assert wrapper.get_current_ctrl_cost_weight() == pytest.approx(0.325, abs=1e-6)
         wrapper.current_return = 5000.0
         assert wrapper.get_current_forward_reward_weight() == pytest.approx(1.0, abs=1e-6)
+        assert wrapper.get_current_ctrl_cost_weight() == pytest.approx(0.5, abs=1e-6)
         wrapper.current_return = 0.0
 
         act = np.full(12, 0.5, dtype=np.float32)
@@ -488,6 +491,20 @@ def test_training_shaping_preserves_standard_benchmark_eval() -> None:
         r_ctrl = float(train_info["reward_ctrl"])
         expected_train = raw_r + (2.5 - 1.0) * r_fwd + (1.0 - 0.15 / 0.5) * (-r_ctrl)
         assert train_r == pytest.approx(expected_train, abs=1e-5)
+        assert float(train_info["ctrl_cost_weight"]) == pytest.approx(0.15, abs=1e-6)
+
+        # Mid-curriculum blending in training mode moves both weights halfway toward benchmark
+        wrapper.target_return = 2500.0
+        wrapper.current_return = 2500.0
+        _, mid_r, _, _, mid_info = wrapper.step(act)
+        mid_raw_r = float(mid_info["raw_env_reward"])
+        mid_fwd = float(mid_info["reward_forward"])
+        mid_ctrl = float(mid_info["reward_ctrl"])
+        expected_mid = mid_raw_r + (1.75 - 1.0) * mid_fwd + (1.0 - 0.325 / 0.5) * (-mid_ctrl)
+        assert mid_r == pytest.approx(expected_mid, abs=1e-5)
+        assert float(mid_info["ctrl_cost_weight"]) == pytest.approx(0.325, abs=1e-6)
+        wrapper.target_return = 0.0
+        wrapper.current_return = 0.0
 
         # Standard Ant-v5 control cost for 8 active dims at 0.5 is -0.5 * (8 * 0.25) = -1.0
         assert r_ctrl == pytest.approx(-1.0, abs=1e-5)
@@ -496,6 +513,7 @@ def test_training_shaping_preserves_standard_benchmark_eval() -> None:
         _, eval_r, _, _, eval_info = wrapper.step(act)
         assert eval_r == pytest.approx(float(eval_info["raw_env_reward"]), abs=1e-6)
         assert float(eval_info["reward_ctrl"]) == pytest.approx(-1.0, abs=1e-5)
+        assert float(eval_info["ctrl_cost_weight"]) == pytest.approx(0.5, abs=1e-6)
     finally:
         wrapper.close()
 

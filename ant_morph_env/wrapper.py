@@ -509,15 +509,23 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             np.clip(pos_ret / max(self.exploration_return_ref, 1e-6), 0.0, 1.0)
         )
 
-    def get_current_forward_reward_weight(self) -> float:
-        """Linearly blends training forward_reward_weight toward standard 1.0 over 0 -> forward_return_ref (5000) raw return."""
+    def _blend_weight_toward_benchmark(
+        self, train_weight: float, benchmark_weight: float
+    ) -> float:
+        """Linearly blends a training weight toward its benchmark value over 0 -> forward_return_ref raw return."""
         pos_ret = max(0.0, float(self._current_return))
-        fwd_blend = float(
+        blend = float(
             np.clip(pos_ret / max(self.forward_return_ref, 1e-6), 0.0, 1.0)
         )
-        return float(
-            self.forward_reward_weight + fwd_blend * (1.0 - self.forward_reward_weight)
-        )
+        return float(train_weight + blend * (benchmark_weight - train_weight))
+
+    def get_current_forward_reward_weight(self) -> float:
+        """Linearly blends training forward_reward_weight toward standard 1.0 over 0 -> forward_return_ref (5000) raw return."""
+        return self._blend_weight_toward_benchmark(self.forward_reward_weight, 1.0)
+
+    def get_current_ctrl_cost_weight(self) -> float:
+        """Linearly blends training ctrl_cost_weight toward standard 0.5 over 0 -> forward_return_ref (5000) raw return."""
+        return self._blend_weight_toward_benchmark(self.ctrl_cost_weight, 0.5)
 
     def get_current_action_ema_alpha(self) -> float:
         """Returns the effective action EMA alpha interpolating linearly from action_ema_alpha to 1.0 over 0 -> 1000 return."""
@@ -762,12 +770,14 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             blend_alpha = 1.0
             exploration_progress = 1.0
             eff_forward_weight = 1.0
+            eff_ctrl_weight = 0.5
             agent_reward = raw_env_reward
             reward = raw_env_reward
         else:
             blend_alpha = self.get_reward_blend_alpha()
             exploration_progress = self.get_exploration_progress()
             eff_forward_weight = self.get_current_forward_reward_weight()
+            eff_ctrl_weight = self.get_current_ctrl_cost_weight()
             if self.min_healthy_vel > 0.0:
                 # Gate on rolling-mean velocity so single-step contact jitter cannot bypass it
                 vel_gate = float(np.clip(smooth_x_vel / self.min_healthy_vel, 0.0, 1.0))
@@ -779,10 +789,10 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             if abs(eff_forward_weight - 1.0) > 1e-7:
                 reward_fwd = float(info.get("reward_forward", step_x_vel))
                 forward_bonus = (eff_forward_weight - 1.0) * reward_fwd
-            if self.ctrl_cost_weight != 0.5:
-                # Standard Ant-v5 reward_ctrl = -0.5 * ||a||^2; adjust training cost to ctrl_cost_weight
+            if abs(eff_ctrl_weight - 0.5) > 1e-7:
+                # Standard Ant-v5 reward_ctrl = -0.5 * ||a||^2; adjust training cost to eff_ctrl_weight
                 reward_ctrl = float(info.get("reward_ctrl", 0.0))
-                ctrl_refund = (1.0 - (self.ctrl_cost_weight / 0.5)) * (-reward_ctrl)
+                ctrl_refund = (1.0 - (eff_ctrl_weight / 0.5)) * (-reward_ctrl)
             agent_reward = (
                 raw_env_reward
                 + forward_bonus
@@ -856,6 +866,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         info["action_smoothness_coef"] = float(cur_smooth_coef)
         info["action_ema_alpha"] = float(eff_ema_alpha)
         info["forward_reward_weight"] = float(eff_forward_weight)
+        info["ctrl_cost_weight"] = float(eff_ctrl_weight)
         info["brl_metrics"] = {
             "x_velocity": float(mean_x_vel),
             "total_distance": float(total_dist),
