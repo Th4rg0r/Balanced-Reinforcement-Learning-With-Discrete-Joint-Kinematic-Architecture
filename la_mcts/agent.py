@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 import copy
 from dataclasses import dataclass, field
+import math
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
@@ -13,7 +14,7 @@ import torch.optim as optim
 
 from brl_core.interfaces import AbstractBRLSolverAgent
 from config import LAMCTSConfig
-from la_mcts.backbone import SelfAttentionBackbone, combine_cumulative_rep
+from la_mcts.backbone import SelfAttentionBackbone, combine_cumulative_rep, min_max_normalize
 from la_mcts.gmm_heads import MultiPeakGMMActorHead, SupportCriticHead
 from la_mcts.rep_trainer import ModelRepresentationTrainer
 from la_mcts.sampled_mcts import SampledContinuousMCTS
@@ -362,6 +363,10 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         )
         self._last_mcts_info: Optional[Tuple[np.ndarray, np.ndarray, float]] = None
         self._last_limb_kinematics: Optional[np.ndarray] = None
+        self._latent_noise_unit: Optional[torch.Tensor] = None
+        self._committed_peak: Optional[int] = None
+        self._mode_hold_remaining: int = 0
+        self.total_transitions_observed: int = 0
         self.exploration_progress: float = 0.0
         self._diagnostics: Dict[str, float] = {
             "v_s0": 0.0,
@@ -370,21 +375,29 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             "loss_rep": 0.0,
             "policy_std": float(self.cfg.min_policy_std_target),
             "policy_entropy": 0.0,
+            "peak_entropy": 0.0,
             "exploration_scale": 1.0,
             "exploration_progress": 0.0,
             "effective_std_target": float(self.cfg.min_policy_std_target),
             "effective_tau_act": float(self.cfg.tau_act_train),
+            "effective_latent_noise_std": float(getattr(self.cfg, "latent_noise_std", 0.08)),
+            "effective_lambda_peak_ent": float(getattr(self.cfg, "lambda_peak_ent", 0.15)),
+            "critic_warmup_scale": (
+                1.0 if int(getattr(self.cfg, "critic_warmup_steps", 5000)) <= 0 else 0.15
+            ),
         }
 
     def set_exploration_progress(self, progress: float) -> None:
-        """Updates velocity-driven exploration progress alpha in [0, 1]."""
+        """Updates return-driven exploration progress alpha in [0, 1]."""
         self.exploration_progress = float(np.clip(progress, 0.0, 1.0))
         self._diagnostics["exploration_progress"] = self.exploration_progress
         self._diagnostics["effective_std_target"] = self.get_current_std_target()
         self._diagnostics["effective_tau_act"] = self.get_current_tau_act_train()
+        self._diagnostics["effective_latent_noise_std"] = self.get_current_latent_noise_std()
+        self._diagnostics["effective_lambda_peak_ent"] = self.get_current_lambda_peak_ent()
 
     def get_current_std_target(self) -> float:
-        """Returns the annealed policy std floor target interpolating from start to end with velocity progress."""
+        """Returns the annealed policy std floor target interpolating from start to end with exploration progress."""
         start = float(self.cfg.min_policy_std_target)
         end = float(getattr(self.cfg, "min_policy_std_target_end", start))
         return float(start + self.exploration_progress * (end - start))
@@ -400,6 +413,72 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         start = float(self.cfg.root_exploration_fraction)
         end = float(getattr(self.cfg, "root_exploration_fraction_end", start))
         return float(start + self.exploration_progress * (end - start))
+
+    def get_current_latent_noise_std(self) -> float:
+        """Returns annealed global latent exploration std in z-space (Point A)."""
+        start = float(getattr(self.cfg, "latent_noise_std", 0.08))
+        end = float(getattr(self.cfg, "latent_noise_std_end", 0.0))
+        return float(max(0.0, start + self.exploration_progress * (end - start)))
+
+    def get_current_mode_hold_steps(self) -> int:
+        """Returns annealed K-step mode commitment horizon (Point B)."""
+        start = max(1, int(getattr(self.cfg, "mode_hold_steps", 8)))
+        eff = 1.0 + (1.0 - self.exploration_progress) * float(start - 1)
+        return max(1, int(round(eff)))
+
+    def get_current_mode_commitment_prob(self) -> float:
+        """Returns annealed probability mass mixed onto committed GMM peak (Point B)."""
+        start = float(getattr(self.cfg, "mode_commitment_prob", 0.70))
+        return float(max(0.0, start * (1.0 - self.exploration_progress)))
+
+    def get_current_lambda_peak_ent(self) -> float:
+        """Returns annealed GMM mixture-weight entropy regularization weight (Point C)."""
+        start = float(getattr(self.cfg, "lambda_peak_ent", 0.15))
+        end = float(getattr(self.cfg, "lambda_peak_ent_end", 0.02))
+        return float(max(0.0, start + self.exploration_progress * (end - start)))
+
+    def get_current_peak_entropy_floor_ratio(self) -> float:
+        """Returns annealed fraction of uniform mixture entropy log(M) enforced early (Point C)."""
+        start = float(getattr(self.cfg, "peak_entropy_floor_ratio", 0.70))
+        return float(max(0.0, start * (1.0 - self.exploration_progress)))
+
+    def get_critic_warmup_scale(self) -> float:
+        """Returns [0.15, 1.0] critic pre-conditioning ramp factor over critic_warmup_steps (Point D)."""
+        warmup_steps = int(getattr(self.cfg, "critic_warmup_steps", 5000))
+        if warmup_steps <= 0:
+            return 1.0
+        obs_steps = max(
+            int(self.total_transitions_observed), int(self.replay_buffer.total_steps)
+        )
+        return float(np.clip(max(0.15, float(obs_steps) / float(warmup_steps)), 0.15, 1.0))
+
+    def get_current_q_advantage_weight(self) -> float:
+        """Returns Q-advantage sharpening weight in MCTS policy selection scaled by critic warmup (Point D)."""
+        return float(2.0 * self.get_critic_warmup_scale())
+
+    def _refresh_latent_noise(self, rho: float = 0.5) -> None:
+        """Updates temporally correlated unit-scale latent noise direction in z-space (Point A)."""
+        eps = torch.randn(self.cfg.latent_dim, device=self.device, dtype=torch.float32)
+        if self._latent_noise_unit is None:
+            self._latent_noise_unit = eps
+        else:
+            blend = math.sqrt(max(0.0, 1.0 - rho * rho))
+            self._latent_noise_unit = rho * self._latent_noise_unit + blend * eps
+
+    def _get_actor_latent_root(
+        self,
+        z_root: torch.Tensor,
+        prev_cum_root: Optional[torch.Tensor],
+        ema_decay: float,
+    ) -> Optional[torch.Tensor]:
+        """Builds coherent perturbed latent intention z_actor for Network 2 without altering Critic z_cum (Point A)."""
+        latent_std = self.get_current_latent_noise_std()
+        if latent_std <= 1e-6 or self._latent_noise_unit is None:
+            return None
+        z_cum_root = combine_cumulative_rep(z_root, prev_cum_root, alpha=ema_decay)
+        return min_max_normalize(
+            z_cum_root + latent_std * self._latent_noise_unit, eps=1e-6
+        )
 
     def set_episode_context(
         self,
@@ -425,6 +504,9 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         self.episode_history_deque.clear()
         self._running_prev_cum = None
         self._pending_history_step = None
+        self._latent_noise_unit = None
+        self._committed_peak = None
+        self._mode_hold_remaining = 0
         self.current_trajectory.context = self.current_context.copy()
         self.current_trajectory.action_mask = self.current_action_mask.copy()
         self.current_trajectory.limb_kinematics = (
@@ -506,7 +588,29 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 tau_act = self.cfg.tau_act_eval
                 root_tau_beta = None
                 root_exp_frac = None
+                z_actor_root = None
+                commit_peak_in = None
+                commit_prob_in = 0.0
+                q_adv_weight = 2.0
+                eff_hold_steps = 1
+                starting_new_window = False
             else:
+                eff_hold_steps = self.get_current_mode_hold_steps()
+                eff_commit_prob = self.get_current_mode_commitment_prob()
+                starting_new_window = (
+                    self._mode_hold_remaining <= 0 or self._committed_peak is None
+                )
+                if starting_new_window:
+                    self._refresh_latent_noise(rho=0.5)
+                    commit_peak_in = None
+                    commit_prob_in = 0.0
+                else:
+                    commit_peak_in = self._committed_peak
+                    commit_prob_in = eff_commit_prob
+                z_actor_root = self._get_actor_latent_root(
+                    z_root, prev_cum_root, ema_decay=ema_decay
+                )
+
                 std_target = self.get_current_std_target()
                 base_tau_act = self.get_current_tau_act_train()
                 base_root_exp = self.get_current_root_exploration_fraction()
@@ -527,12 +631,17 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     )
                 self._diagnostics["exploration_scale"] = explore_scale
                 self._diagnostics["effective_std_target"] = std_target
+                self._diagnostics["effective_latent_noise_std"] = (
+                    self.get_current_latent_noise_std()
+                )
+                self._diagnostics["critic_warmup_scale"] = self.get_critic_warmup_scale()
                 tau_act = base_tau_act * explore_scale
                 self._diagnostics["effective_tau_act"] = tau_act
                 root_tau_beta = self.cfg.root_tau_beta * explore_scale
                 root_exp_frac = min(0.65, base_root_exp * explore_scale)
+                q_adv_weight = self.get_current_q_advantage_weight()
 
-            chosen_action, policy_weights, root_samples, root_value, _ = (
+            chosen_action, policy_weights, root_samples, root_value, root_node = (
                 self.mcts.search(
                     z_root,
                     deterministic=deterministic,
@@ -543,8 +652,24 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     root_tau_beta=root_tau_beta,
                     root_exploration_fraction=root_exp_frac,
                     prev_cum_state=prev_cum_root,
+                    z_actor_root=z_actor_root,
+                    committed_peak=commit_peak_in,
+                    mode_commitment_prob=commit_prob_in,
+                    q_advantage_weight=q_adv_weight,
                 )
             )
+            if not deterministic:
+                chosen_peak = getattr(root_node, "chosen_peak", None)
+                if eff_hold_steps <= 1:
+                    self._committed_peak = chosen_peak
+                    self._mode_hold_remaining = 0
+                elif starting_new_window:
+                    self._committed_peak = chosen_peak
+                    self._mode_hold_remaining = eff_hold_steps - 1
+                else:
+                    if chosen_peak is not None:
+                        self._committed_peak = chosen_peak
+                    self._mode_hold_remaining = max(0, self._mode_hold_remaining - 1)
 
         self._last_mcts_info = (root_samples, policy_weights, root_value)
         if len(self.current_trajectory) == 0:
@@ -654,12 +779,16 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         # Record transition to rolling history
         self._pending_history_step = None
         self.episode_history_deque.append((obs_aligned, act_arr))
+        self.total_transitions_observed += 1
 
         if terminated or truncated:
             self.replay_buffer.add_trajectory(self.current_trajectory)
             self.episode_history_deque.clear()
             self._running_prev_cum = None
             self._pending_history_step = None
+            self._latent_noise_unit = None
+            self._committed_peak = None
+            self._mode_hold_remaining = 0
             self.current_trajectory = EpisodeTrajectory(
                 context=self.current_context.copy(),
                 action_mask=self.current_action_mask.copy(),
@@ -726,6 +855,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     limb_kinematics=kin_t,
                     root_exploration_fraction=self.get_current_root_exploration_fraction(),
                     prev_cum_state=prev_cum_root,
+                    q_advantage_weight=self.get_current_q_advantage_weight(),
                 )
                 traj.mcts_policy_samples[step] = root_samples
                 traj.mcts_policy_weights[step] = policy_weights
@@ -896,6 +1026,12 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         ) = self.replay_buffer.sample_unroll_batch(bsz, self.device)
 
         target_val_seq = self._compute_target_td_values(refs)
+        warmup_scale = self.get_critic_warmup_scale()
+        eff_lambda_p = float(self.cfg.lambda_p) * warmup_scale
+        eff_lambda_peak_ent = self.get_current_lambda_peak_ent()
+        eff_peak_floor_ratio = self.get_current_peak_entropy_floor_ratio()
+        self._diagnostics["critic_warmup_scale"] = warmup_scale
+        self._diagnostics["effective_lambda_peak_ent"] = eff_lambda_peak_ent
 
         self.optimizer.zero_grad()
         total_loss, metrics = self.rep_trainer.compute_unrolled_loss(
@@ -913,7 +1049,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             action_mask=mask_batch,
             limb_kinematics=kin_batch,
             lambda_v=self.cfg.lambda_v,
-            lambda_p=self.cfg.lambda_p,
+            lambda_p=eff_lambda_p,
             lambda_r=self.cfg.lambda_r,
             lambda_rep=self.cfg.lambda_rep,
             lambda_ent=self.cfg.lambda_ent,
@@ -921,6 +1057,8 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             target_backbone=self.target_backbone,
             target_projector=self.target_projector,
             min_policy_std_target=self.get_current_std_target(),
+            lambda_peak_ent=eff_lambda_peak_ent,
+            peak_entropy_floor_ratio=eff_peak_floor_ratio,
         )
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(
@@ -952,6 +1090,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             "target_projector": self.target_projector.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "diagnostics": dict(self._diagnostics),
+            "total_transitions_observed": int(self.total_transitions_observed),
         }
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
@@ -995,3 +1134,5 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             self.optimizer.load_state_dict(state["optimizer"])
         if "diagnostics" in state:
             self._diagnostics.update(state["diagnostics"])
+        if "total_transitions_observed" in state:
+            self.total_transitions_observed = max(0, int(state["total_transitions_observed"]))

@@ -57,6 +57,14 @@ class LAMCTSConfig:
     min_policy_std_target: float = 0.22
     min_policy_std_target_end: float = 0.12
     exploration_boost_max: float = 2.25
+    latent_noise_std: float = 0.08
+    latent_noise_std_end: float = 0.0
+    mode_hold_steps: int = 8
+    mode_commitment_prob: float = 0.70
+    lambda_peak_ent: float = 0.15
+    lambda_peak_ent_end: float = 0.02
+    peak_entropy_floor_ratio: float = 0.70
+    critic_warmup_steps: int = 5000
     lr: float = 3e-4
     batch_size: int = 128
     buffer_capacity: int = 50000
@@ -102,7 +110,7 @@ class BRLConfig:
     eta_viol: float = 2.0
     beta_ent: float = 0.01
     beta_ent_end: float = 0.002
-    warmup_episodes: int = 100
+    warmup_episodes: int = 150
     brl_episodes: int = 10000
     total_episodes: int = 10000
     warmup_limit: float = 50.0

@@ -21,6 +21,8 @@ class MCTSNode:
         "value_prefix",
         "sampled_actions",
         "prior_weights",
+        "sampled_peaks",
+        "chosen_peak",
         "visit_counts",
         "virtual_counts",
         "q_values",
@@ -38,11 +40,14 @@ class MCTSNode:
         prior_weights: Optional[np.ndarray] = None,
         v_value: float = 0.0,
         z_cum_state: Optional[torch.Tensor] = None,
+        sampled_peaks: Optional[np.ndarray] = None,
     ) -> None:
         self.z_state: torch.Tensor = z_state
         self.z_cum_state: torch.Tensor = z_cum_state if z_cum_state is not None else z_state
         self.value_prefix: float = float(value_prefix)
         self.v_value: float = float(v_value)
+        self.sampled_peaks: Optional[np.ndarray] = sampled_peaks
+        self.chosen_peak: Optional[int] = None
 
         if sampled_actions is not None and prior_weights is not None:
             k_act = sampled_actions.shape[0]
@@ -152,15 +157,26 @@ class SampledContinuousMCTS:
         action_mask: Optional[torch.Tensor] = None,
         limb_kinematics: Optional[torch.Tensor] = None,
         z_cum_state: Optional[torch.Tensor] = None,
+        z_actor_state: Optional[torch.Tensor] = None,
+        committed_peak: Optional[int] = None,
+        mode_commitment_prob: float = 0.0,
     ) -> MCTSNode:
-        """Evaluates actor and critic heads on cumulative latent state to initialize an MCTSNode."""
+        """Evaluates actor and critic heads on cumulative latent state to initialize an MCTSNode.
+
+        Critic always reads clean `cum_state` while actor may read `z_actor_state` (Point A)
+        and bias toward `committed_peak` (Point B).
+        """
         cum_state = z_cum_state if z_cum_state is not None else z_state
-        sampled_actions, prior_weights_t = self.actor_head.sample_actions(
-            cum_state,
+        actor_state = z_actor_state if z_actor_state is not None else cum_state
+        sampled_actions, prior_weights_t, sampled_peaks_t = self.actor_head.sample_actions(
+            actor_state,
             k_act=self.k_act,
             temperature=temperature,
             action_mask=action_mask,
             limb_kinematics=limb_kinematics,
+            committed_peak=committed_peak,
+            mode_commitment_prob=mode_commitment_prob,
+            return_peaks=True,
         )
         v_val = float(self.critic_head(cum_state.unsqueeze(0)).squeeze().item())
         return MCTSNode(
@@ -170,6 +186,7 @@ class SampledContinuousMCTS:
             prior_weights=prior_weights_t.detach().cpu().numpy(),
             v_value=v_val,
             z_cum_state=cum_state,
+            sampled_peaks=sampled_peaks_t.detach().cpu().numpy(),
         )
 
     def search(
@@ -183,6 +200,10 @@ class SampledContinuousMCTS:
         root_tau_beta: Optional[float] = None,
         root_exploration_fraction: Optional[float] = None,
         prev_cum_state: Optional[torch.Tensor] = None,
+        z_actor_root: Optional[torch.Tensor] = None,
+        committed_peak: Optional[int] = None,
+        mode_commitment_prob: float = 0.0,
+        q_advantage_weight: float = 2.0,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, MCTSNode]:
         """Executes N_sim MCTS simulations from z_root using virtual-loss leaf batching.
 
@@ -200,6 +221,8 @@ class SampledContinuousMCTS:
             z_root = z_root.squeeze(0)
         if prev_cum_state is not None and prev_cum_state.dim() == 2:
             prev_cum_state = prev_cum_state.squeeze(0)
+        if z_actor_root is not None and z_actor_root.dim() == 2:
+            z_actor_root = z_actor_root.squeeze(0)
 
         num_simulations = n_sim if n_sim is not None else self.n_sim
         temp_act = (0.0 if deterministic else self.tau_act) if tau_act is None else tau_act
@@ -209,6 +232,7 @@ class SampledContinuousMCTS:
             if root_exploration_fraction is None
             else float(root_exploration_fraction)
         )
+        eff_q_adv = float(max(0.0, q_advantage_weight))
 
         with torch.inference_mode():
             min_max_stats = MinMaxStats()
@@ -222,6 +246,9 @@ class SampledContinuousMCTS:
                 action_mask=action_mask,
                 limb_kinematics=limb_kinematics,
                 z_cum_state=z_cum_root,
+                z_actor_state=(None if deterministic else z_actor_root),
+                committed_peak=(None if deterministic else committed_peak),
+                mode_commitment_prob=(0.0 if deterministic else float(mode_commitment_prob)),
             )
             if not deterministic and eff_root_exp > 0.0:
                 noise = np.random.dirichlet([self.root_dirichlet_alpha] * self.k_act)
@@ -351,9 +378,9 @@ class SampledContinuousMCTS:
             q_root_raw = np.where(root.visit_counts > 0, root.q_values, root.v_value)
             q_root_norm = min_max_stats.normalize(q_root_raw)
             if deterministic or temp_act <= 1e-3:
-                best_idx = int(np.argmax(counts_f + 0.5 * q_root_norm))
+                best_idx = int(np.argmax(counts_f + 0.25 * eff_q_adv * q_root_norm))
                 # Soft policy weights combine empirical visit counts and normalized Q-advantage
-                logits_mcts = np.log(np.maximum(counts_f, 1e-8)) + 2.0 * q_root_norm
+                logits_mcts = np.log(np.maximum(counts_f, 1e-8)) + eff_q_adv * q_root_norm
                 logits_mcts -= np.max(logits_mcts)
                 exp_w = np.exp(logits_mcts)
                 policy_weights = exp_w / np.sum(exp_w)
@@ -361,7 +388,7 @@ class SampledContinuousMCTS:
             else:
                 eff_temp = max(float(temp_act), 0.1)
                 logits_mcts = (
-                    np.log(np.maximum(counts_f, 1e-8)) + 2.0 * q_root_norm
+                    np.log(np.maximum(counts_f, 1e-8)) + eff_q_adv * q_root_norm
                 ) / eff_temp
                 logits_mcts -= np.max(logits_mcts)
                 exp_w = np.exp(logits_mcts)
@@ -373,6 +400,9 @@ class SampledContinuousMCTS:
                 # Ensure exact normalization within floating-point precision
                 policy_weights = policy_weights / np.sum(policy_weights)
                 chosen_idx = int(np.random.choice(self.k_act, p=policy_weights))
+
+            if root.sampled_peaks is not None and 0 <= chosen_idx < len(root.sampled_peaks):
+                root.chosen_peak = int(root.sampled_peaks[chosen_idx])
 
             root_actions_np = root.sampled_actions.detach().cpu().numpy()
             chosen_action = root_actions_np[chosen_idx]

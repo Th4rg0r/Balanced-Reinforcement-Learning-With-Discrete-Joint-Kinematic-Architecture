@@ -438,4 +438,232 @@ def test_velocity_driven_exploration_annealing() -> None:
     assert limits.shape == (6,) and costs.shape == (6,) and np.isfinite(budget)
 
 
+def test_needle_point_a_coherent_latent_exploration() -> None:
+    """Point A: Coherent global latent perturbations feed actor without corrupting critic/dynamics."""
+    torch.manual_seed(7)
+    cfg = LAMCTSConfig(
+        obs_dim=12,
+        max_action_dim=4,
+        context_dim=6,
+        history_len=2,
+        k_tok=4,
+        d_model=32,
+        n_heads=2,
+        l_enc=1,
+        latent_dim=32,
+        l_dyn=1,
+        proj_dim=32,
+        pred_dim=32,
+        n_sim=6,
+        k_act=6,
+        latent_noise_std=0.08,
+        latent_noise_std_end=0.0,
+        mode_hold_steps=4,
+    )
+    agent = LatentActionMCTSAgent(cfg, device=torch.device("cpu"))
+    agent.set_episode_context()
+    agent.set_exploration_progress(0.0)
+
+    obs = np.random.randn(12).astype(np.float32)
+    agent.select_action(obs, deterministic=False)
+    noise_step0 = agent._latent_noise_unit.clone()
+    assert noise_step0 is not None
+    assert agent._mode_hold_remaining == 3
+
+    # Held constant inside the active 4-step window
+    agent.select_action(obs, deterministic=False)
+    torch.testing.assert_close(agent._latent_noise_unit, noise_step0)
+    assert agent._mode_hold_remaining == 2
+
+    # Clean z_cum vs perturbed z_actor_root bounds and critic purity
+    z_root = agent.backbone(
+        torch.as_tensor(obs).unsqueeze(0),
+        context=torch.zeros(1, 6),
+        history=torch.zeros(1, 2 * 16),
+    ).squeeze(0)
+    z_actor = agent._get_actor_latent_root(z_root, prev_cum_root=None, ema_decay=0.4)
+    assert z_actor is not None
+    assert float(z_actor.min().item()) >= 0.0 and float(z_actor.max().item()) <= 1.0
+    assert not torch.allclose(z_actor, z_root)
+
+    with torch.no_grad():
+        expected_v = float(agent.critic_head(z_root.unsqueeze(0)).squeeze().item())
+    _, _, _, _, root = agent.mcts.search(
+        z_root, deterministic=False, n_sim=4, z_actor_root=z_actor
+    )
+    assert np.isclose(root.v_value, expected_v, atol=1e-5)
+
+    # Anneals completely to zero at exploration_progress = 1.0
+    agent.set_exploration_progress(1.0)
+    assert np.isclose(agent.get_current_latent_noise_std(), 0.0)
+    assert agent._get_actor_latent_root(z_root, prev_cum_root=None, ema_decay=0.4) is None
+
+
+def test_needle_point_b_mode_commitment_and_hold() -> None:
+    """Point B: Composite GMM commits to peak_k and MCTS agent holds/anneals the commitment horizon."""
+    torch.manual_seed(21)
+    actor_head = MultiPeakGMMActorHead(latent_dim=32, action_dim=4, num_peaks=4)
+    z_t = torch.rand(32)
+
+    # Strong commitment onto peak 2 should make almost all sampled indices equal 2 while keeping valid priors
+    sampled, priors, peaks = actor_head.sample_actions(
+        z_t,
+        k_act=64,
+        temperature=1.2,
+        committed_peak=2,
+        mode_commitment_prob=0.90,
+        return_peaks=True,
+    )
+    assert sampled.shape == (64, 4)
+    assert peaks.shape == (64,)
+    assert torch.allclose(priors.sum(), torch.tensor(1.0), atol=1e-5)
+    frac_peak2 = float((peaks == 2).float().mean().item())
+    assert frac_peak2 > 0.70
+
+    # Agent hold horizon anneals from mode_hold_steps=8 down to 1 and resets at episode boundary
+    cfg = LAMCTSConfig(
+        obs_dim=12,
+        max_action_dim=4,
+        context_dim=6,
+        history_len=2,
+        k_tok=4,
+        d_model=32,
+        n_heads=2,
+        l_enc=1,
+        latent_dim=32,
+        l_dyn=1,
+        proj_dim=32,
+        pred_dim=32,
+        n_sim=4,
+        k_act=4,
+        mode_hold_steps=8,
+        mode_commitment_prob=0.70,
+    )
+    agent = LatentActionMCTSAgent(cfg, device=torch.device("cpu"))
+    agent.set_exploration_progress(0.0)
+    assert agent.get_current_mode_hold_steps() == 8
+    assert np.isclose(agent.get_current_mode_commitment_prob(), 0.70)
+
+    agent.set_exploration_progress(1.0)
+    assert agent.get_current_mode_hold_steps() == 1
+    assert np.isclose(agent.get_current_mode_commitment_prob(), 0.0)
+
+    agent.set_exploration_progress(0.0)
+    obs = np.random.randn(12).astype(np.float32)
+    act = agent.select_action(obs, deterministic=False)
+    assert agent._committed_peak is not None
+    assert agent._mode_hold_remaining == 7
+    agent.observe_transition(obs, act, 1.0, obs, terminated=True, truncated=False, info={})
+    assert agent._committed_peak is None
+    assert agent._mode_hold_remaining == 0
+
+
+def test_needle_point_c_mixture_weight_entropy_floor() -> None:
+    """Point C: Decaying categorical entropy bonus + floor prevents GMM peak collapse."""
+    torch.manual_seed(33)
+    backbone = SelfAttentionBackbone(
+        obs_dim=10, max_action_dim=4, context_dim=6, k_tok=4, d_model=32, n_heads=2, l_enc=1, latent_dim=32, history_len=2
+    )
+    actor_head = MultiPeakGMMActorHead(latent_dim=32, action_dim=4, num_peaks=4)
+    critic_head = SupportCriticHead(latent_dim=32, use_categorical=False)
+    rep_trainer = ModelRepresentationTrainer(
+        latent_dim=32, action_dim=4, num_blocks=1, proj_dim=32, pred_dim=32
+    )
+
+    # Deliberately collapse global mixture logits toward peak 0
+    with torch.no_grad():
+        actor_head.logits_net.bias.copy_(torch.tensor([8.0, -8.0, -8.0, -8.0]))
+
+    obs_seq = torch.randn(2, 3, 10)
+    act_seq = torch.zeros(2, 2, 4)
+    rew_seq = torch.zeros(2, 2)
+    val_seq = torch.zeros(2, 3)
+    samples = torch.zeros(2, 3, 4, 4)
+    weights = torch.full((2, 3, 4), 0.25)
+
+    actor_head.zero_grad()
+    total_loss, metrics = rep_trainer.compute_unrolled_loss(
+        obs_seq=obs_seq,
+        action_seq=act_seq,
+        reward_seq=rew_seq,
+        target_value_seq=val_seq,
+        mcts_policy_samples=samples,
+        mcts_policy_weights=weights,
+        backbone=backbone,
+        actor_head=actor_head,
+        critic_head=critic_head,
+        lambda_p=0.0,
+        lambda_v=0.0,
+        lambda_r=0.0,
+        lambda_rep=0.0,
+        lambda_ent=0.0,
+        c_reg=0.0,
+        lambda_peak_ent=0.15,
+        peak_entropy_floor_ratio=0.70,
+    )
+    assert "loss_peak_ent" in metrics and "peak_ent_floor" in metrics
+    assert np.isclose(metrics["peak_ent_floor"], 0.70 * np.log(4), atol=1e-4)
+    assert metrics["peak_entropy"] < metrics["peak_ent_floor"]
+    assert metrics["loss_peak_ent"] > 0.0
+
+    # Gradient on collapsed peak 0 logit bias and per-limb weight head should push dominant mode down
+    total_loss.backward()
+    bias_grad = actor_head.logits_net.bias.grad
+    assert bias_grad is not None
+    assert float(bias_grad[0].item()) > 0.0
+    assert float(bias_grad[1].item()) < 0.0
+    limb_w_grad = actor_head.limb_head.weight_head.weight.grad
+    assert limb_w_grad is not None and float(torch.norm(limb_w_grad).item()) > 0.0
+
+
+def test_needle_point_d_critic_warmup_and_config_defaults() -> None:
+    """Point D: Critic warmup scales actor sharpening and persists transition count; default_config loads cleanly."""
+    import warnings
+    from config import load_config
+
+    cfg = LAMCTSConfig(
+        obs_dim=12,
+        max_action_dim=4,
+        context_dim=6,
+        history_len=2,
+        k_tok=4,
+        d_model=32,
+        n_heads=2,
+        l_enc=1,
+        latent_dim=32,
+        l_dyn=1,
+        proj_dim=32,
+        pred_dim=32,
+        critic_warmup_steps=100,
+    )
+    agent = LatentActionMCTSAgent(cfg, device=torch.device("cpu"))
+    assert np.isclose(agent.get_critic_warmup_scale(), 0.15)
+    assert np.isclose(agent.get_current_q_advantage_weight(), 0.30)
+
+    agent.total_transitions_observed = 50
+    assert np.isclose(agent.get_critic_warmup_scale(), 0.50)
+    assert np.isclose(agent.get_current_q_advantage_weight(), 1.00)
+
+    agent.total_transitions_observed = 200
+    assert np.isclose(agent.get_critic_warmup_scale(), 1.0)
+    assert np.isclose(agent.get_current_q_advantage_weight(), 2.0)
+
+    sd = agent.state_dict()
+    agent2 = LatentActionMCTSAgent(cfg, device=torch.device("cpu"))
+    agent2.load_state_dict(sd)
+    assert agent2.total_transitions_observed == 200
+    assert np.isclose(agent2.get_critic_warmup_scale(), 1.0)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        sys_cfg = load_config("config/default_config.yaml")
+    assert not caught, f"Unexpected config warnings: {[str(w.message) for w in caught]}"
+    assert np.isclose(sys_cfg.la_mcts.latent_noise_std, 0.08)
+    assert sys_cfg.la_mcts.mode_hold_steps == 8
+    assert np.isclose(sys_cfg.la_mcts.lambda_peak_ent, 0.15)
+    assert sys_cfg.la_mcts.critic_warmup_steps == 5000
+    assert sys_cfg.brl.warmup_episodes == 150
+
+
+
 

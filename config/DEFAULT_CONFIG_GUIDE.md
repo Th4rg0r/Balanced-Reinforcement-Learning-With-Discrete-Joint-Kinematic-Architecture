@@ -171,11 +171,12 @@ This document provides a comprehensive reference for every configuration paramet
   - `beta_mse: 1.0`: Stop-gradient MSE weight inside the hybrid SimSiam cosine + MSE consistency loss.
   - `lambda_v: 0.5`: Weight of the value critic loss.
   - `lambda_r: 1.0`: Weight of the step reward prediction loss.
-  - `lambda_p: 0.25`: Weight of the policy prior cross-entropy loss against MCTS search policy $\pi_{\text{mcts}}$.
-  - `lambda_ent: 0.015`: Weight of the policy peak diversity and standard-deviation floor/ceiling regularization bonus.
+  - `lambda_p: 0.25`: Weight of the policy prior cross-entropy loss against MCTS search policy $\pi_{\text{mcts}}$ (ramped by `critic_warmup_steps` during pre-conditioning).
+  - `lambda_ent: 0.03`: Weight of the per-joint Gaussian standard-deviation floor/ceiling regularization (`std_floor` $\to$ `std_ceil`).
+  - `lambda_peak_ent: 0.15` $\to$ `lambda_peak_ent_end: 0.02`: Decaying weight on the GMM categorical mixture-weight entropy $H(\pi)$ (with `peak_entropy_floor_ratio: 0.70` $\to$ `0.0`) to prevent premature mode collapse without forcing destructive per-joint variance.
 - **Training Impact**:
   - Balanced multi-task loss objective:
-    $$\mathcal{L}_{\text{total}} = \lambda_p \mathcal{L}_{\text{policy}} + \lambda_v \mathcal{L}_{\text{value}} + \lambda_r \mathcal{L}_{\text{reward}} + \lambda_{\text{rep}} \mathcal{L}_{\text{rep}} - \lambda_{\text{ent}} \mathcal{L}_{\text{ent}} + c_{\text{reg}} \|\theta\|_2^2$$
+    $$\mathcal{L}_{\text{total}} = \lambda_p \mathcal{L}_{\text{policy}} + \lambda_v \mathcal{L}_{\text{value}} + \lambda_r \mathcal{L}_{\text{reward}} + \lambda_{\text{rep}} \mathcal{L}_{\text{rep}} - \lambda_{\text{ent}} \mathcal{L}_{\text{ent}} + \mathcal{L}_{\text{peak\_ent}} + c_{\text{reg}} \|\theta\|_2^2$$
 
 #### `c_reg`
 - **Type**: `float` | **Default**: `0.0001` ($10^{-4}$)
@@ -208,8 +209,8 @@ Exploration in LA-MCTS is dynamically annealed using the environment's **rolling
 - **Purpose**: Softmax/proposal temperature applied when sampling continuous actions from the GMM actor at the root node (`1.0`) vs. interior tree nodes (`0.8`).
 
 #### `root_dirichlet_alpha`, `root_exploration_fraction`, and `root_exploration_fraction_end`
-- **Type**: `float` | **Default**: `root_dirichlet_alpha: 0.3`, `root_exploration_fraction: 0.30`, `root_exploration_fraction_end: 0.10`
-- **Purpose**: Injects Dirichlet noise $\text{Dir}(\alpha)$ into the root node policy prior, with mixing fraction $\epsilon$ annealing linearly from `0.30` (at `0` return) down to `0.10` (at `3000` rolling raw return).
+- **Type**: `float` | **Default**: `root_dirichlet_alpha: 0.35`, `root_exploration_fraction: 0.40`, `root_exploration_fraction_end: 0.12`
+- **Purpose**: Injects Dirichlet noise $\text{Dir}(\alpha)$ into the root node policy prior, with mixing fraction $\epsilon$ annealing linearly from `0.40` (at `0` return) down to `0.12` (at `3000` rolling raw return).
 
 #### `tau_act_train`, `tau_act_train_end`, and `tau_act_eval`
 - **Type**: `float` | **Default**: `tau_act_train: 1.0`, `tau_act_train_end: 0.25`, `tau_act_eval: 0.05`
@@ -218,10 +219,16 @@ Exploration in LA-MCTS is dynamically annealed using the environment's **rolling
   - **Evaluation (`tau_act_eval: 0.05`)**: Near-deterministic greedy selection for benchmark evaluation.
 
 #### `adaptive_exploration`, `min_policy_std_target`, `min_policy_std_target_end`, and `exploration_boost_max`
-- **Type**: `bool` / `float` | **Default**: `adaptive_exploration: true`, `min_policy_std_target: 0.22`, `min_policy_std_target_end: 0.12`, `exploration_boost_max: 2.25`
+- **Type**: `bool` / `float` | **Default**: `adaptive_exploration: true`, `min_policy_std_target: 0.22`, `min_policy_std_target_end: 0.12`, `exploration_boost_max: 2.75`
 - **Purpose**:
-  - `min_policy_std_target` $\to$ `min_policy_std_target_end`: Sets the target floor for the actor's Gaussian standard deviation, annealing from `0.22` (at `0` return) down to `0.12` (at `3000` rolling raw return). Used both in `rep_trainer.py`'s std floor bonus and in `agent.py`'s adaptive exploration boost.
-  - When `adaptive_exploration: true` and the actor's current std drops below the annealed target, MCTS temperatures are boosted up to `exploration_boost_max` (`2.25`, which also softens as exploration progress approaches `1.0`).
+  - `min_policy_std_target` $\to$ `min_policy_std_target_end`: Sets the moderate target floor for each mode's per-joint Gaussian standard deviation (`0.22` at `0` return down to `0.12` at `3000` return), avoiding uncorrelated per-limb jitter while structured exploration is handled in latent/mode space.
+  - When `adaptive_exploration: true` and the actor's current std drops below the annealed target, MCTS temperatures are boosted up to `exploration_boost_max` (`2.75`, softening as exploration progress approaches `1.0`).
+
+#### Structured Exploration & Pre-Conditioning (`needle.md` Points A–D)
+- **`latent_noise_std` / `latent_noise_std_end`** (`0.08` $\to$ `0.0`, Point A): Scale of temporally correlated OU perturbation $\delta_z$ added to the shared root latent representation (`min_max_normalize(z_cum + delta_z)`) seen by `MorphologicalLimbHead` (while Critic and dynamics keep clean $z$), so all limbs explore coherent whole-body intentions simultaneously.
+- **`mode_hold_steps` / `mode_commitment_prob`** (`8` $\to$ `1` steps / `0.70` $\to$ `0.0`, Point B): Holds the active global latent intention $\delta_z$ and biases MCTS root candidate sampling toward the committed GMM peak for `mode_hold_steps`, letting MuJoCo physics accumulate torso momentum across steps.
+- **`lambda_peak_ent` / `lambda_peak_ent_end` / `peak_entropy_floor_ratio`** (`0.15` $\to$ `0.02`, floor `0.70` $\to$ `0.0` of $\log M$, Point C): Decaying categorical entropy regularization and entropy floor on the GMM mixture weights $H(\pi)$ across all unroll steps, keeping distribution modes alive without inflating per-joint Gaussian variance.
+- **`critic_warmup_steps`** (`5000`, Point D): Transitions over which Critic and World Model train at full weight while actor policy cross-entropy (`lambda_p`) and MCTS Q-advantage weight ramp from `0.15` to `1.0`.
 
 ---
 
@@ -326,10 +333,10 @@ Exploration in LA-MCTS is dynamically annealed using the environment's **rolling
 ### 2.4 Curriculum Schedule & Warmup
 
 #### `warmup_episodes`, `brl_episodes`, and `total_episodes`
-- **Type**: `int` | **Default**: `warmup_episodes: 80`, `brl_episodes: 10000`, `total_episodes: 10000`
+- **Type**: `int` | **Default**: `warmup_episodes: 150`, `brl_episodes: 10000`, `total_episodes: 10000`
 - **Purpose**:
-  - Episodes `1 .. 80`: Warmup phase with mild, fixed constraints (`warmup_limit`, `warmup_budget`) so the agent learns stable standing and initial locomotion.
-  - Episodes `81 .. 10000`: Active co-evolutionary BRL phase.
+  - Episodes `1 .. 150`: Extended warmup phase with mild, fixed constraints (`warmup_limit`, `warmup_budget`) so Network 2 (`MorphologicalLimbHead`) and the Critic pre-condition over diverse nominal locomotion trajectories before co-evolutionary BRL ramps up difficulty.
+  - Episodes `151 .. 10000`: Active co-evolutionary BRL phase.
 
 #### `warmup_limit` and `warmup_budget`
 - **Type**: `float` | **Default**: `warmup_limit: 30.0`, `warmup_budget: 90.0`

@@ -563,6 +563,8 @@ class MultiPeakGMMActorHead(nn.Module):
             log_std_bounds=log_std_bounds,
         )
         self.last_limb_weights: Optional[torch.Tensor] = None
+        self._last_per_limb_logits: Optional[torch.Tensor] = None
+        self.last_sampled_peaks: Optional[torch.Tensor] = None
         nn.init.zeros_(self.limb_head.weight_head.weight)
         nn.init.zeros_(self.limb_head.weight_head.bias)
 
@@ -574,7 +576,7 @@ class MultiPeakGMMActorHead(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Projects z_t -> (logits, mu, std) with soft-clamped means and bounded log_std."""
         batch_shape = z_t.shape[:-1]
-        logits = self.logits_net(z_t)
+        logits_base = self.logits_net(z_t)
 
         if self.use_morphological_limbs:
             kin = limb_kinematics
@@ -599,7 +601,11 @@ class MultiPeakGMMActorHead(nn.Module):
                     return_weights=True,
                 )
             )
-            logits = logits + peak_logits_limb
+            logits = logits_base + peak_logits_limb
+            per_limb_logits = logits_base.unsqueeze(-1) + limb_weights
+            if temperature != 1.0 and temperature > 0.0:
+                per_limb_logits = per_limb_logits / temperature
+            self._last_per_limb_logits = per_limb_logits
             self.last_limb_weights = limb_weights.detach()
             mu = 5.0 * torch.tanh(mu_raw / 5.0)
             log_std = torch.clamp(
@@ -607,6 +613,8 @@ class MultiPeakGMMActorHead(nn.Module):
             )
             std = torch.exp(log_std)
         else:
+            logits = logits_base
+            self._last_per_limb_logits = None
             mu_raw = self.mu_net(z_t).view(*batch_shape, self.num_peaks, self.action_dim)
             mu = 5.0 * torch.tanh(mu_raw / 5.0)
             log_std = self.log_std_net(z_t).view(*batch_shape, self.num_peaks, self.action_dim)
@@ -773,10 +781,15 @@ class MultiPeakGMMActorHead(nn.Module):
         temperature: float = 1.0,
         action_mask: Optional[torch.Tensor] = None,
         limb_kinematics: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Samples K_act actions from beta(. | z_t) and returns (actions, prior_weights).
+        committed_peak: Optional[int] = None,
+        mode_commitment_prob: float = 0.0,
+        return_peaks: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
+        """Samples K_act actions from beta(. | z_t) and returns (actions, prior_weights[, peak_indices]).
 
-        Uses direct tensorized categorical + Gaussian sampling per Section 2.2 for low latency.
+        When `committed_peak` and `mode_commitment_prob > 0` are given, mixes the proposal
+        mode probabilities with a one-hot on `committed_peak` to achieve temporally persistent
+        multi-step mode commitment while keeping `1 - mode_commitment_prob` mass on other modes.
         """
         single = z_t.dim() == 1
         if single:
@@ -800,8 +813,32 @@ class MultiPeakGMMActorHead(nn.Module):
             std_prop = std_targ
 
         probs = F.softmax(logits_prop, dim=-1)  # (B, M)
+        commit_active = (
+            committed_peak is not None
+            and float(mode_commitment_prob) > 0.0
+            and 0 <= int(committed_peak) < self.num_peaks
+        )
+        if commit_active:
+            c_prob = float(min(max(float(mode_commitment_prob), 0.0), 0.95))
+            one_hot = (
+                F.one_hot(
+                    torch.tensor(int(committed_peak), device=probs.device, dtype=torch.long),
+                    num_classes=self.num_peaks,
+                )
+                .to(dtype=probs.dtype)
+                .unsqueeze(0)
+            )
+            probs_prop = (1.0 - c_prob) * probs + c_prob * one_hot
+            probs_targ_eff = (1.0 - c_prob) * F.softmax(logits_targ, dim=-1) + c_prob * one_hot
+            logits_prop_eff = torch.log(probs_prop.clamp_min(1e-8))
+            logits_targ_eff = torch.log(probs_targ_eff.clamp_min(1e-8))
+        else:
+            probs_prop = probs
+            logits_prop_eff = logits_prop
+            logits_targ_eff = logits_targ
+
         # Draw K_act mixture indices per batch item: (B, K_act)
-        comp_indices = torch.multinomial(probs, num_samples=k_act, replacement=True)
+        comp_indices = torch.multinomial(probs_prop, num_samples=k_act, replacement=True)
         idx_exp = comp_indices.unsqueeze(-1).expand(bsz, k_act, self.action_dim)
 
         chosen_mu = torch.gather(mu_prop, dim=1, index=idx_exp)  # (B, K_act, N)
@@ -820,17 +857,24 @@ class MultiPeakGMMActorHead(nn.Module):
             )
         else:
             log_pi_u = self._fast_log_prob_u(
-                u, logits_targ, mu_targ, std_targ, action_mask=action_mask
+                u, logits_targ_eff, mu_targ, std_targ, action_mask=action_mask
             )
             log_beta_u = self._fast_log_prob_u(
-                u, logits_prop, mu_prop, std_prop, action_mask=action_mask
+                u, logits_prop_eff, mu_prop, std_prop, action_mask=action_mask
             )
             # Note: tanh Jacobian cancels out identically in the importance ratio pi(a)/beta(a)!
             log_ratio = torch.clamp(log_pi_u - log_beta_u, min=-20.0, max=20.0)
             prior_weights = F.softmax(log_ratio, dim=-1)
 
+        peaks_out = comp_indices.squeeze(0) if single else comp_indices
+        self.last_sampled_peaks = peaks_out.detach()
+
         if single:
+            if return_peaks:
+                return sampled.squeeze(0), prior_weights.squeeze(0), peaks_out
             return sampled.squeeze(0), prior_weights.squeeze(0)
+        if return_peaks:
+            return sampled, prior_weights, peaks_out
         return sampled, prior_weights
 
     def log_prob(
@@ -850,6 +894,22 @@ class MultiPeakGMMActorHead(nn.Module):
             return lp.transpose(0, 1)  # (B, K_act)
         return dist.log_prob(actions, action_mask=action_mask)
 
+    def _log_prob_pre_tanh_from_params(
+        self,
+        z_t_dim: int,
+        actions: torch.Tensor,
+        logits: torch.Tensor,
+        mu: torch.Tensor,
+        std: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        a_clamped = torch.clamp(actions, -1.0 + 1e-5, 1.0 - 1e-5)
+        u = torch.atanh(a_clamped)
+        if actions.dim() == z_t_dim:
+            u = u.unsqueeze(-2)
+            return self._fast_log_prob_u(u, logits, mu, std, action_mask=action_mask).squeeze(-1)
+        return self._fast_log_prob_u(u, logits, mu, std, action_mask=action_mask)
+
     def log_prob_pre_tanh(
         self,
         z_t: torch.Tensor,
@@ -862,13 +922,75 @@ class MultiPeakGMMActorHead(nn.Module):
         logits, mu, std = self.get_distribution_params(
             z_t, temperature=temperature, limb_kinematics=limb_kinematics
         )
-        a_clamped = torch.clamp(actions, -1.0 + 1e-5, 1.0 - 1e-5)
-        u = torch.atanh(a_clamped)
-        if actions.dim() == z_t.dim():
-            u = u.unsqueeze(-2)
-            lp = self._fast_log_prob_u(u, logits, mu, std, action_mask=action_mask)
-            return lp.squeeze(-1)
-        return self._fast_log_prob_u(u, logits, mu, std, action_mask=action_mask)
+        return self._log_prob_pre_tanh_from_params(
+            z_t.dim(), actions, logits, mu, std, action_mask=action_mask
+        )
+
+    def _compute_entropy_stats(
+        self,
+        logits: torch.Tensor,
+        std: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
+        per_limb_logits: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Computes (total_entropy, peak_entropy, mean_std) from GMM distribution parameters.
+
+        Includes both global composite mixture-weight entropy and per-limb categorical peak
+        entropy (when MorphologicalLimbHead is active) so neither the global head nor
+        individual limb decoders collapse to a single mode early on.
+        """
+        peak_probs = F.softmax(logits, dim=-1)
+        peak_log_probs = F.log_softmax(logits, dim=-1)
+        global_peak_entropy = -(peak_probs * peak_log_probs).sum(dim=-1)
+
+        eff_limb_logits = (
+            per_limb_logits if per_limb_logits is not None else self._last_per_limb_logits
+        )
+        if eff_limb_logits is not None and eff_limb_logits.shape[:-1] == logits.shape:
+            limb_probs = F.softmax(eff_limb_logits, dim=-2)
+            limb_log_probs = F.log_softmax(eff_limb_logits, dim=-2)
+            limb_peak_entropy = -(limb_probs * limb_log_probs).sum(dim=-2).mean(dim=-1)
+            peak_entropy = 0.5 * (global_peak_entropy + limb_peak_entropy)
+        else:
+            peak_entropy = global_peak_entropy
+
+        comp_gauss_ent = 0.5 * math.log(2.0 * math.pi * math.e) + torch.log(std)
+        if action_mask is not None:
+            if action_mask.dim() == 1:
+                mask = action_mask.view(*([1] * (std.dim() - 1)), -1)
+            else:
+                extra_ones = [1] * (std.dim() - action_mask.dim())
+                mask = action_mask.view(
+                    *action_mask.shape[:-1], *extra_ones, action_mask.shape[-1]
+                )
+            denom = mask.sum(dim=-1).squeeze(-1).clamp_min(1.0)
+            gauss_entropy = (peak_probs.unsqueeze(-1) * comp_gauss_ent * mask).sum(dim=(-2, -1)) / denom
+            mean_std = (peak_probs.unsqueeze(-1) * std * mask).sum(dim=(-2, -1)) / denom
+        else:
+            gauss_entropy = (peak_probs.unsqueeze(-1) * comp_gauss_ent).sum(dim=-2).mean(dim=-1)
+            mean_std = (peak_probs.unsqueeze(-1) * std).sum(dim=-2).mean(dim=-1)
+
+        return peak_entropy + gauss_entropy, peak_entropy, mean_std
+
+    def compute_log_prob_pre_tanh_and_entropy(
+        self,
+        z_t: torch.Tensor,
+        actions: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
+        temperature: float = 1.0,
+        limb_kinematics: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Evaluates pre-tanh GMM log_prob together with entropy stats in a single actor forward pass."""
+        logits, mu, std = self.get_distribution_params(
+            z_t, temperature=temperature, limb_kinematics=limb_kinematics
+        )
+        lp = self._log_prob_pre_tanh_from_params(
+            z_t.dim(), actions, logits, mu, std, action_mask=action_mask
+        )
+        total_ent, peak_ent, mean_std = self._compute_entropy_stats(
+            logits, std, action_mask=action_mask
+        )
+        return lp, total_ent, peak_ent, mean_std
 
     def entropy_proxy(
         self,
@@ -886,27 +1008,7 @@ class MultiPeakGMMActorHead(nn.Module):
         logits, _, std = self.get_distribution_params(
             z_t, temperature=1.0, limb_kinematics=limb_kinematics
         )
-        peak_probs = F.softmax(logits, dim=-1)
-        peak_log_probs = F.log_softmax(logits, dim=-1)
-        peak_entropy = -(peak_probs * peak_log_probs).sum(dim=-1)
-
-        comp_gauss_ent = 0.5 * math.log(2.0 * math.pi * math.e) + torch.log(std)
-        if action_mask is not None:
-            mask = (
-                action_mask.view(*([1] * (std.dim() - 1)), -1)
-                if action_mask.dim() == 1
-                else action_mask.unsqueeze(-2)
-            )
-            denom = mask.sum(dim=-1, keepdim=False).clamp_min(1.0)
-            if denom.dim() > peak_probs.dim() - 1:
-                denom = denom.squeeze(-1)
-            gauss_entropy = (peak_probs.unsqueeze(-1) * comp_gauss_ent * mask).sum(dim=(-2, -1)) / denom
-            mean_std = (peak_probs.unsqueeze(-1) * std * mask).sum(dim=(-2, -1)) / denom
-        else:
-            gauss_entropy = (peak_probs.unsqueeze(-1) * comp_gauss_ent).sum(dim=-2).mean(dim=-1)
-            mean_std = (peak_probs.unsqueeze(-1) * std).sum(dim=-2).mean(dim=-1)
-
-        return peak_entropy + gauss_entropy, peak_entropy, mean_std
+        return self._compute_entropy_stats(logits, std, action_mask=action_mask)
 
 
 def symlog_transform(x: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:

@@ -317,6 +317,10 @@ def load_training_checkpoint(
 
     if "agent_state_dict" in payload:
         agent.load_state_dict(payload["agent_state_dict"])
+    agent.total_transitions_observed = max(
+        getattr(agent, "total_transitions_observed", 0),
+        int(payload.get("total_env_steps", 0)),
+    )
     if "tweaker_state_dict" in payload:
         tweaker.load_state_dict(payload["tweaker_state_dict"])
     if "tweaker_optimizer_state_dict" in payload:
@@ -530,6 +534,10 @@ def run_single_seed(
 
             if "agent_state_dict" in payload:
                 agent.load_state_dict(payload["agent_state_dict"])
+            agent.total_transitions_observed = max(
+                getattr(agent, "total_transitions_observed", 0),
+                total_env_steps,
+            )
             if "tweaker_state_dict" in payload:
                 tweaker.load_state_dict(payload["tweaker_state_dict"])
             if "tweaker_optimizer_state_dict" in payload:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
@@ -191,6 +192,8 @@ class ModelRepresentationTrainer(nn.Module):
         target_backbone: Optional[SelfAttentionBackbone] = None,
         target_projector: Optional[nn.Module] = None,
         min_policy_std_target: float = 0.22,
+        lambda_peak_ent: float = 0.15,
+        peak_entropy_floor_ratio: float = 0.70,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Computes K-step unrolled total loss with SimSiam representation consistency.
 
@@ -212,7 +215,6 @@ class ModelRepresentationTrainer(nn.Module):
             context, hist_0, alpha=self.latent_ema_decay
         )
         cum_hat = combine_cumulative_rep(z_hat, prev_cum_0, alpha=self.latent_ema_decay)
-        cum_0 = cum_hat
 
         # Encode k = 1..K target representations under no_grad using target_backbone when provided
         z_target_seq: Optional[torch.Tensor] = None
@@ -241,12 +243,7 @@ class ModelRepresentationTrainer(nn.Module):
                     flat_obs_targ, context=flat_ctx_targ, history=flat_hist_targ
                 ).view(bsz, unroll_k, -1)
 
-        # Step k = 0 value and policy loss (per-active-dimension pre-tanh log-prob avoids negative Jacobian offset)
-        kin_0 = (
-            limb_kinematics[:, 0]
-            if (limb_kinematics is not None and limb_kinematics.dim() == 4)
-            else limb_kinematics
-        )
+        # Active action dimension scaling for pre-tanh log-prob (avoids negative Jacobian offset)
         if action_mask is not None:
             active_dims = (
                 action_mask.sum().clamp_min(1.0)
@@ -307,8 +304,10 @@ class ModelRepresentationTrainer(nn.Module):
         samples_flat = mcts_policy_samples[:, :n_steps].reshape(
             bsz * n_steps, mcts_policy_samples.size(2), mcts_policy_samples.size(3)
         )
-        log_probs_flat = actor_head.log_prob_pre_tanh(
-            cum_flat, samples_flat, action_mask=mask_flat, limb_kinematics=kin_flat
+        log_probs_flat, policy_entropy, peak_entropy, mean_policy_std = (
+            actor_head.compute_log_prob_pre_tanh_and_entropy(
+                cum_flat, samples_flat, action_mask=mask_flat, limb_kinematics=kin_flat
+            )
         )
         log_probs_seq = log_probs_flat.view(bsz, n_steps, -1)
         weights_seq = mcts_policy_weights[:, :n_steps]
@@ -331,15 +330,22 @@ class ModelRepresentationTrainer(nn.Module):
             for p in backbone.parameters():
                 reg_loss = reg_loss + p.pow(2).sum()
 
-        # Entropy regularization on root policy: encourage peak diversity while keeping std near [std_floor, std_ceil]
-        policy_entropy, peak_entropy, mean_policy_std = actor_head.entropy_proxy(
-            cum_0, limb_kinematics=kin_0, action_mask=action_mask
-        )
+        # Mixture-weight categorical entropy regularization (Point C):
+        # keeps all GMM modes alive and distinct while the critic warms up,
+        # without forcing destructive per-joint Gaussian variance.
+        max_peak_ent = math.log(max(1, int(actor_head.num_peaks)))
+        clamped_floor_ratio = min(1.0, max(0.0, float(peak_entropy_floor_ratio)))
+        peak_ent_floor = clamped_floor_ratio * max_peak_ent
+        peak_floor_penalty = F.relu(peak_ent_floor - peak_entropy).mean() * 2.0
+        eff_lambda_peak = max(0.0, float(lambda_peak_ent))
+        loss_peak_ent = eff_lambda_peak * (peak_floor_penalty - peak_entropy.mean())
+
+        # Per-joint Gaussian std bounds [std_floor, std_ceil]
         std_floor = max(0.05, float(min_policy_std_target))
         std_ceil = max(std_floor + 0.15, 0.45)
         std_floor_bonus = -F.relu(std_floor - mean_policy_std).mean() * 5.0
         std_ceil_penalty = F.relu(mean_policy_std - std_ceil).pow(2).mean() * 5.0
-        loss_ent = peak_entropy.mean() + std_floor_bonus - std_ceil_penalty
+        loss_ent = std_floor_bonus - std_ceil_penalty
 
         total_loss = (
             lambda_v * loss_v
@@ -347,6 +353,7 @@ class ModelRepresentationTrainer(nn.Module):
             + lambda_r * loss_r
             + lambda_rep * loss_rep
             - lambda_ent * loss_ent
+            + loss_peak_ent
             + c_reg * reg_loss
         )
 
@@ -356,8 +363,10 @@ class ModelRepresentationTrainer(nn.Module):
             "loss_p": float(loss_p.detach().item()),
             "loss_r": float(loss_r.detach().item()),
             "loss_rep": float(loss_rep.detach().item()),
+            "loss_peak_ent": float(loss_peak_ent.detach().item()),
             "policy_entropy": float(policy_entropy.mean().detach().item()),
             "peak_entropy": float(peak_entropy.mean().detach().item()),
+            "peak_ent_floor": float(peak_ent_floor),
             "policy_std": float(mean_policy_std.mean().detach().item()),
         }
         return total_loss, metrics

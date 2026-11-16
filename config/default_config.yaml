@@ -40,9 +40,17 @@ la_mcts:
   tau_act_train_end: 0.25
   tau_act_eval: 0.05
   adaptive_exploration: true
-  min_policy_std_target: 0.35
-  min_policy_std_target_end: 0.15
+  min_policy_std_target: 0.22
+  min_policy_std_target_end: 0.12
   exploration_boost_max: 2.75
+  latent_noise_std: 0.08
+  latent_noise_std_end: 0.0
+  mode_hold_steps: 8
+  mode_commitment_prob: 0.70
+  lambda_peak_ent: 0.15
+  lambda_peak_ent_end: 0.02
+  peak_entropy_floor_ratio: 0.70
+  critic_warmup_steps: 5000
   lr: 0.000085
   batch_size: 128
   buffer_capacity: 50000
@@ -82,7 +90,7 @@ brl:
   eta_viol: 2.0
   beta_ent: 0.01
   beta_ent_end: 0.002
-  warmup_episodes: 80
+  warmup_episodes: 150
   brl_episodes: 10000
   total_episodes: 10000
   warmup_limit: 30.0
