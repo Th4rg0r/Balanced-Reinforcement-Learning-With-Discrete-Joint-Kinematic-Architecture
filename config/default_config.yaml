@@ -38,8 +38,8 @@ la_mcts:
   c_2: 19652.0
   root_tau_beta: 1.0
   inner_tau_beta: 0.8
-  root_dirichlet_alpha: 0.45
-  root_exploration_fraction: 0.50
+  root_dirichlet_alpha: 0.03
+  root_exploration_fraction: 0.75
   root_exploration_fraction_end: 0.12
   tau_act_train: 1.0
   tau_act_train_end: 0.15
@@ -113,11 +113,11 @@ ant_morph:
   healthy_z_range: [0.2, 1.0]
   max_action_capacity: 12
   default_num_legs: 4
-  action_ema_alpha: 0.75     # mild jitter filter without attenuating exploratory torques -> scales to 1.0 at 1000 return
-  action_smoothness_coef: 0.05 # smoothness 0.06
+  action_ema_alpha: 1 # 0.75    # mild jitter filter without attenuating exploratory torques -> scales to 1.0 at 1000 return
+  action_smoothness_coef: 0.00 #0.05 # smoothness 0.06
   action_smoothness_end_step: 500000
   forward_reward_weight: 4.0 # training-only agent_reward forward scale (Eval/raw Ant-v5 stays standard 1.0)
-  ctrl_cost_weight: 0.30     # training-only agent_reward torque cost weight (blends to standard Ant-v5 0.5)
+  ctrl_cost_weight: 0.50     # training-only agent_reward torque cost weight (blends to standard Ant-v5 0.5)
   benchmark_vel_ref: 0.20
   torque_return_ref: 1000.0
   exploration_return_ref: 3000.0
@@ -126,8 +126,8 @@ ant_morph:
   vel_shift_factor: 3000.0
   upside_down_time_limit: 0.0
   upside_down_penalty: 0.0
-  min_healthy_vel: 0.05     # training-only: scale healthy_reward by clip(v_x / min_healthy_vel, 0, 1); 0.0 disables
-  stationary_penalty_coef: 0.35  # training-only: extra per-step penalty coef * (1 - vel_gate) fed into MCTS rewards; 0.0 disables
+  min_healthy_vel: 0.0     # training-only: scale healthy_reward by clip(v_x / min_healthy_vel, 0, 1); 0.0 disables
+  stationary_penalty_coef: 0.0 # 0.7  # training-only: extra per-step penalty coef * (1 - vel_gate) fed into MCTS rewards; 0.0 disables
   stationary_vel_window: 20      # steps (~1.0s) of rolling-mean x-velocity used for the velocity gate
 
 # Run protocol defaults for experiments/train_ant_brl.py (CLI flags override; 0 = automatic)
