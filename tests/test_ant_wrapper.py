@@ -470,8 +470,16 @@ def test_training_shaping_preserves_standard_benchmark_eval() -> None:
         stationary_penalty_coef=0.0,
         forward_reward_weight=2.5,
         ctrl_cost_weight=0.15,
+        forward_return_ref=5000.0,
     )
     try:
+        assert wrapper.get_current_forward_reward_weight() == pytest.approx(2.5, abs=1e-6)
+        wrapper.current_return = 2500.0
+        assert wrapper.get_current_forward_reward_weight() == pytest.approx(1.75, abs=1e-6)
+        wrapper.current_return = 5000.0
+        assert wrapper.get_current_forward_reward_weight() == pytest.approx(1.0, abs=1e-6)
+        wrapper.current_return = 0.0
+
         act = np.full(12, 0.5, dtype=np.float32)
         wrapper.reset(seed=42, options={"eval_mode": False})
         _, train_r, _, _, train_info = wrapper.step(act)
