@@ -121,9 +121,11 @@ class AntMorphConfig:
     max_action_capacity: int = 12
     default_num_legs: int = 4
     action_ema_alpha: float = 0.8
-    action_smoothness_coef: float = 0.15
+    action_smoothness_coef: float = 0.04
     action_smoothness_end_step: int = 500000
     action_smoothness_log_shape: float = 10.0  # Deprecated/unused; kept for backward config compatibility
+    forward_reward_weight: float = 2.5
+    ctrl_cost_weight: float = 0.15
     benchmark_vel_ref: float = 6.0
     torque_return_ref: float = 1000.0
     exploration_return_ref: float = 3000.0
@@ -132,7 +134,7 @@ class AntMorphConfig:
     upside_down_time_limit: float = 0.0
     upside_down_penalty: float = 0.0
     min_healthy_vel: float = 0.10
-    stationary_penalty_coef: float = 0.50
+    stationary_penalty_coef: float = 1.50
     stationary_vel_window: int = 20
 
 

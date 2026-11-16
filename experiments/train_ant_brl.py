@@ -456,6 +456,8 @@ def run_single_seed(
         min_healthy_vel=sys_cfg.ant_morph.min_healthy_vel,
         stationary_penalty_coef=sys_cfg.ant_morph.stationary_penalty_coef,
         stationary_vel_window=sys_cfg.ant_morph.stationary_vel_window,
+        forward_reward_weight=sys_cfg.ant_morph.forward_reward_weight,
+        ctrl_cost_weight=sys_cfg.ant_morph.ctrl_cost_weight,
     )
 
     agent = LatentActionMCTSAgent(config=sys_cfg.la_mcts, device=device)

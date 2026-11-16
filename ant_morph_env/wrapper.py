@@ -54,10 +54,14 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         min_healthy_vel: float = 0.0,
         stationary_penalty_coef: float = 0.0,
         stationary_vel_window: int = 20,
+        forward_reward_weight: float = 1.0,
+        ctrl_cost_weight: float = 0.5,
     ) -> None:
         self.env_id = env_id
         if env is None:
             if str(env_id).startswith("Ant-v5"):
+                # Keep underlying Ant-v5 at standard benchmark weights (1.0 / 0.5)
+                # so raw_env_reward and eval_mode=True remain 100% benchmark-conforming.
                 env = gym.make(
                     env_id,
                     include_cfrc_ext_in_observation=use_contact_forces,
@@ -92,6 +96,8 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self.min_healthy_vel = max(0.0, float(min_healthy_vel))
         self.stationary_penalty_coef = max(0.0, float(stationary_penalty_coef))
         self.stationary_vel_window = max(1, int(stationary_vel_window))
+        self.forward_reward_weight = max(0.0, float(forward_reward_weight))
+        self.ctrl_cost_weight = max(0.0, float(ctrl_cost_weight))
         self._recent_step_vels: Deque[float] = deque(maxlen=self.stationary_vel_window)
         self._recent_ep_returns: Deque[float] = deque(maxlen=20)
         self._recent_ep_velocities: Deque[float] = self._recent_ep_returns
@@ -736,6 +742,8 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         upside_down_terminated = False
         healthy_penalty = 0.0
         stationary_penalty = 0.0
+        forward_bonus = 0.0
+        ctrl_refund = 0.0
         self._recent_step_vels.append(float(step_x_vel))
         smooth_x_vel = float(sum(self._recent_step_vels) / len(self._recent_step_vels))
         if self._eval_mode:
@@ -754,8 +762,17 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
                     healthy_penalty = healthy_r * (1.0 - vel_gate)
                 if self.stationary_penalty_coef > 0.0:
                     stationary_penalty = self.stationary_penalty_coef * (1.0 - vel_gate)
+            if self.forward_reward_weight != 1.0:
+                reward_fwd = float(info.get("reward_forward", step_x_vel))
+                forward_bonus = (self.forward_reward_weight - 1.0) * reward_fwd
+            if self.ctrl_cost_weight != 0.5:
+                # Standard Ant-v5 reward_ctrl = -0.5 * ||a||^2; adjust training cost to ctrl_cost_weight
+                reward_ctrl = float(info.get("reward_ctrl", 0.0))
+                ctrl_refund = (1.0 - (self.ctrl_cost_weight / 0.5)) * (-reward_ctrl)
             agent_reward = (
                 raw_env_reward
+                + forward_bonus
+                + ctrl_refund
                 - (1.0 - blend_alpha) * smooth_penalty
                 - healthy_penalty
                 - stationary_penalty

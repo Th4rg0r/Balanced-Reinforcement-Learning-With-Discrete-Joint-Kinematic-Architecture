@@ -459,3 +459,36 @@ def test_stationary_penalty_smoothed_gate_and_mcts_gradients() -> None:
             assert torch.isfinite(p.grad).all()
 
 
+def test_training_shaping_preserves_standard_benchmark_eval() -> None:
+    """Verifies forward_reward_weight / ctrl_cost_weight shape training reward only; eval/raw stays standard Ant-v5."""
+    wrapper = MorphologicalAntBRLWrapper(
+        max_action_capacity=12,
+        fixed_action_space=True,
+        action_ema_alpha=1.0,
+        action_smoothness_coef=0.0,
+        min_healthy_vel=0.0,
+        stationary_penalty_coef=0.0,
+        forward_reward_weight=2.5,
+        ctrl_cost_weight=0.15,
+    )
+    try:
+        act = np.full(12, 0.5, dtype=np.float32)
+        wrapper.reset(seed=42, options={"eval_mode": False})
+        _, train_r, _, _, train_info = wrapper.step(act)
+        raw_r = float(train_info["raw_env_reward"])
+        r_fwd = float(train_info["reward_forward"])
+        r_ctrl = float(train_info["reward_ctrl"])
+        expected_train = raw_r + (2.5 - 1.0) * r_fwd + (1.0 - 0.15 / 0.5) * (-r_ctrl)
+        assert train_r == pytest.approx(expected_train, abs=1e-5)
+
+        # Standard Ant-v5 control cost for 8 active dims at 0.5 is -0.5 * (8 * 0.25) = -1.0
+        assert r_ctrl == pytest.approx(-1.0, abs=1e-5)
+
+        wrapper.reset(seed=42, options={"eval_mode": True})
+        _, eval_r, _, _, eval_info = wrapper.step(act)
+        assert eval_r == pytest.approx(float(eval_info["raw_env_reward"]), abs=1e-6)
+        assert float(eval_info["reward_ctrl"]) == pytest.approx(-1.0, abs=1e-5)
+    finally:
+        wrapper.close()
+
+
