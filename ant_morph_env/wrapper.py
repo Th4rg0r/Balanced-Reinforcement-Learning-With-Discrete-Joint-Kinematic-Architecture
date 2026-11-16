@@ -57,6 +57,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         forward_reward_weight: float = 1.0,
         ctrl_cost_weight: float = 0.5,
         forward_return_ref: float = 5000.0,
+        use_real_returns: bool = False,
     ) -> None:
         self.env_id = env_id
         if env is None:
@@ -100,6 +101,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self.forward_reward_weight = max(0.0, float(forward_reward_weight))
         self.ctrl_cost_weight = max(0.0, float(ctrl_cost_weight))
         self.forward_return_ref = max(1e-6, float(forward_return_ref))
+        self.use_real_returns = bool(use_real_returns)
         self._recent_step_vels: Deque[float] = deque(maxlen=self.stationary_vel_window)
         self._recent_ep_returns: Deque[float] = deque(maxlen=20)
         self._recent_ep_velocities: Deque[float] = self._recent_ep_returns
@@ -769,6 +771,14 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         if self._eval_mode:
             blend_alpha = 1.0
             exploration_progress = 1.0
+            eff_forward_weight = 1.0
+            eff_ctrl_weight = 0.5
+            agent_reward = raw_env_reward
+            reward = raw_env_reward
+        elif self.use_real_returns:
+            # Bypass all reward/return shaping from step 1 while keeping exploration_progress annealing alive
+            blend_alpha = 1.0
+            exploration_progress = self.get_exploration_progress()
             eff_forward_weight = 1.0
             eff_ctrl_weight = 0.5
             agent_reward = raw_env_reward

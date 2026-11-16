@@ -518,3 +518,122 @@ def test_training_shaping_preserves_standard_benchmark_eval() -> None:
         wrapper.close()
 
 
+def test_use_real_returns_bypasses_all_reward_shaping_from_step_one() -> None:
+    """Verifies use_real_returns=True passes raw Ant-v5 rewards from step 1 while preserving exploration_progress."""
+    wrapper = MorphologicalAntBRLWrapper(
+        max_action_capacity=12,
+        fixed_action_space=True,
+        action_ema_alpha=0.75,
+        action_smoothness_coef=0.15,
+        min_healthy_vel=0.10,
+        stationary_penalty_coef=0.50,
+        forward_reward_weight=4.0,
+        ctrl_cost_weight=0.30,
+        exploration_return_ref=3000.0,
+        use_real_returns=True,
+    )
+    try:
+        wrapper.reset(seed=42, options={"eval_mode": False})
+        act = np.full(12, 0.2, dtype=np.float32)
+        _, rew, _, _, info = wrapper.step(act)
+        raw_r = float(info["raw_env_reward"])
+        assert rew == pytest.approx(raw_r, abs=1e-6)
+        assert float(info["agent_reward"]) == pytest.approx(raw_r, abs=1e-6)
+        assert float(info["healthy_penalty"]) == 0.0
+        assert float(info["stationary_penalty"]) == 0.0
+        assert float(info["forward_reward_weight"]) == pytest.approx(1.0, abs=1e-6)
+        assert float(info["ctrl_cost_weight"]) == pytest.approx(0.5, abs=1e-6)
+        assert float(info["reward_blend_alpha"]) == pytest.approx(1.0, abs=1e-6)
+
+        wrapper.current_return = 1500.0
+        assert wrapper.get_exploration_progress() == pytest.approx(0.5, abs=1e-6)
+    finally:
+        wrapper.close()
+
+
+def test_orchestrator_forwards_raw_returns_and_gates_exploration_by_velocity() -> None:
+    """Verifies BRLTrainingOrchestrator forwards raw_env_reward when use_real_returns=True and keeps exploration alive at v_x=0."""
+    from brl_core.balancer import DDPGBalancer
+    from brl_core.orchestrator import BRLTrainingOrchestrator
+    from brl_core.tweaker import StochasticTweakerActorCritic
+    from config import SystemConfig
+
+    class _MockEnv:
+        def reset(self, options=None):
+            return np.zeros(27, dtype=np.float32), {"morphology_mask": np.ones(8, dtype=np.float32)}
+
+        def step(self, action):
+            return (
+                np.zeros(27, dtype=np.float32),
+                99.0,  # shaped dummy reward
+                False,
+                True,
+                {
+                    "raw_env_reward": 1.25,
+                    "exploration_progress": 0.4,
+                    "brl_metrics": {"x_velocity": 0.0, "total_distance": 0.0},
+                },
+            )
+
+        def get_exploration_progress(self):
+            return 0.4
+
+    class _MockAgent:
+        def __init__(self) -> None:
+            self.observed_rewards: list[float] = []
+            self.exp_progress_calls: list[float] = []
+
+        def set_exploration_progress(self, progress: float) -> None:
+            self.exp_progress_calls.append(float(progress))
+
+        def select_action(self, obs, deterministic=False, limb_kinematics=None):
+            return np.zeros(8, dtype=np.float32)
+
+        def observe_transition(self, obs, act, rew, next_obs, term, trunc, info):
+            self.observed_rewards.append(float(rew))
+
+        def train_step(self):
+            return {}
+
+    cfg = SystemConfig()
+    cfg.brl.warmup_episodes = 5
+    cfg.brl.brl_episodes = 10
+    cfg.ant_morph.max_episode_steps = 1
+    cfg.ant_morph.use_real_returns = True
+
+    agent = _MockAgent()
+    orch = BRLTrainingOrchestrator(
+        env=_MockEnv(),
+        agent=agent,
+        tweaker=StochasticTweakerActorCritic(cfg.brl, device="cpu"),
+        balancer=DDPGBalancer(cfg.brl, device="cpu"),
+        config=cfg,
+    )
+    summary = orch.run_episode(episode_idx=1, max_steps=1, train_agent_every=10)
+    assert agent.observed_rewards == pytest.approx([1.25], abs=1e-6)
+    assert summary["agent_episode_return"] == pytest.approx(1.25, abs=1e-6)
+    assert summary["episode_return"] == pytest.approx(1.25, abs=1e-6)
+    # Velocity-gated exploration stays at 0.0 decay when mean_x_vel=0.0
+    assert agent.exp_progress_calls[-1] == pytest.approx(0.0, abs=1e-6)
+
+    # When use_real_returns=False, orchestrator forwards shaped step reward & un-gated exploration
+    cfg_shaped = SystemConfig()
+    cfg_shaped.brl.warmup_episodes = 5
+    cfg_shaped.brl.brl_episodes = 10
+    cfg_shaped.ant_morph.max_episode_steps = 1
+    cfg_shaped.ant_morph.use_real_returns = False
+    agent_shaped = _MockAgent()
+    orch_shaped = BRLTrainingOrchestrator(
+        env=_MockEnv(),
+        agent=agent_shaped,
+        tweaker=StochasticTweakerActorCritic(cfg_shaped.brl, device="cpu"),
+        balancer=DDPGBalancer(cfg_shaped.brl, device="cpu"),
+        config=cfg_shaped,
+    )
+    summary_s = orch_shaped.run_episode(episode_idx=1, max_steps=1, train_agent_every=10)
+    assert agent_shaped.observed_rewards == pytest.approx([99.0], abs=1e-6)
+    assert summary_s["agent_episode_return"] == pytest.approx(99.0, abs=1e-6)
+    assert agent_shaped.exp_progress_calls[-1] == pytest.approx(0.4, abs=1e-6)
+
+
+

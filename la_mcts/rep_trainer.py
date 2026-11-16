@@ -334,7 +334,7 @@ class ModelRepresentationTrainer(nn.Module):
             else:
                 loss_p = (sq_err.sum(dim=-1) / active_dims).mean(dim=0).sum()
                 pre_tanh_reg = pre_tanh_sq.mean()
-            loss_p = loss_p + 1e-3 * pre_tanh_reg
+            loss_p = loss_p + 1e-4 * pre_tanh_reg
 
             # Normalize over unroll horizon
             loss_v = loss_v / float(k_plus_1)
@@ -563,7 +563,7 @@ class ModelRepresentationTrainer(nn.Module):
                 self._dpg_q_scale = 0.95 * self._dpg_q_scale + 0.05 * q_span
                 scale = max(1.0, float(self._dpg_q_scale))
 
-            loss_dpg = -float(lambda_dpg) * (q_total / scale).mean() + 1e-3 * (
+            loss_dpg = -float(lambda_dpg) * (q_total / scale).mean() + 1e-4 * (
                 pre_tanh_reg / float(horizon)
             )
             dpg_metrics = {

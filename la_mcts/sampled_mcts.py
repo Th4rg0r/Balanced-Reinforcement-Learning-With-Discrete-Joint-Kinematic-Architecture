@@ -165,6 +165,7 @@ class SampledContinuousMCTS:
         deterministic_candidates: bool = False,
         latent_noise_std: Optional[float] = None,
         action_noise_std: Optional[float] = None,
+        held_action_noise: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, ...]:
         """Dispatches candidate sampling uniformly to GMM or Deterministic actor heads."""
         if getattr(self.actor_head, "is_deterministic", False):
@@ -173,6 +174,8 @@ class SampledContinuousMCTS:
                 kwargs["latent_noise_std"] = float(latent_noise_std)
             if action_noise_std is not None:
                 kwargs["action_noise_std"] = float(action_noise_std)
+            if held_action_noise is not None:
+                kwargs["held_action_noise"] = held_action_noise
             return self.actor_head.sample_actions(
                 state,
                 k_act=self.k_act,
@@ -209,6 +212,7 @@ class SampledContinuousMCTS:
         deterministic_candidates: bool = False,
         latent_noise_std: Optional[float] = None,
         action_noise_std: Optional[float] = None,
+        held_action_noise: Optional[torch.Tensor] = None,
     ) -> MCTSNode:
         """Evaluates actor and critic heads on cumulative latent state to initialize an MCTSNode.
 
@@ -228,6 +232,7 @@ class SampledContinuousMCTS:
             deterministic_candidates=deterministic_candidates,
             latent_noise_std=latent_noise_std,
             action_noise_std=action_noise_std,
+            held_action_noise=held_action_noise,
         )
         v_val = float(self.critic_head(cum_state.unsqueeze(0)).squeeze().item())
         return MCTSNode(
@@ -257,6 +262,7 @@ class SampledContinuousMCTS:
         q_advantage_weight: float = 4.0,
         latent_noise_std: Optional[float] = None,
         action_noise_std: Optional[float] = None,
+        held_action_noise: Optional[torch.Tensor] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, MCTSNode]:
         """Executes N_sim MCTS simulations from z_root using virtual-loss leaf batching.
 
@@ -305,6 +311,7 @@ class SampledContinuousMCTS:
                 deterministic_candidates=deterministic,
                 latent_noise_std=latent_noise_std,
                 action_noise_std=action_noise_std,
+                held_action_noise=(None if deterministic else held_action_noise),
             )
             eff_k_act = len(root.prior_weights)
             if deterministic and eff_k_act == 1:

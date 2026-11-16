@@ -377,6 +377,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         self._last_mcts_info: Optional[Tuple[np.ndarray, np.ndarray, float]] = None
         self._last_limb_kinematics: Optional[np.ndarray] = None
         self._latent_noise_unit: Optional[torch.Tensor] = None
+        self._det_explore_noise: Optional[torch.Tensor] = None
         self._committed_peak: Optional[int] = None
         self._mode_hold_remaining: int = 0
         self.total_transitions_observed: int = 0
@@ -393,10 +394,10 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             "exploration_progress": 0.0,
             "effective_std_target": float(self.cfg.min_policy_std_target),
             "effective_tau_act": float(self.cfg.tau_act_train),
-            "effective_latent_noise_std": float(getattr(self.cfg, "latent_noise_std", 0.08)),
+            "effective_latent_noise_std": float(getattr(self.cfg, "latent_noise_std", 0.25)),
             "effective_lambda_peak_ent": float(getattr(self.cfg, "lambda_peak_ent", 0.15)),
             "critic_warmup_scale": (
-                1.0 if int(getattr(self.cfg, "critic_warmup_steps", 5000)) <= 0 else 0.15
+                1.0 if int(getattr(self.cfg, "critic_warmup_steps", 25000)) <= 0 else 0.15
             ),
         }
 
@@ -495,6 +496,15 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             blend = math.sqrt(max(0.0, 1.0 - rho * rho))
             self._latent_noise_unit = rho * self._latent_noise_unit + blend * eps
 
+    def _refresh_det_explore_noise(self, rho: float = 0.5) -> None:
+        """Updates temporally correlated unit-scale action exploration vector held over mode_hold_steps."""
+        eps = torch.randn(self.cfg.max_action_dim, device=self.device, dtype=torch.float32)
+        if self._det_explore_noise is None:
+            self._det_explore_noise = eps
+        else:
+            blend = math.sqrt(max(0.0, 1.0 - rho * rho))
+            self._det_explore_noise = rho * self._det_explore_noise + blend * eps
+
     def _get_actor_latent_root(
         self,
         z_root: torch.Tensor,
@@ -535,6 +545,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         self._running_prev_cum = None
         self._pending_history_step = None
         self._latent_noise_unit = None
+        self._det_explore_noise = None
         self._committed_peak = None
         self._mode_hold_remaining = 0
         self.current_trajectory.context = self.current_context.copy()
@@ -626,14 +637,17 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 starting_new_window = False
                 eff_lat_noise = 0.0
                 eff_act_noise = 0.0
+                held_act_noise_in = None
             else:
                 eff_hold_steps = self.get_current_mode_hold_steps()
                 eff_commit_prob = self.get_current_mode_commitment_prob()
+                is_det_head = bool(getattr(self.actor_head, "is_deterministic", False))
                 starting_new_window = (
                     self._mode_hold_remaining <= 0 or self._committed_peak is None
                 )
                 if starting_new_window:
                     self._refresh_latent_noise(rho=0.5)
+                    self._refresh_det_explore_noise(rho=0.5)
                     commit_peak_in = None
                     commit_prob_in = 0.0
                 else:
@@ -646,7 +660,6 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 std_target = self.get_current_std_target()
                 base_tau_act = self.get_current_tau_act_train()
                 base_root_exp = self.get_current_root_exploration_fraction()
-                is_det_head = bool(getattr(self.actor_head, "is_deterministic", False))
                 explore_scale = 1.0
                 if self.cfg.adaptive_exploration and not is_det_head:
                     cur_std = float(
@@ -664,6 +677,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     )
                 eff_lat_noise = self.get_current_latent_noise_std()
                 eff_act_noise = self.get_current_action_explore_std()
+                held_act_noise_in = self._det_explore_noise if is_det_head else None
                 self._diagnostics["exploration_scale"] = explore_scale
                 self._diagnostics["effective_std_target"] = std_target
                 self._diagnostics["effective_latent_noise_std"] = eff_lat_noise
@@ -691,6 +705,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     q_advantage_weight=q_adv_weight,
                     latent_noise_std=eff_lat_noise,
                     action_noise_std=eff_act_noise,
+                    held_action_noise=held_act_noise_in,
                 )
             )
             if not deterministic:
@@ -822,6 +837,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             self._running_prev_cum = None
             self._pending_history_step = None
             self._latent_noise_unit = None
+            self._det_explore_noise = None
             self._committed_peak = None
             self._mode_hold_remaining = 0
             self.current_trajectory = EpisodeTrajectory(
@@ -1166,6 +1182,17 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     actor_state[w_key] = torch.nn.functional.pad(
                         saved_w, (0, pad_cols)
                     )
+            if (
+                "limb_head.z_film.weight" not in actor_state
+                and hasattr(self.actor_head, "limb_head")
+                and hasattr(self.actor_head.limb_head, "z_film")
+            ):
+                actor_state["limb_head.z_film.weight"] = torch.zeros_like(
+                    self.actor_head.limb_head.z_film.weight
+                )
+                actor_state["limb_head.z_film.bias"] = torch.zeros_like(
+                    self.actor_head.limb_head.z_film.bias
+                )
             self.actor_head.load_state_dict(actor_state)
         if "critic_head" in state:
             self.critic_head.load_state_dict(state["critic_head"])

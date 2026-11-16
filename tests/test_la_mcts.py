@@ -661,15 +661,19 @@ def test_needle_point_d_critic_warmup_and_config_defaults() -> None:
         sys_cfg = load_config("config/default_config.yaml")
     assert not caught, f"Unexpected config warnings: {[str(w.message) for w in caught]}"
     assert sys_cfg.la_mcts.actor_type == "deterministic"
-    assert np.isclose(sys_cfg.la_mcts.lambda_dpg, 0.50)
-    assert sys_cfg.la_mcts.dpg_horizon == 2
-    assert np.isclose(sys_cfg.la_mcts.action_explore_std, 0.12)
-    assert np.isclose(sys_cfg.la_mcts.latent_noise_std, 0.08)
+    assert np.isclose(sys_cfg.la_mcts.lambda_dpg, 0.25)
+    assert sys_cfg.la_mcts.dpg_horizon == 4
+    assert np.isclose(sys_cfg.la_mcts.action_explore_std, 0.35)
+    assert np.isclose(sys_cfg.la_mcts.latent_noise_std, 0.25)
     assert sys_cfg.la_mcts.mode_hold_steps == 8
     assert np.isclose(sys_cfg.la_mcts.lambda_peak_ent, 0.15)
     assert np.isclose(sys_cfg.la_mcts.lambda_peak_sep, 0.25)
     assert sys_cfg.la_mcts.k_act == 8
-    assert sys_cfg.la_mcts.critic_warmup_steps == 5000
+    assert sys_cfg.la_mcts.critic_warmup_steps == 25000
+    assert np.isclose(sys_cfg.la_mcts.lr, 9e-5)
+    assert np.isclose(sys_cfg.la_mcts.c_1, 2.50)
+    assert sys_cfg.ant_morph.use_real_returns is True
+    assert np.isclose(sys_cfg.ant_morph.action_ema_alpha, 0.75)
     assert sys_cfg.brl.warmup_episodes == 150
 
 
@@ -841,6 +845,21 @@ def test_deterministic_limb_actor_head_and_single_limb_sharing() -> None:
     )
     torch.testing.assert_close(leg0_single, all_act[:2], atol=1e-5, rtol=1e-5)
 
+    # Verify FiLM z-conditioning keeps DeterministicActorHead responsive to latent state z
+    z_grid = torch.rand(32, 64)
+    a_grid = ant_actor(z_grid)
+    assert float(a_grid.std(dim=0).mean().item()) > 0.08
+
+    # Verify held_action_noise places the sustained directional perturbation into slot 1
+    held = torch.ones(8) * 0.8
+    cands, priors = ant_actor.sample_actions(
+        z1, k_act=8, temperature=1.0, action_noise_std=0.35, held_action_noise=held
+    )
+    assert cands.shape == (8, 8)
+    expected_slot1 = torch.clamp(all_act + 0.35 * held, -1.0, 1.0)
+    torch.testing.assert_close(cands[1], expected_slot1, atol=1e-5, rtol=1e-5)
+    assert float(cands.std(dim=0).mean().item()) > 0.15
+
 
 def test_model_based_dpg_gradients_and_world_model_freeze() -> None:
     """Verifies Model-Based DPG gives analytical per-limb gradients without modifying world model/critic."""
@@ -919,13 +938,27 @@ def test_deterministic_agent_end_to_end_mcts_and_dpg_step() -> None:
     det_a2 = agent.select_action(obs, deterministic=True)
     np.testing.assert_allclose(det_a1, det_a2, atol=1e-6)
 
+    held_noise_ref = None
     for step in range(6):
         act = agent.select_action(obs, deterministic=False)
+        if step == 0:
+            held_noise_ref = agent._det_explore_noise.clone()
+        else:
+            torch.testing.assert_close(agent._det_explore_noise, held_noise_ref)
         next_obs = np.random.randn(12).astype(np.float32)
         agent.observe_transition(
             obs, act, 0.5, next_obs, terminated=(step == 5), truncated=False, info={}
         )
         obs = next_obs
+    assert agent._det_explore_noise is None
+
+    # Verify loading pre-z_film legacy deterministic state dict succeeds cleanly
+    sd_legacy = agent.state_dict()
+    sd_legacy["actor_head"] = {
+        k: v for k, v in sd_legacy["actor_head"].items() if "z_film" not in k
+    }
+    agent_compat = LatentActionMCTSAgent(cfg, device=torch.device("cpu"))
+    agent_compat.load_state_dict(sd_legacy)
 
     metrics = agent.train_step()
     assert "loss_dpg" in metrics and np.isfinite(metrics["loss_dpg"])

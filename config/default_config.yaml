@@ -10,10 +10,10 @@ la_mcts:
   log_std_bounds: [-1.8, 0.25]
   use_categorical_critic: true
   actor_type: "deterministic"
-  lambda_dpg: 0.50
-  dpg_horizon: 2
-  action_explore_std: 0.12
-  action_explore_std_end: 0.02
+  lambda_dpg: 0.25
+  dpg_horizon: 4
+  action_explore_std: 0.35
+  action_explore_std_end: 0.05
   support_min: -150
   support_max: 150
   num_bins: 301
@@ -28,18 +28,18 @@ la_mcts:
   beta_mse: 1.0
   lambda_v: 0.5
   lambda_r: 1.0
-  lambda_p: 0.50
+  lambda_p: 0.25
   lambda_ent: 0.03
   c_reg: 0.0001
   n_sim: 32
   n_sim_eval: 64
   k_act: 8
-  c_1: 2.00
+  c_1: 2.50
   c_2: 19652.0
   root_tau_beta: 1.0
   inner_tau_beta: 0.8
-  root_dirichlet_alpha: 0.35
-  root_exploration_fraction: 0.40
+  root_dirichlet_alpha: 0.45
+  root_exploration_fraction: 0.50
   root_exploration_fraction_end: 0.12
   tau_act_train: 1.0
   tau_act_train_end: 0.15
@@ -48,8 +48,8 @@ la_mcts:
   min_policy_std_target: 0.22
   min_policy_std_target_end: 0.12
   exploration_boost_max: 2.75
-  latent_noise_std: 0.08
-  latent_noise_std_end: 0.0
+  latent_noise_std: 0.25
+  latent_noise_std_end: 0.03
   mode_hold_steps: 8
   mode_commitment_prob: 0.70
   lambda_peak_ent: 0.15
@@ -58,8 +58,8 @@ la_mcts:
   lambda_peak_sep: 0.25
   lambda_peak_sep_end: 0.05
   min_peak_separation: 0.40
-  critic_warmup_steps: 5000
-  lr: 0.00018
+  critic_warmup_steps: 25000
+  lr: 0.00009
   batch_size: 128
   buffer_capacity: 50000
   context_dim: 18
@@ -107,12 +107,13 @@ brl:
 ant_morph:
   env_id: "Ant-v5"
   use_contact_forces: false
+  use_real_returns: true     # bypass training reward shaping; pass 100% raw Ant-v5 returns to agent from episode 1
   max_episode_steps: 1000
   xml_rebuild_threshold: 1.0
   healthy_z_range: [0.2, 1.0]
   max_action_capacity: 12
   default_num_legs: 4
-  action_ema_alpha: 0.35 # smooth early 50ms jitter -> scales to 1.0 at 1000 return
+  action_ema_alpha: 0.75     # mild jitter filter without attenuating exploratory torques -> scales to 1.0 at 1000 return
   action_smoothness_coef: 0.05 # smoothness 0.06
   action_smoothness_end_step: 500000
   forward_reward_weight: 4.0 # training-only agent_reward forward scale (Eval/raw Ant-v5 stays standard 1.0)

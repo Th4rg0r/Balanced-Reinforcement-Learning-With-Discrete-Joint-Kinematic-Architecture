@@ -1211,6 +1211,7 @@ class DeterministicLimbHead(nn.Module):
             nn.Linear(latent_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
         )
+        self.z_film = nn.Linear(latent_dim, hidden_dim * 2)
         self.kin_proj = nn.Sequential(
             nn.Linear(self.geom_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -1243,9 +1244,10 @@ class DeterministicLimbHead(nn.Module):
     def _encode_limbs(
         self, z_flat: torch.Tensor, limb_geom: torch.Tensor
     ) -> torch.Tensor:
-        """Runs self-attention over [global_z, limb_tokens] -> limb hidden states (B, N_limbs, D)."""
+        """Runs shared FiLM state-conditioning + self-attention over [global_z, limb_tokens] -> (B, N_limbs, D)."""
         e_global = self.global_proj(z_flat).unsqueeze(1) + self.global_type_emb
-        e_limbs = self.kin_proj(limb_geom) + self.limb_type_emb
+        scale, shift = self.z_film(z_flat).unsqueeze(1).chunk(2, dim=-1)
+        e_limbs = self.kin_proj(limb_geom) * (1.0 + 0.5 * torch.tanh(scale)) + shift + self.limb_type_emb
         enc_seq = torch.cat([e_global, e_limbs], dim=1)
         enc_out = self.out_ln(self.encoder(enc_seq))
         return enc_out[:, 1:, :]
@@ -1464,10 +1466,11 @@ class DeterministicActorHead(nn.Module):
         return_peaks: bool = False,
         deterministic_candidates: bool = False,
         include_peak_means: bool = True,
-        latent_noise_std: float = 0.08,
-        action_noise_std: float = 0.12,
+        latent_noise_std: float = 0.25,
+        action_noise_std: float = 0.35,
+        held_action_noise: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, ...]:
-        """Generates deterministic action + coherent latent-perturbed candidates for MCTS search."""
+        """Generates deterministic action + temporally held & latent-perturbed candidates for MCTS search."""
         single = z_t.dim() == 1
         z_in = z_t.unsqueeze(0) if single else z_t
         bsz = z_in.shape[0]
@@ -1486,51 +1489,68 @@ class DeterministicActorHead(nn.Module):
                 return sampled, prior_weights, peaks
             return sampled, prior_weights
 
-        # Generate k_act candidates: slot 0 = clean deterministic policy,
-        # slots 1..n_lat = coherent latent-perturbed policies f(norm(z + delta_z)),
-        # slots n_lat+1..k_act-1 = light exploration perturbations around a_det.
+        # Generate k_act candidates:
+        #   slot 0: clean deterministic policy f_phi(z, c)
+        #   slot 1 (when held_action_noise given): temporally held multi-step perturbation (Point B)
+        #   slots 2..: coherent latent-perturbed policies f(norm(z + delta_z)) & isotropic action exploration
         kin, counts = self._resolve_kinematics(limb_kinematics, z_in.device)
-        n_lat = max(1, (k_act - 1) // 2)
-        n_act = (k_act - 1) - n_lat
+        use_held = held_action_noise is not None and k_act >= 2
+        remaining = (k_act - 2) if use_held else (k_act - 1)
+        n_lat = max(1, remaining // 2) if remaining > 0 else 0
+        n_act = max(0, remaining - n_lat)
         eff_lat_std = max(0.02, float(latent_noise_std)) * math.sqrt(max(float(temperature), 0.25))
         eff_act_std = max(0.02, float(action_noise_std)) * math.sqrt(max(float(temperature), 0.25))
 
-        z_pert = min_max_normalize(
-            z_in.unsqueeze(1)
-            + eff_lat_std * torch.randn(bsz, n_lat, self.latent_dim, device=z_t.device, dtype=z_t.dtype),
-            eps=1e-6,
-        )
-        z_stack = torch.cat([z_in.unsqueeze(1), z_pert], dim=1)  # (B, 1 + n_lat, D)
-        flat_z = z_stack.reshape(bsz * (1 + n_lat), self.latent_dim)
+        if n_lat > 0:
+            z_pert = min_max_normalize(
+                z_in.unsqueeze(1)
+                + eff_lat_std * torch.randn(bsz, n_lat, self.latent_dim, device=z_t.device, dtype=z_t.dtype),
+                eps=1e-6,
+            )
+            z_stack = torch.cat([z_in.unsqueeze(1), z_pert], dim=1)  # (B, 1 + n_lat, D)
+        else:
+            z_stack = z_in.unsqueeze(1)
+
+        n_core = 1 + n_lat
+        flat_z = z_stack.reshape(bsz * n_core, self.latent_dim)
         if kin.dim() >= 3:
             kin_stack = (
                 kin.unsqueeze(1)
-                .expand(bsz, 1 + n_lat, kin.shape[-2], kin.shape[-1])
-                .reshape(bsz * (1 + n_lat), kin.shape[-2], kin.shape[-1])
+                .expand(bsz, n_core, kin.shape[-2], kin.shape[-1])
+                .reshape(bsz * n_core, kin.shape[-2], kin.shape[-1])
             )
         else:
             kin_stack = kin
 
         acts_core = self.limb_head.forward_all_limbs(
             flat_z, kin_stack, limb_joint_counts=counts, target_action_dim=self.action_dim
-        ).view(bsz, 1 + n_lat, self.action_dim)
+        ).view(bsz, n_core, self.action_dim)
 
         a_det = acts_core[:, 0:1, :]
+        chunks = [a_det]
+        if use_held:
+            h_noise = held_action_noise.to(device=z_t.device, dtype=z_t.dtype)
+            if h_noise.dim() == 1:
+                h_noise = h_noise.view(1, 1, -1).expand(bsz, 1, -1)
+            elif h_noise.dim() == 2:
+                h_noise = h_noise.unsqueeze(1)
+            a_held = torch.clamp(a_det + eff_act_std * h_noise[..., : self.action_dim], -1.0, 1.0)
+            chunks.append(a_held)
+        if n_lat > 0:
+            chunks.append(acts_core[:, 1:, :])
         if n_act > 0:
             a_noisy = torch.clamp(
                 a_det + eff_act_std * torch.randn(bsz, n_act, self.action_dim, device=z_t.device, dtype=z_t.dtype),
                 -1.0,
                 1.0,
             )
-            sampled = torch.cat([acts_core, a_noisy], dim=1)
-        else:
-            sampled = acts_core
-
+            chunks.append(a_noisy)
+        sampled = torch.cat(chunks, dim=1)
         sampled = self._apply_mask(sampled, action_mask)
 
-        # Anchor slightly higher prior on the deterministic baseline slot 0 while exploring alternatives
+        # Mild anchor on slot 0 while ensuring exploratory branches receive strong PUCT visits
         priors = torch.ones((bsz, k_act), device=z_t.device, dtype=z_t.dtype)
-        priors[:, 0] = 2.0
+        priors[:, 0] = 1.25
         prior_weights = priors / priors.sum(dim=-1, keepdim=True)
         peaks = torch.zeros((bsz, k_act), device=z_t.device, dtype=torch.long)
         peaks_out = peaks.squeeze(0) if single else peaks
