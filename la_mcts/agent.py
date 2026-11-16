@@ -423,10 +423,23 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         return float(start + self.exploration_progress * (end - start))
 
     def get_current_root_exploration_fraction(self) -> float:
-        """Returns the annealed MCTS root Dirichlet noise fraction."""
+        """Returns step-decayed MCTS root Dirichlet noise fraction clipped at root_exploration_fraction_end."""
         start = float(self.cfg.root_exploration_fraction)
         end = float(getattr(self.cfg, "root_exploration_fraction_end", start))
-        return float(start + self.exploration_progress * (end - start))
+        decay = float(
+            getattr(self.cfg, "root_exploration_fraction_decay_constant", 0.999996)
+        )
+        steps_taken = max(
+            0,
+            max(int(self.total_transitions_observed), int(self.replay_buffer.total_steps)),
+        )
+        if decay <= 0.0:
+            decayed = start if steps_taken == 0 else 0.0
+        else:
+            decayed = start * (decay ** steps_taken)
+        low = min(start, end)
+        high = max(start, end)
+        return float(np.clip(decayed, low, high))
 
     def get_current_latent_noise_std(self) -> float:
         """Returns annealed global latent exploration std in z-space (Point A)."""
@@ -684,8 +697,10 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 self._diagnostics["critic_warmup_scale"] = self.get_critic_warmup_scale()
                 tau_act = base_tau_act * explore_scale
                 self._diagnostics["effective_tau_act"] = tau_act
+                self._diagnostics["effective_root_exploration_fraction"] = base_root_exp
                 root_tau_beta = self.cfg.root_tau_beta * explore_scale
-                root_exp_frac = min(0.65, base_root_exp * explore_scale)
+                root_exp_cap = min(1.0, max(0.65, base_root_exp))
+                root_exp_frac = min(root_exp_cap, base_root_exp * explore_scale)
                 q_adv_weight = self.get_current_q_advantage_weight()
 
             chosen_action, policy_weights, root_samples, root_value, root_node = (

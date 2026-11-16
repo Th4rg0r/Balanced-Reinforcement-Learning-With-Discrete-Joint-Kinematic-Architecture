@@ -401,16 +401,16 @@ def test_velocity_driven_exploration_annealing() -> None:
     assert np.isclose(agent.get_current_root_exploration_fraction(), 0.30)
     assert np.isclose(agent.get_current_std_target(), 0.22)
 
-    # Progress = 0.5 -> midpoint interpolation
+    # Progress = 0.5 -> midpoint interpolation (root_exploration_fraction is step-based, not return-based)
     agent.set_exploration_progress(0.5)
     assert np.isclose(agent.get_current_tau_act_train(), 0.625)
-    assert np.isclose(agent.get_current_root_exploration_fraction(), 0.20)
+    assert np.isclose(agent.get_current_root_exploration_fraction(), 0.30)
     assert np.isclose(agent.get_current_std_target(), 0.17)
 
     # Progress = 1.0 -> end-of-curriculum precision parameters
     agent.set_exploration_progress(1.0)
     assert np.isclose(agent.get_current_tau_act_train(), 0.25)
-    assert np.isclose(agent.get_current_root_exploration_fraction(), 0.10)
+    assert np.isclose(agent.get_current_root_exploration_fraction(), 0.30)
     assert np.isclose(agent.get_current_std_target(), 0.12)
 
     # Can also move back up if velocity progress decreases (clamped to [0.0, 1.0])
@@ -673,7 +673,8 @@ def test_needle_point_d_critic_warmup_and_config_defaults() -> None:
     assert np.isclose(sys_cfg.la_mcts.lr, 9e-5)
     assert np.isclose(sys_cfg.la_mcts.c_1, 2.50)
     assert sys_cfg.ant_morph.use_real_returns is True
-    assert np.isclose(sys_cfg.ant_morph.action_ema_alpha, 0.75)
+    assert 0.0 < sys_cfg.ant_morph.action_ema_alpha <= 1.0
+    assert np.isclose(sys_cfg.la_mcts.root_exploration_fraction_decay_constant, 0.999996)
     assert sys_cfg.brl.warmup_episodes == 150
 
 
@@ -964,6 +965,47 @@ def test_deterministic_agent_end_to_end_mcts_and_dpg_step() -> None:
     assert "loss_dpg" in metrics and np.isfinite(metrics["loss_dpg"])
     assert "dpg_q_mean" in metrics and np.isfinite(metrics["dpg_q_mean"])
     agent.reanalyze_batch(num_states=2)
+
+
+def test_step_based_root_exploration_fraction_decay() -> None:
+    """Verifies root_exploration_fraction decays exponentially by steps taken and clips at end."""
+    cfg = LAMCTSConfig(
+        obs_dim=12,
+        max_action_dim=4,
+        context_dim=6,
+        history_len=2,
+        k_tok=4,
+        d_model=32,
+        n_heads=2,
+        l_enc=1,
+        latent_dim=32,
+        l_dyn=1,
+        proj_dim=32,
+        pred_dim=32,
+        root_exploration_fraction=0.75,
+        root_exploration_fraction_end=0.12,
+        root_exploration_fraction_decay_constant=0.99,
+    )
+    agent = LatentActionMCTSAgent(cfg, device=torch.device("cpu"))
+    assert np.isclose(agent.get_current_root_exploration_fraction(), 0.75)
+
+    # Return/exploration_progress changes must NOT affect root_exploration_fraction
+    agent.set_exploration_progress(1.0)
+    assert np.isclose(agent.get_current_root_exploration_fraction(), 0.75)
+
+    agent.total_transitions_observed = 50
+    expected_50 = 0.75 * (0.99 ** 50)
+    assert np.isclose(agent.get_current_root_exploration_fraction(), expected_50, atol=1e-7)
+
+    # Large step count must clip cleanly at root_exploration_fraction_end
+    agent.total_transitions_observed = 5000
+    assert np.isclose(agent.get_current_root_exploration_fraction(), 0.12, atol=1e-7)
+
+    # State dict persistence preserves decayed schedule across resume
+    sd = agent.state_dict()
+    agent_resumed = LatentActionMCTSAgent(cfg, device=torch.device("cpu"))
+    agent_resumed.load_state_dict(sd)
+    assert np.isclose(agent_resumed.get_current_root_exploration_fraction(), 0.12, atol=1e-7)
 
 
 

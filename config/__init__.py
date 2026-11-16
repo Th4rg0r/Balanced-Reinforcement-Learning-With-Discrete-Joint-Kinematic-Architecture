@@ -55,6 +55,7 @@ class LAMCTSConfig:
     root_dirichlet_alpha: float = 0.45
     root_exploration_fraction: float = 0.50
     root_exploration_fraction_end: float = 0.12
+    root_exploration_fraction_decay_constant: float = 0.999996
     tau_act_train: float = 1.0
     tau_act_train_end: float = 0.15
     tau_act_eval: float = 0.05

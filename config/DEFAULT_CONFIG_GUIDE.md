@@ -218,9 +218,9 @@ Exploration in LA-MCTS is dynamically annealed using the environment's **rolling
 - **Type**: `float` | **Default**: `root_tau_beta: 1.0`, `inner_tau_beta: 0.8`
 - **Purpose**: Softmax/proposal temperature applied when sampling continuous actions from the GMM actor at the root node (`1.0`) vs. interior tree nodes (`0.8`).
 
-#### `root_dirichlet_alpha`, `root_exploration_fraction`, and `root_exploration_fraction_end`
-- **Type**: `float` | **Default**: `root_dirichlet_alpha: 0.45`, `root_exploration_fraction: 0.50`, `root_exploration_fraction_end: 0.12`
-- **Purpose**: Injects Dirichlet noise $\text{Dir}(\alpha)$ into the root node policy prior, with mixing fraction $\epsilon$ annealing linearly from `0.50` (at `0` return) down to `0.12` (at `3000` rolling raw return).
+#### `root_dirichlet_alpha`, `root_exploration_fraction`, `root_exploration_fraction_end`, and `root_exploration_fraction_decay_constant`
+- **Type**: `float` | **Default**: `root_dirichlet_alpha: 0.03`, `root_exploration_fraction: 0.75`, `root_exploration_fraction_end: 0.12`, `root_exploration_fraction_decay_constant: 0.999996`
+- **Purpose**: Injects Dirichlet noise $\text{Dir}(\alpha)$ into the root node policy prior, decaying exponentially with environment steps taken as $\text{clip}(\text{root\_exploration\_fraction} \cdot \gamma_{\text{decay}}^{\text{steps}}, \text{root\_exploration\_fraction\_end}, \text{root\_exploration\_fraction})$ rather than return progress.
 
 #### `tau_act_train`, `tau_act_train_end`, and `tau_act_eval`
 - **Type**: `float` | **Default**: `tau_act_train: 1.0`, `tau_act_train_end: 0.15`, `tau_act_eval: 0.05`
