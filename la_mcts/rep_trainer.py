@@ -202,6 +202,7 @@ class ModelRepresentationTrainer(nn.Module):
         peak_entropy_floor_ratio: float = 0.70,
         lambda_peak_sep: float = 0.25,
         min_peak_separation: float = 0.40,
+        phase_seq: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Computes K-step unrolled total loss with SimSiam representation consistency.
 
@@ -317,8 +318,24 @@ class ModelRepresentationTrainer(nn.Module):
         is_det_actor = bool(getattr(actor_head, "is_deterministic", False))
 
         if is_det_actor:
+            phase_flat = None
+            if phase_seq is not None:
+                if phase_seq.dim() == 3:
+                    phase_flat = phase_seq[:, :n_steps].reshape(bsz * n_steps, -1)
+                elif phase_seq.dim() == 2:
+                    phase_flat = (
+                        phase_seq.unsqueeze(1)
+                        .expand(bsz, n_steps, phase_seq.size(-1))
+                        .reshape(bsz * n_steps, -1)
+                    )
+                else:
+                    phase_flat = phase_seq
             a_det_flat, pre_tanh_flat = actor_head(
-                cum_flat, limb_kinematics=kin_flat, action_mask=mask_flat, return_pre_tanh=True
+                cum_flat,
+                limb_kinematics=kin_flat,
+                action_mask=mask_flat,
+                return_pre_tanh=True,
+                phase=phase_flat,
             )
             best_idx = torch.argmax(weights_seq, dim=-1)  # (B, n_steps)
             n_act_dim = mcts_policy_samples.size(3)
@@ -485,6 +502,7 @@ class ModelRepresentationTrainer(nn.Module):
         gamma: float = 0.99,
         dpg_horizon: int = 2,
         lambda_dpg: float = 0.50,
+        phase_seq: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Computes analytical Deterministic Policy Gradient loss over a frozen latent world-model rollout.
 
@@ -515,8 +533,16 @@ class ModelRepresentationTrainer(nn.Module):
                         kin_h = limb_kinematics[:, min(h, limb_kinematics.size(1) - 1)]
                     else:
                         kin_h = limb_kinematics
+                    if phase_seq is not None and phase_seq.dim() == 3:
+                        phase_h = phase_seq[:, min(h, phase_seq.size(1) - 1)]
+                    else:
+                        phase_h = phase_seq
                     act_h, pre_h = actor_head(
-                        cum_cur, limb_kinematics=kin_h, action_mask=action_mask, return_pre_tanh=True
+                        cum_cur,
+                        limb_kinematics=kin_h,
+                        action_mask=action_mask,
+                        return_pre_tanh=True,
+                        phase=phase_h,
                     )
                     pre_tanh_reg = pre_tanh_reg + pre_h.pow(2).mean()
                     z_next, r_hat = self.forward(z_cur, act_h)

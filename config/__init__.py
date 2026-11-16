@@ -26,6 +26,7 @@ class LAMCTSConfig:
     actor_type: str = "deterministic"
     lambda_dpg: float = 0.25
     dpg_horizon: int = 4
+    gait_phase_period: int = 20
     action_explore_std: float = 0.35
     action_explore_std_end: float = 0.05
     support_min: int = -150
@@ -56,7 +57,7 @@ class LAMCTSConfig:
     root_exploration_fraction: float = 0.50
     root_exploration_fraction_end: float = 0.12
     root_exploration_fraction_decay_constant: float = 0.999996
-    tau_act_train: float = 1.0
+    tau_act_train: float = 1.5
     tau_act_train_end: float = 0.15
     tau_act_eval: float = 0.05
     adaptive_exploration: bool = True
@@ -73,7 +74,7 @@ class LAMCTSConfig:
     lambda_peak_sep: float = 0.25
     lambda_peak_sep_end: float = 0.05
     min_peak_separation: float = 0.40
-    critic_warmup_steps: int = 25000
+    critic_warmup_steps: int = 12000
     lr: float = 9e-5
     batch_size: int = 128
     buffer_capacity: int = 50000

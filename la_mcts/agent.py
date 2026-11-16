@@ -19,6 +19,7 @@ from la_mcts.gmm_heads import (
     DeterministicActorHead,
     MultiPeakGMMActorHead,
     SupportCriticHead,
+    compute_gait_phase,
 )
 from la_mcts.rep_trainer import ModelRepresentationTrainer
 from la_mcts.sampled_mcts import SampledContinuousMCTS
@@ -380,6 +381,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         self._det_explore_noise: Optional[torch.Tensor] = None
         self._committed_peak: Optional[int] = None
         self._mode_hold_remaining: int = 0
+        self._episode_step: int = 0
         self.total_transitions_observed: int = 0
         self.exploration_progress: float = 0.0
         self._diagnostics: Dict[str, float] = {
@@ -561,6 +563,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         self._det_explore_noise = None
         self._committed_peak = None
         self._mode_hold_remaining = 0
+        self._episode_step = 0
         self.current_trajectory.context = self.current_context.copy()
         self.current_trajectory.action_mask = self.current_action_mask.copy()
         self.current_trajectory.limb_kinematics = (
@@ -703,6 +706,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 root_exp_frac = min(root_exp_cap, base_root_exp * explore_scale)
                 q_adv_weight = self.get_current_q_advantage_weight()
 
+            gait_period = max(1, int(getattr(self.cfg, "gait_phase_period", 20)))
             chosen_action, policy_weights, root_samples, root_value, root_node = (
                 self.mcts.search(
                     z_root,
@@ -721,8 +725,11 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     latent_noise_std=eff_lat_noise,
                     action_noise_std=eff_act_noise,
                     held_action_noise=held_act_noise_in,
+                    phase_step=self._episode_step,
+                    gait_period_steps=gait_period,
                 )
             )
+            self._episode_step += 1
             if not deterministic:
                 chosen_peak = getattr(root_node, "chosen_peak", None)
                 if eff_hold_steps <= 1:
@@ -855,6 +862,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             self._det_explore_noise = None
             self._committed_peak = None
             self._mode_hold_remaining = 0
+            self._episode_step = 0
             self.current_trajectory = EpisodeTrajectory(
                 context=self.current_context.copy(),
                 action_mask=self.current_action_mask.copy(),
@@ -912,6 +920,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     ctx_t, hist_t, alpha=ema_decay
                 )
                 prev_cum_root = prev_cum_t.squeeze(0) if prev_cum_t is not None else None
+                gait_period = max(1, int(getattr(self.cfg, "gait_phase_period", 20)))
                 _, policy_weights, root_samples, root_value, _ = self.mcts.search(
                     z_root,
                     deterministic=False,
@@ -924,6 +933,8 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     q_advantage_weight=self.get_current_q_advantage_weight(),
                     latent_noise_std=self.get_current_latent_noise_std(),
                     action_noise_std=self.get_current_action_explore_std(),
+                    phase_step=step,
+                    gait_period_steps=gait_period,
                 )
                 traj.mcts_policy_samples[step] = root_samples
                 traj.mcts_policy_weights[step] = policy_weights
@@ -1103,6 +1114,22 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         self._diagnostics["critic_warmup_scale"] = warmup_scale
         self._diagnostics["effective_lambda_peak_ent"] = eff_lambda_peak_ent
 
+        gait_period = max(1, int(getattr(self.cfg, "gait_phase_period", 20)))
+        dpg_horizon = max(1, int(getattr(self.cfg, "dpg_horizon", 4)))
+        max_phase_steps = max(self.cfg.unroll_steps + 1, dpg_horizon)
+        start_steps_t = torch.tensor(
+            [s for (_, s) in refs], device=self.device, dtype=torch.float32
+        ).unsqueeze(1)
+        offsets_t = torch.arange(
+            max_phase_steps, device=self.device, dtype=torch.float32
+        ).unsqueeze(0)
+        phase_seq = compute_gait_phase(
+            start_steps_t + offsets_t,
+            period_steps=gait_period,
+            device=self.device,
+            dtype=torch.float32,
+        )
+
         self.optimizer.zero_grad()
         total_loss, metrics = self.rep_trainer.compute_unrolled_loss(
             obs_seq=obs_seq,
@@ -1131,6 +1158,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             peak_entropy_floor_ratio=eff_peak_floor_ratio,
             lambda_peak_sep=eff_lambda_peak_sep,
             min_peak_separation=eff_min_peak_sep,
+            phase_seq=phase_seq[:, : self.cfg.unroll_steps + 1],
         )
         total_loss.backward()
         eff_lambda_dpg = self.get_current_lambda_dpg()
@@ -1144,8 +1172,9 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 action_mask=mask_batch,
                 limb_kinematics=kin_batch,
                 gamma=self.cfg.gamma,
-                dpg_horizon=int(getattr(self.cfg, "dpg_horizon", 2)),
+                dpg_horizon=dpg_horizon,
                 lambda_dpg=eff_lambda_dpg,
+                phase_seq=phase_seq[:, :dpg_horizon],
             )
             loss_dpg.backward()
             metrics.update(dpg_metrics)
@@ -1207,6 +1236,17 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 )
                 actor_state["limb_head.z_film.bias"] = torch.zeros_like(
                     self.actor_head.limb_head.z_film.bias
+                )
+            if (
+                "limb_head.phase_film.weight" not in actor_state
+                and hasattr(self.actor_head, "limb_head")
+                and hasattr(self.actor_head.limb_head, "phase_film")
+            ):
+                actor_state["limb_head.phase_film.weight"] = torch.zeros_like(
+                    self.actor_head.limb_head.phase_film.weight
+                )
+                actor_state["limb_head.phase_film.bias"] = torch.zeros_like(
+                    self.actor_head.limb_head.phase_film.bias
                 )
             self.actor_head.load_state_dict(actor_state)
         if "critic_head" in state:

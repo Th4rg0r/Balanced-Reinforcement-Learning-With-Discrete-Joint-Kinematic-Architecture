@@ -12,6 +12,7 @@ from la_mcts.gmm_heads import (
     DeterministicActorHead,
     MultiPeakGMMActorHead,
     SupportCriticHead,
+    compute_gait_phase,
 )
 from la_mcts.rep_trainer import ModelRepresentationTrainer
 
@@ -34,6 +35,7 @@ class MCTSNode:
         "children",
         "total_visits",
         "v_value",
+        "depth",
     )
 
     def __init__(
@@ -45,6 +47,7 @@ class MCTSNode:
         v_value: float = 0.0,
         z_cum_state: Optional[torch.Tensor] = None,
         sampled_peaks: Optional[np.ndarray] = None,
+        depth: int = 0,
     ) -> None:
         self.z_state: torch.Tensor = z_state
         self.z_cum_state: torch.Tensor = z_cum_state if z_cum_state is not None else z_state
@@ -52,6 +55,7 @@ class MCTSNode:
         self.v_value: float = float(v_value)
         self.sampled_peaks: Optional[np.ndarray] = sampled_peaks
         self.chosen_peak: Optional[int] = None
+        self.depth: int = int(depth)
 
         if sampled_actions is not None and prior_weights is not None:
             k_act = sampled_actions.shape[0]
@@ -166,6 +170,7 @@ class SampledContinuousMCTS:
         latent_noise_std: Optional[float] = None,
         action_noise_std: Optional[float] = None,
         held_action_noise: Optional[torch.Tensor] = None,
+        phase: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, ...]:
         """Dispatches candidate sampling uniformly to GMM or Deterministic actor heads."""
         if getattr(self.actor_head, "is_deterministic", False):
@@ -176,6 +181,8 @@ class SampledContinuousMCTS:
                 kwargs["action_noise_std"] = float(action_noise_std)
             if held_action_noise is not None:
                 kwargs["held_action_noise"] = held_action_noise
+            if phase is not None:
+                kwargs["phase"] = phase
             return self.actor_head.sample_actions(
                 state,
                 k_act=self.k_act,
@@ -213,6 +220,8 @@ class SampledContinuousMCTS:
         latent_noise_std: Optional[float] = None,
         action_noise_std: Optional[float] = None,
         held_action_noise: Optional[torch.Tensor] = None,
+        phase: Optional[torch.Tensor] = None,
+        depth: int = 0,
     ) -> MCTSNode:
         """Evaluates actor and critic heads on cumulative latent state to initialize an MCTSNode.
 
@@ -233,6 +242,7 @@ class SampledContinuousMCTS:
             latent_noise_std=latent_noise_std,
             action_noise_std=action_noise_std,
             held_action_noise=held_action_noise,
+            phase=phase,
         )
         v_val = float(self.critic_head(cum_state.unsqueeze(0)).squeeze().item())
         return MCTSNode(
@@ -243,6 +253,7 @@ class SampledContinuousMCTS:
             v_value=v_val,
             z_cum_state=cum_state,
             sampled_peaks=sampled_peaks_t.detach().cpu().numpy(),
+            depth=depth,
         )
 
     def search(
@@ -263,6 +274,8 @@ class SampledContinuousMCTS:
         latent_noise_std: Optional[float] = None,
         action_noise_std: Optional[float] = None,
         held_action_noise: Optional[torch.Tensor] = None,
+        phase_step: Optional[int] = None,
+        gait_period_steps: int = 20,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, MCTSNode]:
         """Executes N_sim MCTS simulations from z_root using virtual-loss leaf batching.
 
@@ -298,6 +311,16 @@ class SampledContinuousMCTS:
             z_cum_root = combine_cumulative_rep(
                 z_root, prev_cum_state, alpha=self.latent_ema_decay
             )
+            root_phase = (
+                compute_gait_phase(
+                    phase_step,
+                    period_steps=gait_period_steps,
+                    device=z_root.device,
+                    dtype=z_root.dtype,
+                )
+                if phase_step is not None
+                else None
+            )
             root = self._expand_node(
                 z_root,
                 temperature=eff_root_tau_beta,
@@ -312,6 +335,8 @@ class SampledContinuousMCTS:
                 latent_noise_std=latent_noise_std,
                 action_noise_std=action_noise_std,
                 held_action_noise=(None if deterministic else held_action_noise),
+                phase=root_phase,
+                depth=0,
             )
             eff_k_act = len(root.prior_weights)
             if deterministic and eff_k_act == 1:
@@ -397,6 +422,19 @@ class SampledContinuousMCTS:
                 v_next_batch = self.critic_head(z_cum_next_batch).squeeze(-1)
                 is_final_batch = (sims_done + len(pending_paths)) >= num_simulations
                 if not is_final_batch:
+                    child_phase = None
+                    if phase_step is not None:
+                        child_steps_t = torch.tensor(
+                            [phase_step + sp[-1][0].depth + 1 for sp in pending_paths],
+                            device=z_root.device,
+                            dtype=z_root.dtype,
+                        )
+                        child_phase = compute_gait_phase(
+                            child_steps_t,
+                            period_steps=gait_period_steps,
+                            device=z_root.device,
+                            dtype=z_root.dtype,
+                        )
                     sampled_acts_batch, prior_weights_batch = self._sample_node_candidates(
                         z_cum_next_batch,
                         temperature=self.inner_tau_beta,
@@ -406,6 +444,7 @@ class SampledContinuousMCTS:
                         deterministic_candidates=deterministic,
                         latent_noise_std=latent_noise_std,
                         action_noise_std=action_noise_std,
+                        phase=child_phase,
                     )
                     priors_np = prior_weights_batch.detach().cpu().numpy()
                 else:
@@ -435,6 +474,7 @@ class SampledContinuousMCTS:
                             prior_weights=priors_np[b_idx],
                             v_value=v_val,
                             z_cum_state=z_cum_next_batch[b_idx],
+                            depth=parent_node.depth + 1,
                         )
                         parent_node.children[edge_idx] = child_node
 

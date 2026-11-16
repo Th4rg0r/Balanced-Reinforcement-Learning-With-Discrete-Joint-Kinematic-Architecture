@@ -669,9 +669,11 @@ def test_needle_point_d_critic_warmup_and_config_defaults() -> None:
     assert np.isclose(sys_cfg.la_mcts.lambda_peak_ent, 0.15)
     assert np.isclose(sys_cfg.la_mcts.lambda_peak_sep, 0.25)
     assert sys_cfg.la_mcts.k_act == 8
-    assert sys_cfg.la_mcts.critic_warmup_steps == 25000
+    assert sys_cfg.la_mcts.critic_warmup_steps == 12000
     assert np.isclose(sys_cfg.la_mcts.lr, 9e-5)
     assert np.isclose(sys_cfg.la_mcts.c_1, 2.50)
+    assert np.isclose(sys_cfg.la_mcts.tau_act_train, 1.5)
+    assert sys_cfg.la_mcts.gait_phase_period == 20
     assert sys_cfg.ant_morph.use_real_returns is True
     assert 0.0 < sys_cfg.ant_morph.action_ema_alpha <= 1.0
     assert np.isclose(sys_cfg.la_mcts.root_exploration_fraction_decay_constant, 0.999996)
@@ -935,6 +937,9 @@ def test_deterministic_agent_end_to_end_mcts_and_dpg_step() -> None:
     agent.set_episode_context()
     obs = np.random.randn(12).astype(np.float32)
     det_a1 = agent.select_action(obs, deterministic=True)
+    det_a_step1 = agent.select_action(obs, deterministic=True)
+    # 2D periodic gait-phase clock prevents identical static pose across consecutive steps
+    assert float(np.abs(det_a_step1 - det_a1).mean()) > 1e-4
     agent.set_episode_context()
     det_a2 = agent.select_action(obs, deterministic=True)
     np.testing.assert_allclose(det_a1, det_a2, atol=1e-6)
@@ -956,7 +961,9 @@ def test_deterministic_agent_end_to_end_mcts_and_dpg_step() -> None:
     # Verify loading pre-z_film legacy deterministic state dict succeeds cleanly
     sd_legacy = agent.state_dict()
     sd_legacy["actor_head"] = {
-        k: v for k, v in sd_legacy["actor_head"].items() if "z_film" not in k
+        k: v
+        for k, v in sd_legacy["actor_head"].items()
+        if "z_film" not in k and "phase_film" not in k
     }
     agent_compat = LatentActionMCTSAgent(cfg, device=torch.device("cpu"))
     agent_compat.load_state_dict(sd_legacy)

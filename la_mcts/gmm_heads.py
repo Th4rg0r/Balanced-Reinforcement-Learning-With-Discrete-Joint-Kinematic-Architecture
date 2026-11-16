@@ -1183,6 +1183,22 @@ class SupportCriticHead(nn.Module):
         return -torch.sum(target_dist * log_probs, dim=-1).mean()
 
 
+def compute_gait_phase(
+    steps: torch.Tensor | int | float,
+    period_steps: int = 20,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Computes 2D periodic gait-phase clock [sin(2*pi*t/T), cos(2*pi*t/T)] in [-1, 1]^2."""
+    period = max(1, int(period_steps))
+    if torch.is_tensor(steps):
+        s_t = steps.to(device=device if device is not None else steps.device, dtype=dtype)
+    else:
+        s_t = torch.tensor(steps, device=device, dtype=dtype)
+    theta = (2.0 * math.pi / float(period)) * s_t
+    return torch.stack([torch.sin(theta), torch.cos(theta)], dim=-1)
+
+
 class DeterministicLimbHead(nn.Module):
     """Universal Deterministic Morphological Limb Network f_phi(z_t, c_i) -> a_i in [-1, 1]^J.
 
@@ -1212,6 +1228,7 @@ class DeterministicLimbHead(nn.Module):
             nn.LayerNorm(hidden_dim),
         )
         self.z_film = nn.Linear(latent_dim, hidden_dim * 2)
+        self.phase_film = nn.Linear(2, hidden_dim * 2)
         self.kin_proj = nn.Sequential(
             nn.Linear(self.geom_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -1242,11 +1259,22 @@ class DeterministicLimbHead(nn.Module):
         return encode_limb_kinematics(kinematics)
 
     def _encode_limbs(
-        self, z_flat: torch.Tensor, limb_geom: torch.Tensor
+        self,
+        z_flat: torch.Tensor,
+        limb_geom: torch.Tensor,
+        phase: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Runs shared FiLM state-conditioning + self-attention over [global_z, limb_tokens] -> (B, N_limbs, D)."""
+        """Runs shared FiLM state + phase conditioning & self-attention over [global_z, limb_tokens] -> (B, N_limbs, D)."""
         e_global = self.global_proj(z_flat).unsqueeze(1) + self.global_type_emb
-        scale, shift = self.z_film(z_flat).unsqueeze(1).chunk(2, dim=-1)
+        film_raw = self.z_film(z_flat)
+        if phase is not None:
+            p_in = phase.to(device=z_flat.device, dtype=z_flat.dtype)
+            if p_in.dim() == 1:
+                p_in = p_in.unsqueeze(0).expand(z_flat.shape[0], -1)
+            elif p_in.shape[0] == 1 and z_flat.shape[0] > 1:
+                p_in = p_in.expand(z_flat.shape[0], -1)
+            film_raw = film_raw + self.phase_film(p_in)
+        scale, shift = film_raw.unsqueeze(1).chunk(2, dim=-1)
         e_limbs = self.kin_proj(limb_geom) * (1.0 + 0.5 * torch.tanh(scale)) + shift + self.limb_type_emb
         enc_seq = torch.cat([e_global, e_limbs], dim=1)
         enc_out = self.out_ln(self.encoder(enc_seq))
@@ -1262,6 +1290,7 @@ class DeterministicLimbHead(nn.Module):
         all_limbs_kinematics: Optional[torch.Tensor] = None,
         angle_diff: Optional[Tuple[float, float, float] | Sequence[float] | torch.Tensor] = None,
         world_euler: Optional[Tuple[float, float, float] | Sequence[float] | torch.Tensor] = None,
+        phase: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Computes deterministic bounded action in [-1, 1]^{n_j} for a single queried limb."""
         device = z_t.device
@@ -1284,13 +1313,13 @@ class DeterministicLimbHead(nn.Module):
             dists = torch.norm(ctx_t[0, :, :3] - kin_11d[0, :3].unsqueeze(0), dim=-1)
             best_idx = int(torch.argmin(dists).item())
             if float(dists[best_idx].item()) < 1e-3:
-                h_limbs = self._encode_limbs(z_in, ctx_geom)
+                h_limbs = self._encode_limbs(z_in, ctx_geom, phase=phase)
                 h_target = h_limbs[:, best_idx, :]
             else:
-                h_limbs = self._encode_limbs(z_in, torch.cat([ctx_geom, geom_q], dim=1))
+                h_limbs = self._encode_limbs(z_in, torch.cat([ctx_geom, geom_q], dim=1), phase=phase)
                 h_target = h_limbs[:, -1, :]
         else:
-            h_target = self._encode_limbs(z_in, geom_q)[:, 0, :]
+            h_target = self._encode_limbs(z_in, geom_q, phase=phase)[:, 0, :]
 
         n_j = num_joints if num_joints is not None else self.max_joints_per_limb
         act = torch.tanh(self.mu_head(h_target)[..., :n_j])
@@ -1303,15 +1332,17 @@ class DeterministicLimbHead(nn.Module):
         limb_joint_counts: Optional[Sequence[int]] = None,
         target_action_dim: Optional[int] = None,
         return_pre_tanh: bool = False,
+        phase: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         """Vectorized deterministic forward pass across all creature limbs."""
         orig_shape = z_t.shape[:-1]
         z_flat = z_t.reshape(-1, self.latent_dim)
         bsz = z_flat.shape[0]
+        phase_flat = phase.reshape(-1, phase.shape[-1]) if (phase is not None and phase.dim() > 2) else phase
 
         kin_flat, n_limbs = _flatten_kinematics_batch(limb_kinematics, bsz)
         geom_emb = self.encode_kinematics(kin_flat)
-        h = self._encode_limbs(z_flat, geom_emb)
+        h = self._encode_limbs(z_flat, geom_emb, phase=phase_flat)
         mu_limbs = self.mu_head(h)  # (bsz, n_limbs, max_joints_per_limb)
 
         if limb_joint_counts is not None:
@@ -1417,6 +1448,7 @@ class DeterministicActorHead(nn.Module):
         limb_kinematics: Optional[torch.Tensor] = None,
         action_mask: Optional[torch.Tensor] = None,
         return_pre_tanh: bool = False,
+        phase: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         """Computes exact deterministic action(s) in [-1, 1]^N."""
         kin, counts = self._resolve_kinematics(limb_kinematics, z_t.device)
@@ -1426,6 +1458,7 @@ class DeterministicActorHead(nn.Module):
             limb_joint_counts=counts,
             target_action_dim=self.action_dim,
             return_pre_tanh=True,
+            phase=phase,
         )
         act = self._apply_mask(act, action_mask)
         self.last_pre_tanh = pre_tanh
@@ -1469,6 +1502,7 @@ class DeterministicActorHead(nn.Module):
         latent_noise_std: float = 0.25,
         action_noise_std: float = 0.35,
         held_action_noise: Optional[torch.Tensor] = None,
+        phase: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, ...]:
         """Generates deterministic action + temporally held & latent-perturbed candidates for MCTS search."""
         single = z_t.dim() == 1
@@ -1476,7 +1510,9 @@ class DeterministicActorHead(nn.Module):
         bsz = z_in.shape[0]
 
         if deterministic_candidates or k_act <= 1:
-            a_det = self.forward(z_in, limb_kinematics=limb_kinematics, action_mask=action_mask)
+            a_det = self.forward(
+                z_in, limb_kinematics=limb_kinematics, action_mask=action_mask, phase=phase
+            )
             sampled = a_det.unsqueeze(1)  # (B, 1, N)
             prior_weights = torch.ones((bsz, 1), device=z_t.device, dtype=z_t.dtype)
             peaks = torch.zeros((bsz, 1), device=z_t.device, dtype=torch.long)
@@ -1522,8 +1558,15 @@ class DeterministicActorHead(nn.Module):
         else:
             kin_stack = kin
 
+        phase_stack = None
+        if phase is not None:
+            p_in = phase.to(device=z_t.device, dtype=z_t.dtype)
+            if p_in.dim() == 1:
+                p_in = p_in.unsqueeze(0).expand(bsz, -1)
+            phase_stack = p_in.unsqueeze(1).expand(bsz, n_core, p_in.shape[-1]).reshape(bsz * n_core, -1)
+
         acts_core = self.limb_head.forward_all_limbs(
-            flat_z, kin_stack, limb_joint_counts=counts, target_action_dim=self.action_dim
+            flat_z, kin_stack, limb_joint_counts=counts, target_action_dim=self.action_dim, phase=phase_stack
         ).view(bsz, n_core, self.action_dim)
 
         a_det = acts_core[:, 0:1, :]
