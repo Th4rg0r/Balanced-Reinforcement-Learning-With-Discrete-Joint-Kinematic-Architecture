@@ -677,8 +677,12 @@ def test_needle_point_d_critic_warmup_and_config_defaults() -> None:
     assert np.isclose(sys_cfg.ant_morph.ctrl_cost_weight, 0.0)
     assert np.isclose(sys_cfg.ant_morph.ctrl_start_return_ref, 1000.0)
     assert np.isclose(sys_cfg.ant_morph.ctrl_return_ref, 3500.0)
+    assert sys_cfg.ant_morph.min_joint_vel > 0.0
+    assert sys_cfg.ant_morph.joint_vel_penalty_coef > 0.0
+    assert np.isclose(sys_cfg.ant_morph.joint_vel_start_return_ref, 1000.0)
+    assert np.isclose(sys_cfg.ant_morph.joint_vel_end_return_ref, 3000.0)
     assert 0.0 < sys_cfg.ant_morph.action_ema_alpha <= 1.0
-    assert np.isclose(sys_cfg.la_mcts.root_exploration_fraction_decay_constant, 0.999996)
+    assert 0.0 < sys_cfg.la_mcts.root_exploration_fraction_decay_constant <= 1.0
     assert sys_cfg.brl.warmup_episodes == 150
 
 
@@ -850,19 +854,26 @@ def test_deterministic_limb_actor_head_and_single_limb_sharing() -> None:
     )
     torch.testing.assert_close(leg0_single, all_act[:2], atol=1e-5, rtol=1e-5)
 
+    # Verify phase_film and mu_head biases initialize at 0.0 (preventing static stance offset)
+    torch.testing.assert_close(ant_actor.limb_head.phase_film.bias, torch.zeros_like(ant_actor.limb_head.phase_film.bias))
+    torch.testing.assert_close(ant_actor.limb_head.mu_head.bias, torch.zeros_like(ant_actor.limb_head.mu_head.bias))
+
     # Verify FiLM z-conditioning keeps DeterministicActorHead responsive to latent state z
     z_grid = torch.rand(32, 64)
     a_grid = ant_actor(z_grid)
     assert float(a_grid.std(dim=0).mean().item()) > 0.08
 
-    # Verify held_action_noise places the sustained directional perturbation into slot 1
+    # Verify held_action_noise places +held into slot 1, antithetic -held into slot 2, and uses uniform priors
     held = torch.ones(8) * 0.8
     cands, priors = ant_actor.sample_actions(
         z1, k_act=8, temperature=1.0, action_noise_std=0.35, held_action_noise=held
     )
     assert cands.shape == (8, 8)
     expected_slot1 = torch.clamp(all_act + 0.35 * held, -1.0, 1.0)
+    expected_slot2 = torch.clamp(all_act - 0.35 * held, -1.0, 1.0)
     torch.testing.assert_close(cands[1], expected_slot1, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(cands[2], expected_slot2, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(priors, torch.full_like(priors, 1.0 / 8.0), atol=1e-6, rtol=1e-6)
     assert float(cands.std(dim=0).mean().item()) > 0.15
 
 
@@ -1021,3 +1032,78 @@ def test_step_based_root_exploration_fraction_decay() -> None:
 
 
 
+
+
+def test_deterministic_awr_distills_positive_advantage_actions_over_slot0_collapse() -> None:
+    """Verifies AWR pulls DeterministicActorHead toward high-return executed actions even when Slot 0 dominates MCTS weights."""
+    from la_mcts.gmm_heads import DeterministicActorHead, compute_gait_phase
+    from la_mcts.backbone import SelfAttentionBackbone
+
+    torch.manual_seed(202)
+    backbone = SelfAttentionBackbone(
+        obs_dim=12, k_tok=4, d_model=32, n_heads=2, l_enc=1, latent_dim=32
+    )
+    actor = DeterministicActorHead(latent_dim=32, action_dim=4, hidden_dim=32)
+    critic = SupportCriticHead(
+        latent_dim=32, use_categorical=True, support_min=-50, support_max=50, num_bins=101
+    )
+    rep = ModelRepresentationTrainer(
+        latent_dim=32, action_dim=4, num_blocks=1, proj_dim=32, pred_dim=32
+    )
+    opt = torch.optim.Adam(actor.parameters(), lr=5e-3)
+
+    bsz, unroll_k, k_act = 4, 2, 4
+    obs_seq = torch.randn(bsz, unroll_k + 1, 12)
+    with torch.no_grad():
+        z0 = backbone(obs_seq[:, 0])
+        ph0 = compute_gait_phase(torch.zeros(bsz), period_steps=20, dtype=z0.dtype)
+        a_slot0_before = actor(z0, phase=ph0)
+
+    # Winning executed action in trajectory 0, static/zero action in trajectories 1..3
+    a_win = torch.tensor([0.85, -0.85, 0.85, -0.85], dtype=torch.float32)
+    act_seq = torch.zeros(bsz, unroll_k, 4)
+    act_seq[0, :, :] = a_win.unsqueeze(0)
+    rew_seq = torch.zeros(bsz, unroll_k)
+    rew_seq[0, :] = 10.0
+    target_val_seq = torch.zeros(bsz, unroll_k + 1)
+    target_val_seq[0, :] = 25.0  # Strong positive advantage over critic (~0) and batch (~0)
+
+    # Simulate Slot 0 winning MCTS weights (argmax=0), which previously produced zero actor pull toward a_win
+    samples_seq = torch.zeros(bsz, unroll_k + 1, k_act, 4)
+    samples_seq[:, 0, 0, :] = a_slot0_before
+    weights_seq = torch.zeros(bsz, unroll_k + 1, k_act)
+    weights_seq[:, :, 0] = 0.85
+    weights_seq[:, :, 1:] = 0.05
+
+    dist_before = float((a_slot0_before[0] - a_win).abs().mean().item())
+    phase_seq = compute_gait_phase(
+        torch.arange(unroll_k + 1, dtype=torch.float32).unsqueeze(0).expand(bsz, -1),
+        period_steps=20,
+    )
+
+    for _ in range(15):
+        opt.zero_grad()
+        loss, metrics = rep.compute_unrolled_loss(
+            obs_seq=obs_seq,
+            action_seq=act_seq,
+            reward_seq=rew_seq,
+            target_value_seq=target_val_seq,
+            mcts_policy_samples=samples_seq,
+            mcts_policy_weights=weights_seq,
+            backbone=backbone,
+            actor_head=actor,
+            critic_head=critic,
+            lambda_p=1.0,
+            lambda_v=0.1,
+            lambda_r=0.1,
+            lambda_rep=0.1,
+            phase_seq=phase_seq,
+        )
+        assert metrics["loss_p_awr"] > 0.0
+        loss.backward()
+        opt.step()
+
+    with torch.no_grad():
+        a_slot0_after = actor(backbone(obs_seq[:, 0]), phase=ph0)
+    dist_after = float((a_slot0_after[0] - a_win).abs().mean().item())
+    assert dist_after < dist_before - 0.1

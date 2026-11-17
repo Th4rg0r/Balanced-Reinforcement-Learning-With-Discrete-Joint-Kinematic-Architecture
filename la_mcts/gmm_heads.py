@@ -1229,6 +1229,9 @@ class DeterministicLimbHead(nn.Module):
         )
         self.z_film = nn.Linear(latent_dim, hidden_dim * 2)
         self.phase_film = nn.Linear(2, hidden_dim * 2)
+        # Avoid large default 1/sqrt(2) bias flooding early z/phase FiLM modulation
+        nn.init.orthogonal_(self.phase_film.weight, gain=0.75)
+        nn.init.zeros_(self.phase_film.bias)
         self.kin_proj = nn.Sequential(
             nn.Linear(self.geom_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -1253,6 +1256,8 @@ class DeterministicLimbHead(nn.Module):
         )
         self.out_ln = nn.LayerNorm(hidden_dim)
         self.mu_head = nn.Linear(hidden_dim, max_joints_per_limb)
+        nn.init.orthogonal_(self.mu_head.weight, gain=0.5)
+        nn.init.zeros_(self.mu_head.bias)
 
     @staticmethod
     def encode_kinematics(kinematics: torch.Tensor) -> torch.Tensor:
@@ -1527,11 +1532,14 @@ class DeterministicActorHead(nn.Module):
 
         # Generate k_act candidates:
         #   slot 0: clean deterministic policy f_phi(z, c)
-        #   slot 1 (when held_action_noise given): temporally held multi-step perturbation (Point B)
-        #   slots 2..: coherent latent-perturbed policies f(norm(z + delta_z)) & isotropic action exploration
+        #   slot 1 (when held_action_noise given): +held directional perturbation
+        #   slot 2 (when held_action_noise given & k_act >= 3): antithetic -held perturbation
+        #   slots 3..: coherent latent-perturbed policies f(norm(z + delta_z)) & isotropic action exploration
         kin, counts = self._resolve_kinematics(limb_kinematics, z_in.device)
         use_held = held_action_noise is not None and k_act >= 2
-        remaining = (k_act - 2) if use_held else (k_act - 1)
+        use_antithetic = use_held and k_act >= 3
+        n_held = (2 if use_antithetic else 1) if use_held else 0
+        remaining = k_act - 1 - n_held
         n_lat = max(1, remaining // 2) if remaining > 0 else 0
         n_act = max(0, remaining - n_lat)
         eff_lat_std = max(0.02, float(latent_noise_std)) * math.sqrt(max(float(temperature), 0.25))
@@ -1577,8 +1585,12 @@ class DeterministicActorHead(nn.Module):
                 h_noise = h_noise.view(1, 1, -1).expand(bsz, 1, -1)
             elif h_noise.dim() == 2:
                 h_noise = h_noise.unsqueeze(1)
-            a_held = torch.clamp(a_det + eff_act_std * h_noise[..., : self.action_dim], -1.0, 1.0)
+            h_delta = eff_act_std * h_noise[..., : self.action_dim]
+            a_held = torch.clamp(a_det + h_delta, -1.0, 1.0)
             chunks.append(a_held)
+            if use_antithetic:
+                a_anti = torch.clamp(a_det - h_delta, -1.0, 1.0)
+                chunks.append(a_anti)
         if n_lat > 0:
             chunks.append(acts_core[:, 1:, :])
         if n_act > 0:
@@ -1591,9 +1603,8 @@ class DeterministicActorHead(nn.Module):
         sampled = torch.cat(chunks, dim=1)
         sampled = self._apply_mask(sampled, action_mask)
 
-        # Mild anchor on slot 0 while ensuring exploratory branches receive strong PUCT visits
+        # Uniform priors avoid starving exploratory branches under small n_sim
         priors = torch.ones((bsz, k_act), device=z_t.device, dtype=z_t.dtype)
-        priors[:, 0] = 1.25
         prior_weights = priors / priors.sum(dim=-1, keepdim=True)
         peaks = torch.zeros((bsz, k_act), device=z_t.device, dtype=torch.long)
         peaks_out = peaks.squeeze(0) if single else peaks

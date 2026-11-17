@@ -921,6 +921,14 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 )
                 prev_cum_root = prev_cum_t.squeeze(0) if prev_cum_t is not None else None
                 gait_period = max(1, int(getattr(self.cfg, "gait_phase_period", 20)))
+                is_det_head = bool(getattr(self.actor_head, "is_deterministic", False))
+                held_reanalyze_noise = (
+                    torch.randn(
+                        self.cfg.max_action_dim, device=self.device, dtype=torch.float32
+                    )
+                    if is_det_head
+                    else None
+                )
                 _, policy_weights, root_samples, root_value, _ = self.mcts.search(
                     z_root,
                     deterministic=False,
@@ -933,11 +941,13 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     q_advantage_weight=self.get_current_q_advantage_weight(),
                     latent_noise_std=self.get_current_latent_noise_std(),
                     action_noise_std=self.get_current_action_explore_std(),
+                    held_action_noise=held_reanalyze_noise,
                     phase_step=step,
                     gait_period_steps=gait_period,
                 )
-                traj.mcts_policy_samples[step] = root_samples
-                traj.mcts_policy_weights[step] = policy_weights
+                if not is_det_head:
+                    traj.mcts_policy_samples[step] = root_samples
+                    traj.mcts_policy_weights[step] = policy_weights
                 traj.mcts_values[step] = float(root_value)
 
     def _target_pairs(self) -> List[Tuple[nn.Module, nn.Module]]:

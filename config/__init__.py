@@ -158,6 +158,10 @@ class AntMorphConfig:
     min_healthy_vel: float = 0.10
     stationary_penalty_coef: float = 1.50
     stationary_vel_window: int = 20
+    min_joint_vel: float = 0.5
+    joint_vel_penalty_coef: float = 0.5
+    joint_vel_start_return_ref: float = 1000.0
+    joint_vel_end_return_ref: float = 3000.0
 
 
 @dataclass

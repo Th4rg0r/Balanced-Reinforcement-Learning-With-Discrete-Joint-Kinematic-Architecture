@@ -691,3 +691,65 @@ def test_ctrl_cost_cancellation_holds_until_1000_and_ramps_to_3500() -> None:
         assert eval_r == pytest.approx(float(eval_info["raw_env_reward"]), abs=1e-5)
     finally:
         wrapper.close()
+
+
+def test_joint_vel_penalty_enforces_all_joints_and_blends_1000_to_3000() -> None:
+    """Verifies per-step joint speed penalty covers all active hip+ankle joints and blends out from 1000 to 3000 return."""
+    wrapper = MorphologicalAntBRLWrapper(
+        max_action_capacity=12,
+        fixed_action_space=True,
+        action_ema_alpha=1.0,
+        action_smoothness_coef=0.0,
+        min_healthy_vel=0.0,
+        stationary_penalty_coef=0.0,
+        min_joint_vel=0.5,
+        joint_vel_penalty_coef=0.5,
+        joint_vel_start_return_ref=1000.0,
+        joint_vel_end_return_ref=3000.0,
+        forward_reward_weight=1.0,
+        ctrl_cost_weight=0.5,
+        use_real_returns=False,
+    )
+    try:
+        wrapper.reset(seed=42, options={"eval_mode": False})
+        zero_act = np.zeros(12, dtype=np.float32)
+
+        # 1) At 0 and 1000 real return: scale == 1.0, frozen joints incur full penalty
+        for ret in (0.0, 1000.0):
+            wrapper.target_return = ret
+            wrapper.current_return = ret
+            wrapper.mj_data.qvel[:] = 0.0
+            assert wrapper.get_current_joint_vel_penalty_scale() == pytest.approx(1.0, abs=1e-6)
+            _, r, _, _, info = wrapper.step(zero_act)
+            assert float(info["joint_vel_penalty_scale"]) == pytest.approx(1.0, abs=1e-6)
+            assert 0.0 < float(info["joint_vel_penalty"]) <= 0.5
+            assert r == pytest.approx(float(info["raw_env_reward"]) - float(info["joint_vel_penalty"]), abs=1e-5)
+
+        # 2) At 2000 real return (midpoint between 1000 and 3000): scale == 0.5
+        wrapper.target_return = 2000.0
+        wrapper.current_return = 2000.0
+        assert wrapper.get_current_joint_vel_penalty_scale() == pytest.approx(0.5, abs=1e-6)
+        _, mid_r, _, _, mid_info = wrapper.step(zero_act)
+        assert float(mid_info["joint_vel_penalty_scale"]) == pytest.approx(0.5, abs=1e-6)
+        assert mid_r == pytest.approx(
+            float(mid_info["raw_env_reward"]) - float(mid_info["joint_vel_penalty"]), abs=1e-5
+        )
+
+        # 3) At 3000+ real return: completely blended away (scale == 0.0, penalty == 0.0)
+        wrapper.target_return = 3000.0
+        wrapper.current_return = 3000.0
+        assert wrapper.get_current_joint_vel_penalty_scale() == pytest.approx(0.0, abs=1e-6)
+        _, end_r, _, _, end_info = wrapper.step(zero_act)
+        assert float(end_info["joint_vel_penalty_scale"]) == pytest.approx(0.0, abs=1e-6)
+        assert float(end_info["joint_vel_penalty"]) == pytest.approx(0.0, abs=1e-6)
+        assert end_r == pytest.approx(float(end_info["raw_env_reward"]), abs=1e-5)
+
+        # 4) Eval mode always keeps penalty at 0.0 regardless of low training return
+        wrapper.target_return = 0.0
+        wrapper.current_return = 0.0
+        wrapper.reset(seed=42, options={"eval_mode": True})
+        _, eval_r, _, _, eval_info = wrapper.step(zero_act)
+        assert float(eval_info["joint_vel_penalty"]) == pytest.approx(0.0, abs=1e-6)
+        assert eval_r == pytest.approx(float(eval_info["raw_env_reward"]), abs=1e-5)
+    finally:
+        wrapper.close()

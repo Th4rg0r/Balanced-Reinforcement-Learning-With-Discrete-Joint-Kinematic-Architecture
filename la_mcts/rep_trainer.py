@@ -337,21 +337,48 @@ class ModelRepresentationTrainer(nn.Module):
                 return_pre_tanh=True,
                 phase=phase_flat,
             )
-            best_idx = torch.argmax(weights_seq, dim=-1)  # (B, n_steps)
-            n_act_dim = mcts_policy_samples.size(3)
-            best_idx_exp = best_idx.unsqueeze(-1).unsqueeze(-1).expand(bsz, n_steps, 1, n_act_dim)
-            a_best = torch.gather(mcts_policy_samples[:, :n_steps], dim=2, index=best_idx_exp).squeeze(2)
             a_det_seq = a_det_flat.view(bsz, n_steps, -1)
-            sq_err = (a_det_seq - a_best).pow(2)
+            # 1) Sharpened MCTS visit/Q barycenter avoids brittle Slot-0 argmax lock-in
+            w_sharp = weights_seq.pow(2.0)
+            w_sharp = w_sharp / w_sharp.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            a_mcts_target = torch.sum(
+                w_sharp.unsqueeze(-1) * mcts_policy_samples[:, :n_steps], dim=2
+            )
+            sq_err = (a_det_seq - a_mcts_target).pow(2)
             pre_tanh_sq = pre_tanh_flat.view(bsz, n_steps, -1).pow(2)
             if action_mask is not None:
                 m_seq = action_mask.view(1, 1, -1) if action_mask.dim() == 1 else action_mask.unsqueeze(1)
-                loss_p = ((sq_err * m_seq).sum(dim=-1) / active_dims).mean(dim=0).sum()
+                loss_p_mcts = ((sq_err * m_seq).sum(dim=-1) / active_dims).mean(dim=0).sum()
                 pre_tanh_reg = ((pre_tanh_sq * m_seq).sum(dim=-1) / active_dims).mean()
             else:
-                loss_p = (sq_err.sum(dim=-1) / active_dims).mean(dim=0).sum()
+                m_seq = None
+                loss_p_mcts = (sq_err.sum(dim=-1) / active_dims).mean(dim=0).sum()
                 pre_tanh_reg = pre_tanh_sq.mean()
-            loss_p = loss_p + 1e-4 * pre_tanh_reg
+
+            # 2) Direct Advantage-Weighted Regression (AWR) on executed replay actions so
+            #    high-return exploratory motions distill straight into the deterministic actor
+            n_awr = min(unroll_k, action_seq.size(1), target_value_seq.size(1)) if unroll_k > 0 else 0
+            if n_awr > 0 and action_seq.numel() > 0:
+                with torch.no_grad():
+                    v_pred_seq = critic_head(
+                        cum_seq[:, :n_awr].detach().reshape(bsz * n_awr, -1)
+                    ).view(bsz, n_awr)
+                    adv = target_value_seq[:, :n_awr] - v_pred_seq
+                    adv_scale = adv.std().clamp_min(1.0)
+                    adv_score = torch.relu((adv - adv.mean()) / adv_scale) * (
+                        adv > -0.5 * adv_scale
+                    ).to(adv.dtype)
+                    w_awr = (torch.exp(adv_score.clamp(max=3.0)) - 1.0).clamp(max=6.0)
+                awr_sq = (a_det_seq[:, :n_awr] - action_seq[:, :n_awr]).pow(2)
+                if m_seq is not None:
+                    awr_mse = (awr_sq * m_seq).sum(dim=-1) / active_dims
+                else:
+                    awr_mse = awr_sq.sum(dim=-1) / active_dims
+                loss_p_awr = 2.0 * (w_awr.detach() * awr_mse).mean()
+            else:
+                loss_p_awr = torch.tensor(0.0, device=obs_seq.device, dtype=obs_seq.dtype)
+
+            loss_p = loss_p_mcts + loss_p_awr * float(n_steps) + 1e-4 * pre_tanh_reg
 
             # Normalize over unroll horizon
             loss_v = loss_v / float(k_plus_1)
@@ -378,6 +405,8 @@ class ModelRepresentationTrainer(nn.Module):
                 "loss_total": float(total_loss.detach().item()),
                 "loss_v": float(loss_v.detach().item()),
                 "loss_p": float(loss_p.detach().item()),
+                "loss_p_mcts": float((loss_p_mcts / float(k_plus_1)).detach().item()),
+                "loss_p_awr": float(loss_p_awr.detach().item()),
                 "loss_r": float(loss_r.detach().item()),
                 "loss_rep": float(loss_rep.detach().item()),
                 "loss_peak_ent": 0.0,

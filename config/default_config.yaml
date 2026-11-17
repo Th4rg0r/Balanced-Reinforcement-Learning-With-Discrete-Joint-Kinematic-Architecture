@@ -42,8 +42,7 @@ la_mcts:
   root_dirichlet_alpha: 0.3
   root_exploration_fraction: 0.5
   root_exploration_fraction_end: 0.12
-  #root_exploration_fraction_decay_constant: 0.999996
-  root_exploration_fraction_decay_constant: 0.99990
+  root_exploration_fraction_decay_constant: 0.999995
   tau_act_train: 1.5
   tau_act_train_end: 0.15
   tau_act_eval: 0.05
@@ -119,7 +118,7 @@ ant_morph:
   action_ema_alpha: 1 # 0.75    # mild jitter filter without attenuating exploratory torques -> scales to 1.0 at 1000 return
   action_smoothness_coef: 0.00 #0.05 # smoothness 0.06
   action_smoothness_end_step: 500000
-  forward_reward_weight: 1 # training-only agent_reward forward scale (Eval/raw Ant-v5 stays standard 1.0)
+  forward_reward_weight: 2.5 # training-only agent_reward forward scale (Eval/raw Ant-v5 stays standard 1.0)
   ctrl_cost_weight: 0.0      # training-only agent_reward torque cost weight (0.0 cancels torque penalty at start, blends to 0.5)
   benchmark_vel_ref: 0.20
   torque_return_ref: 1000.0
@@ -131,9 +130,13 @@ ant_morph:
   vel_shift_factor: 3000.0
   upside_down_time_limit: 0.0
   upside_down_penalty: 0.0
-  min_healthy_vel: 0.05   # training-only: scale healthy_reward by clip(v_x / min_healthy_vel, 0, 1); 0.0 disables
-  stationary_penalty_coef: 0.3 # 0.7  # training-only: extra per-step penalty coef * (1 - vel_gate) fed into MCTS rewards; 0.0 disables
+  min_healthy_vel: 0.15 # 0.45   # training-only: scale healthy_reward by clip(v_x / min_healthy_vel, 0, 1); 0.0 disables
+  stationary_penalty_coef: 0.5 #0.5 # 0.7  # training-only: extra per-step penalty coef * (1 - vel_gate) fed into MCTS rewards; 0.0 disables
   stationary_vel_window: 20      # steps (~1.0s) of rolling-mean x-velocity used for the velocity gate
+  min_joint_vel: 0.5              # min |qvel| (rad/s) required per active hip & ankle joint during early training
+  joint_vel_penalty_coef: 0.5     # per-step penalty coef averaged across all active hip & ankle joints; 0.0 disables
+  joint_vel_start_return_ref: 1000.0 # rolling-20 real return where joint-speed penalty begins blending out
+  joint_vel_end_return_ref: 3000.0   # rolling-20 real return where joint-speed penalty reaches 0.0
 
 # Run protocol defaults for experiments/train_ant_brl.py (CLI flags override; 0 = automatic)
 run:
@@ -142,7 +145,7 @@ run:
   episodes: 0          # 0 = brl.total_episodes
   max_steps: 0         # 0 = ant_morph.max_episode_steps
   device: "cuda"
-  eval_interval: 25     # 0 = min(10, episodes)
+  eval_interval: 10     # 0 = min(10, episodes)
   checkpoint_interval: 500 # Periodic milestone checkpoint interval in episodes
   parallel_seeds: 3
   gpu_mem_fraction: 0.0
