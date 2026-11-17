@@ -109,7 +109,7 @@ brl:
 ant_morph:
   env_id: "Ant-v5"
   use_contact_forces: false
-  use_real_returns: true     # bypass training reward shaping; pass 100% raw Ant-v5 returns to agent from episode 1
+  use_real_returns: false     # bypass training reward shaping; pass 100% raw Ant-v5 returns to agent from episode 1
   max_episode_steps: 1000
   xml_rebuild_threshold: 1.0
   healthy_z_range: [0.2, 1.0]
@@ -128,8 +128,8 @@ ant_morph:
   vel_shift_factor: 3000.0
   upside_down_time_limit: 0.0
   upside_down_penalty: 0.0
-  min_healthy_vel: 0.05     # training-only: scale healthy_reward by clip(v_x / min_healthy_vel, 0, 1); 0.0 disables
-  stationary_penalty_coef: 0.35 # 0.7  # training-only: extra per-step penalty coef * (1 - vel_gate) fed into MCTS rewards; 0.0 disables
+  min_healthy_vel: 3.0    # training-only: scale healthy_reward by clip(v_x / min_healthy_vel, 0, 1); 0.0 disables
+  stationary_penalty_coef: 1.5 # 0.7  # training-only: extra per-step penalty coef * (1 - vel_gate) fed into MCTS rewards; 0.0 disables
   stationary_vel_window: 20      # steps (~1.0s) of rolling-mean x-velocity used for the velocity gate
 
 # Run protocol defaults for experiments/train_ant_brl.py (CLI flags override; 0 = automatic)
