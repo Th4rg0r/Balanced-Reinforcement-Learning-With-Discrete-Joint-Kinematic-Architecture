@@ -54,19 +54,9 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         min_healthy_vel: float = 0.0,
         stationary_penalty_coef: float = 0.0,
         stationary_vel_window: int = 20,
-        min_joint_vel: float = 0.0,
-        joint_vel_penalty_coef: float = 0.0,
-        joint_vel_start_return_ref: float = 1000.0,
-        joint_vel_end_return_ref: float = 3000.0,
         forward_reward_weight: float = 1.0,
         ctrl_cost_weight: float = 0.5,
-        ctrl_start_return_ref: float = 0.0,
-        ctrl_return_ref: Optional[float] = None,
         forward_return_ref: float = 5000.0,
-        use_real_returns: bool = False,
-        pure_velocity_reward_mode: bool = False,
-        pure_vel_start_return_ref: float = 1000.0,
-        pure_vel_end_return_ref: float = 3000.0,
     ) -> None:
         self.env_id = env_id
         if env is None:
@@ -107,27 +97,9 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self.min_healthy_vel = max(0.0, float(min_healthy_vel))
         self.stationary_penalty_coef = max(0.0, float(stationary_penalty_coef))
         self.stationary_vel_window = max(1, int(stationary_vel_window))
-        self.min_joint_vel = max(0.0, float(min_joint_vel))
-        self.joint_vel_penalty_coef = max(0.0, float(joint_vel_penalty_coef))
-        self.joint_vel_start_return_ref = max(0.0, float(joint_vel_start_return_ref))
-        self.joint_vel_end_return_ref = max(
-            self.joint_vel_start_return_ref + 1e-6, float(joint_vel_end_return_ref)
-        )
         self.forward_reward_weight = max(0.0, float(forward_reward_weight))
         self.ctrl_cost_weight = max(0.0, float(ctrl_cost_weight))
         self.forward_return_ref = max(1e-6, float(forward_return_ref))
-        self.ctrl_start_return_ref = max(0.0, float(ctrl_start_return_ref))
-        self.ctrl_return_ref = (
-            self.forward_return_ref
-            if ctrl_return_ref is None
-            else max(self.ctrl_start_return_ref + 1e-6, float(ctrl_return_ref))
-        )
-        self.use_real_returns = bool(use_real_returns)
-        self.pure_velocity_reward_mode = bool(pure_velocity_reward_mode)
-        self.pure_vel_start_return_ref = max(0.0, float(pure_vel_start_return_ref))
-        self.pure_vel_end_return_ref = max(
-            self.pure_vel_start_return_ref + 1e-6, float(pure_vel_end_return_ref)
-        )
         self._recent_step_vels: Deque[float] = deque(maxlen=self.stationary_vel_window)
         self._recent_ep_returns: Deque[float] = deque(maxlen=20)
         self._recent_ep_velocities: Deque[float] = self._recent_ep_returns
@@ -538,17 +510,13 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         )
 
     def _blend_weight_toward_benchmark(
-        self,
-        train_weight: float,
-        benchmark_weight: float,
-        start_ref: float = 0.0,
-        end_ref: Optional[float] = None,
+        self, train_weight: float, benchmark_weight: float
     ) -> float:
-        """Linearly blends a training weight toward its benchmark value over start_ref -> end_ref raw return."""
-        end = self.forward_return_ref if end_ref is None else end_ref
+        """Linearly blends a training weight toward its benchmark value over 0 -> forward_return_ref raw return."""
         pos_ret = max(0.0, float(self._current_return))
-        span = max(float(end) - float(start_ref), 1e-6)
-        blend = float(np.clip((pos_ret - float(start_ref)) / span, 0.0, 1.0))
+        blend = float(
+            np.clip(pos_ret / max(self.forward_return_ref, 1e-6), 0.0, 1.0)
+        )
         return float(train_weight + blend * (benchmark_weight - train_weight))
 
     def get_current_forward_reward_weight(self) -> float:
@@ -556,40 +524,8 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         return self._blend_weight_toward_benchmark(self.forward_reward_weight, 1.0)
 
     def get_current_ctrl_cost_weight(self) -> float:
-        """Holds ctrl_cost_weight until ctrl_start_return_ref, then linearly blends to standard 0.5 at ctrl_return_ref."""
-        return self._blend_weight_toward_benchmark(
-            self.ctrl_cost_weight,
-            0.5,
-            start_ref=self.ctrl_start_return_ref,
-            end_ref=self.ctrl_return_ref,
-        )
-
-    def get_current_joint_vel_penalty_scale(self) -> float:
-        """Returns joint-speed penalty scale in [0, 1]: 1.0 up to start_ref (1000), blending linearly to 0.0 at end_ref (3000)."""
-        pos_ret = max(0.0, float(self._current_return))
-        span = max(
-            float(self.joint_vel_end_return_ref) - float(self.joint_vel_start_return_ref),
-            1e-6,
-        )
-        fade = float(
-            np.clip(
-                (pos_ret - float(self.joint_vel_start_return_ref)) / span, 0.0, 1.0
-            )
-        )
-        return float(1.0 - fade)
-
-    def get_current_pure_vel_raw_blend(self) -> float:
-        """Returns linear blend weight in [0, 1] from pure velocity reward to raw_env_reward over [start_ref, end_ref]."""
-        pos_ret = max(0.0, float(self._current_return))
-        span = max(
-            float(self.pure_vel_end_return_ref) - float(self.pure_vel_start_return_ref),
-            1e-6,
-        )
-        return float(
-            np.clip(
-                (pos_ret - float(self.pure_vel_start_return_ref)) / span, 0.0, 1.0
-            )
-        )
+        """Linearly blends training ctrl_cost_weight toward standard 0.5 over 0 -> forward_return_ref (5000) raw return."""
+        return self._blend_weight_toward_benchmark(self.ctrl_cost_weight, 0.5)
 
     def get_current_action_ema_alpha(self) -> float:
         """Returns the effective action EMA alpha interpolating linearly from action_ema_alpha to 1.0 over 0 -> 1000 return."""
@@ -711,7 +647,6 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self._healthy_steps = 0
         self._upside_down_time = 0.0
         self._start_x = float(self.mj_data.qpos[0])
-        self._max_forward_x = self._start_x
         self._prev_raw_action = None
         self._prev_smoothed_action = None
 
@@ -827,12 +762,8 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         upside_down_terminated = False
         healthy_penalty = 0.0
         stationary_penalty = 0.0
-        joint_vel_penalty = 0.0
-        joint_vel_scale = 0.0
         forward_bonus = 0.0
         ctrl_refund = 0.0
-        pure_vel_reward = 0.0
-        pure_vel_raw_blend = 0.0
         self._recent_step_vels.append(float(step_x_vel))
         smooth_x_vel = float(sum(self._recent_step_vels) / len(self._recent_step_vels))
         if self._eval_mode:
@@ -842,38 +773,6 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             eff_ctrl_weight = 0.5
             agent_reward = raw_env_reward
             reward = raw_env_reward
-        elif self.use_real_returns:
-            # Bypass all reward/return shaping from step 1 while keeping exploration_progress annealing alive
-            blend_alpha = 1.0
-            exploration_progress = self.get_exploration_progress()
-            eff_forward_weight = 1.0
-            eff_ctrl_weight = 0.5
-            agent_reward = raw_env_reward
-            reward = raw_env_reward
-        elif self.pure_velocity_reward_mode:
-            # Pure non-negative forward-velocity reward up to 1000 raw return, linearly blending to raw_env_reward at 3000.
-            # Gate on rolling-window net forward velocity (smooth_x_vel) once the window is populated
-            # so zero-mean torso rocking around a stationary stance cannot accumulate fake velocity return.
-            blend_alpha = self.get_reward_blend_alpha()
-            exploration_progress = self.get_exploration_progress()
-            eff_forward_weight = self.forward_reward_weight
-            eff_ctrl_weight = 0.0
-            reward_fwd = float(info.get("reward_forward", step_x_vel))
-            if (
-                self.stationary_vel_window > 1
-                and len(self._recent_step_vels) >= min(5, self.stationary_vel_window)
-                and self.min_healthy_vel > 0.0
-            ):
-                vel_gate = float(np.clip(smooth_x_vel / self.min_healthy_vel, 0.0, 1.0))
-            else:
-                vel_gate = 1.0
-            pure_vel_reward = float(self.forward_reward_weight) * max(0.0, reward_fwd) * vel_gate
-            pure_vel_raw_blend = self.get_current_pure_vel_raw_blend()
-            agent_reward = (
-                (1.0 - pure_vel_raw_blend) * pure_vel_reward
-                + pure_vel_raw_blend * raw_env_reward
-            )
-            reward = agent_reward
         else:
             blend_alpha = self.get_reward_blend_alpha()
             exploration_progress = self.get_exploration_progress()
@@ -894,12 +793,6 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
                 # Standard Ant-v5 reward_ctrl = -0.5 * ||a||^2; adjust training cost to eff_ctrl_weight
                 reward_ctrl = float(info.get("reward_ctrl", 0.0))
                 ctrl_refund = (1.0 - (eff_ctrl_weight / 0.5)) * (-reward_ctrl)
-            joint_vel_scale = self.get_current_joint_vel_penalty_scale()
-            if self.min_joint_vel > 0.0 and self.joint_vel_penalty_coef > 0.0 and joint_vel_scale > 0.0:
-                joint_vels = np.abs(self.mj_data.qvel.ravel()[6 : 6 + nu])
-                if joint_vels.size > 0:
-                    deficit = np.clip((self.min_joint_vel - joint_vels) / self.min_joint_vel, 0.0, 1.0)
-                    joint_vel_penalty = self.joint_vel_penalty_coef * joint_vel_scale * float(np.mean(deficit))
             agent_reward = (
                 raw_env_reward
                 + forward_bonus
@@ -907,7 +800,6 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
                 - (1.0 - blend_alpha) * smooth_penalty
                 - healthy_penalty
                 - stationary_penalty
-                - joint_vel_penalty
             )
             reward = agent_reward
 
@@ -955,10 +847,6 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         info["agent_reward"] = float(agent_reward)
         info["healthy_penalty"] = float(healthy_penalty)
         info["stationary_penalty"] = float(stationary_penalty)
-        info["joint_vel_penalty"] = float(joint_vel_penalty)
-        info["joint_vel_penalty_scale"] = float(joint_vel_scale)
-        info["pure_vel_reward"] = float(pure_vel_reward)
-        info["pure_vel_raw_blend"] = float(pure_vel_raw_blend)
         info["smooth_x_vel"] = float(smooth_x_vel)
         info["reward_blend_alpha"] = float(blend_alpha)
         info["exploration_progress"] = float(exploration_progress)

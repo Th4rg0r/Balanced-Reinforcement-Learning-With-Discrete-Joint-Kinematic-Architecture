@@ -75,23 +75,12 @@ This document provides a comprehensive reference for every configuration paramet
   - **Lower**: Struggles to disambiguate unobserved physical parameters (e.g. slippery ice vs. weak actuators) from instantaneous states.
 
 #### `latent_ema_decay`
-- **Type**: `float` | **Default**: `0.15`
+- **Type**: `float` | **Default**: `0.4`
 - **Purpose**: Exponential moving average weight $\alpha \in [0, 1]$ used to blend cumulative historical latent representations ($z^{\text{cum}}_t = \text{norm}(z_t + \alpha z^{\text{cum}}_{t-1})$) for Actor and Critic readout while keeping latent dynamics transitions un-smeared ($z_t \to z_{t+1}$).
 
 ---
 
-### 1.2 Policy Architecture & Actor Optimization
-
-#### `actor_type`, `lambda_dpg`, `dpg_horizon`, `gait_phase_period`, `action_explore_std`, and `action_explore_std_end`
-- **Defaults**:
-  - `actor_type: "deterministic"`: Selects Network 2 implementation:
-    - `"deterministic"` (Default): Uses `DeterministicActorHead` (`DeterministicLimbHead`), mapping `(z_t, c_i, phase_i) -> a_i in [-1, 1]^J` directly via Pre-LN self-attention and 8D per-limb phase harmonics without composite GMM sampling, trained via MCTS barycenter + AWR + temporal oscillation floor (`lambda_p`) and gradient-clipped 1-step DPG (`lambda_dpg`).
-    - `"gmm"`: Legacy `MultiPeakGMMActorHead` outputting multi-peak `(logits, mu, log_std)` distribution parameters.
-  - `lambda_dpg: 0.05`: Weight of the analytical Deterministic Policy Gradient (`d/d_phi [r_hat + gamma V(z_cum)]`) backpropagated through the frozen world model and critic (clipped to at most `0.25x` of the `loss_p` actor gradient norm).
-  - `dpg_horizon: 1`: 1-step latent evaluation horizon differentiated per DPG update to prevent multi-step world-model corner exploitation.
-  - `use_gait_phase: false`: Enables (`true`) or disables (`false`) the external 2D sinusoidal gait clock signal $[\sin(2\pi t / T), \cos(2\pi t / T)]$. When `false`, the actor relies purely on closed-loop proprioceptive state feedback.
-  - `gait_phase_period: 16`: Period in environment steps (`16 * 50ms = 0.80s`, `1.25 Hz`) of the global 2D sinusoidal gait clock when `use_gait_phase: true`.
-  - `action_explore_std: 0.40` $\to$ `action_explore_std_end: 0.05`: Exploration noise std around deterministic MCTS proposals during training, annealing linearly over `0 -> exploration_return_ref` (`3000`, velocity-gated when `use_real_returns: true`).
+### 1.2 Policy Prior & Latent Action Space
 
 #### `num_peaks`
 - **Type**: `int` | **Default**: `4`
@@ -182,7 +171,7 @@ This document provides a comprehensive reference for every configuration paramet
   - `beta_mse: 1.0`: Stop-gradient MSE weight inside the hybrid SimSiam cosine + MSE consistency loss.
   - `lambda_v: 0.5`: Weight of the value critic loss.
   - `lambda_r: 1.0`: Weight of the step reward prediction loss.
-  - `lambda_p: 0.25`: Weight of the policy anchor loss against MCTS search targets (masked MSE to MCTS winning candidate when `actor_type: "deterministic"`, or cross-entropy log-prob when `"gmm"`, ramped by `critic_warmup_steps`).
+  - `lambda_p: 1.0`: Weight of the policy prior cross-entropy loss against MCTS search policy $\pi_{\text{mcts}}$ (ramped by `critic_warmup_steps` during pre-conditioning).
   - `lambda_ent: 0.03`: Weight of the per-joint Gaussian standard-deviation floor/ceiling regularization (`std_floor` $\to$ `std_ceil`).
   - `lambda_peak_ent: 0.15` $\to$ `lambda_peak_ent_end: 0.02`: Decaying weight on the GMM categorical mixture-weight entropy $H(\pi)$ (with `peak_entropy_floor_ratio: 0.70` $\to$ `0.0`) to prevent premature mode collapse without forcing destructive per-joint variance.
   - `lambda_peak_sep: 0.25` $\to$ `lambda_peak_sep_end: 0.05` (`min_peak_separation: 0.40`): Decaying pairwise RMS separation penalty between GMM peak means $\tanh(\mu_i), \tanh(\mu_j)$ so modes represent genuinely distinct gaits/postures.
@@ -204,15 +193,15 @@ Exploration in LA-MCTS is dynamically annealed using the environment's **rolling
 - **Type**: `int` | **Default**: `n_sim: 32`, `n_sim_eval: 64`
 - **Purpose**: Number of MCTS simulation trajectories executed per environment step during training (`n_sim`) and evaluation (`n_sim_eval`).
 - **Training Impact**:
-  - **Training (32)**: `4` sequential PUCT waves (`batch_leaf_eval = 8`) per step for multi-step tree depth without hurting throughput.
-  - **Eval (64)**: Used when evaluating `"gmm"` peak centers (`"deterministic"` mode evaluates `DeterministicActorHead` noise-free in O(1)).
+  - **Training (32)**: Exact multiple of `batch_leaf_eval = 16` (2 GPU batches per step), maximizing wall-clock throughput while preserving strong tree planning.
+  - **Eval (64)**: 4 GPU batches during evaluation to extract maximum performance from the learned world model.
 
 #### `k_act`
 - **Type**: `int` | **Default**: `8`
 - **Purpose**: Number of candidate continuous actions per tree node (anchoring the `num_peaks` deterministic peak centers alongside exploratory Gaussian samples during training, and evaluating exact noise-free mode centers during `deterministic=True` evaluation).
 
 #### `c_1` and `c_2`
-- **Type**: `float` | **Default**: `c_1: 2.50`, `c_2: 19652.0`
+- **Type**: `float` | **Default**: `c_1: 1.50`, `c_2: 19652.0`
 - **Purpose**: Hyperparameters governing the polynomial upper confidence bound (pUCT) exploration bonus:
   $$U(s, a) = P(s, a) \cdot \frac{\sqrt{\sum_b N(s, b)}}{1 + N(s, a)} \cdot \left(c_1 + \log\left(\frac{\sum_b N(s, b) + c_2 + 1}{c_2}\right)\right)$$
 
@@ -220,9 +209,9 @@ Exploration in LA-MCTS is dynamically annealed using the environment's **rolling
 - **Type**: `float` | **Default**: `root_tau_beta: 1.0`, `inner_tau_beta: 0.8`
 - **Purpose**: Softmax/proposal temperature applied when sampling continuous actions from the GMM actor at the root node (`1.0`) vs. interior tree nodes (`0.8`).
 
-#### `root_dirichlet_alpha`, `root_exploration_fraction`, `root_exploration_fraction_end`, and `root_exploration_fraction_decay_constant`
-- **Type**: `float` | **Default**: `root_dirichlet_alpha: 0.03`, `root_exploration_fraction: 0.75`, `root_exploration_fraction_end: 0.12`, `root_exploration_fraction_decay_constant: 0.999996`
-- **Purpose**: Injects Dirichlet noise $\text{Dir}(\alpha)$ into the root node policy prior, decaying exponentially with environment steps taken as $\text{clip}(\text{root\_exploration\_fraction} \cdot \gamma_{\text{decay}}^{\text{steps}}, \text{root\_exploration\_fraction\_end}, \text{root\_exploration\_fraction})$ rather than return progress.
+#### `root_dirichlet_alpha`, `root_exploration_fraction`, and `root_exploration_fraction_end`
+- **Type**: `float` | **Default**: `root_dirichlet_alpha: 0.35`, `root_exploration_fraction: 0.40`, `root_exploration_fraction_end: 0.12`
+- **Purpose**: Injects Dirichlet noise $\text{Dir}(\alpha)$ into the root node policy prior, with mixing fraction $\epsilon$ annealing linearly from `0.40` (at `0` return) down to `0.12` (at `3000` rolling raw return).
 
 #### `tau_act_train`, `tau_act_train_end`, and `tau_act_eval`
 - **Type**: `float` | **Default**: `tau_act_train: 1.0`, `tau_act_train_end: 0.15`, `tau_act_eval: 0.05`
@@ -237,17 +226,17 @@ Exploration in LA-MCTS is dynamically annealed using the environment's **rolling
   - When `adaptive_exploration: true` and the actor's current std drops below the annealed target, MCTS temperatures are boosted up to `exploration_boost_max` (`2.75`, softening as exploration progress approaches `1.0`).
 
 #### Structured Exploration & Pre-Conditioning (`needle.md` Points A–D)
-- **`latent_noise_std` / `latent_noise_std_end`** (`0.25` $\to$ `0.03`, Point A): Scale of temporally correlated OU perturbation $\delta_z$ added to the shared root latent representation (`min_max_normalize(z_cum + delta_z)`) seen by Network 2 (while Critic and dynamics keep clean $z$), so all limbs explore coherent whole-body intentions simultaneously.
-- **`mode_hold_steps` / `mode_commitment_prob`** (`8` $\to$ `1` steps / `0.70` $\to$ `0.0`, Point B): Holds the active global latent intention $\delta_z$ and (in `"gmm"`) committed GMM peak or (in `"deterministic"`) sustained action-space exploratory vector for `mode_hold_steps`, letting MuJoCo physics accumulate torso momentum across steps.
+- **`latent_noise_std` / `latent_noise_std_end`** (`0.08` $\to$ `0.0`, Point A): Scale of temporally correlated OU perturbation $\delta_z$ added to the shared root latent representation (`min_max_normalize(z_cum + delta_z)`) seen by `MorphologicalLimbHead` (while Critic and dynamics keep clean $z$), so all limbs explore coherent whole-body intentions simultaneously.
+- **`mode_hold_steps` / `mode_commitment_prob`** (`8` $\to$ `1` steps / `0.70` $\to$ `0.0`, Point B): Holds the active global latent intention $\delta_z$ and biases MCTS root candidate sampling toward the committed GMM peak for `mode_hold_steps`, letting MuJoCo physics accumulate torso momentum across steps.
 - **`lambda_peak_ent` / `lambda_peak_ent_end` / `peak_entropy_floor_ratio`** (`0.15` $\to$ `0.02`, floor `0.70` $\to$ `0.0` of $\log M$, Point C): Decaying categorical entropy regularization and entropy floor on the GMM mixture weights $H(\pi)$ across all unroll steps, keeping distribution modes alive without inflating per-joint Gaussian variance.
-- **`critic_warmup_steps`** (`25000`, Point D): Transitions over which Critic and World Model train at full weight while actor policy anchor (`lambda_p`), DPG weight (`lambda_dpg`), and MCTS Q-advantage weight ramp from `0.15` to `1.0`.
+- **`critic_warmup_steps`** (`5000`, Point D): Transitions over which Critic and World Model train at full weight while actor policy cross-entropy (`lambda_p`) and MCTS Q-advantage weight ramp from `0.15` to `1.0`.
 
 ---
 
 ### 1.6 Replay Buffer & MuZero Reanalyze
 
 #### `lr`
-- **Type**: `float` | **Default**: `0.00009` ($9 \times 10^{-5}$)
+- **Type**: `float` | **Default**: `0.00018` ($1.8 \times 10^{-4}$)
 - **Purpose**: AdamW optimizer learning rate for the Agent networks (Transformer representation, dynamics, value critic, and policy prior).
 
 #### `batch_size`
@@ -358,11 +347,10 @@ Exploration in LA-MCTS is dynamically annealed using the environment's **rolling
 
 ## 3. Ant Morphology Environment (`ant_morph`)
 
-#### `env_id`, `use_contact_forces`, `use_real_returns`, `max_episode_steps`, `xml_rebuild_threshold`, `healthy_z_range`, `max_action_capacity`, `default_num_legs`
+#### `env_id`, `use_contact_forces`, `max_episode_steps`, `xml_rebuild_threshold`, `healthy_z_range`, `max_action_capacity`, `default_num_legs`
 - **Defaults**:
   - `env_id: "Ant-v5"`
   - `use_contact_forces: false`
-  - `use_real_returns: true` (when `true`, bypasses all training-only reward shaping from step 1 so `agent_reward == raw_env_reward`, while keeping `exploration_progress` velocity-gated until forward locomotion develops)
   - `max_episode_steps: 1000`
   - `xml_rebuild_threshold: 1.0`
   - `healthy_z_range: [0.2, 1.0]`
@@ -370,18 +358,16 @@ Exploration in LA-MCTS is dynamically annealed using the environment's **rolling
   - `default_num_legs: 4`
 
 #### `action_ema_alpha` and `action_smoothness_coef`
-- **Type**: `float` | **Default**: `action_ema_alpha: 0.75`, `action_smoothness_coef: 0.05`
+- **Type**: `float` | **Default**: `action_ema_alpha: 0.35`, `action_smoothness_coef: 0.05`
 - **Purpose**:
   - `action_ema_alpha`: Initial exponential moving average action filter weight ($a_t^{\text{env}} = \alpha_{\text{ema}} a_t + (1 - \alpha_{\text{ema}}) a_{t-1}^{\text{env}}$). Interpolates linearly from `action_ema_alpha` to `1.0` (unfiltered agility) as `current_return` progresses from `0` to `torque_return_ref` (`1000.0`).
   - `action_smoothness_coef`: Penalty weight on squared action changes $\|a_t - a_{t-1}\|_2^2$. Scaled by $(1 - \alpha_{\text{torque}})$ so the smoothness penalty vanishes completely once `current_return` reaches `torque_return_ref` (`1000.0`).
 
-#### `torque_return_ref`, `exploration_return_ref`, `ctrl_start_return_ref`, `ctrl_return_ref`, `forward_return_ref`, and Shaping Penalties
-- **Defaults**:
-  - `forward_reward_weight: 3.0` $\to$ `1.0` over `0 -> forward_return_ref` (`5000.0`).
-  - `ctrl_cost_weight: 0.0` held until `ctrl_start_return_ref` (`1000.0`), then ramping linearly to `0.5` at `ctrl_return_ref` (`3500.0`).
-  - `min_healthy_vel: 0.10`, `stationary_penalty_coef: 0.25`, `stationary_vel_window: 10`: Velocity-gated healthy reward and anti-stationary penalty over a responsive 10-step (`0.5s`) window.
-  - `min_joint_vel: 0.60`, `joint_vel_penalty_coef: 0.35`, `joint_vel_start_return_ref: 1000.0`, `joint_vel_end_return_ref: 3000.0`: Per-joint minimum angular speed (`|qvel| >= 0.60` rad/s across all active hip and ankle joints) held at `1.0` scale up to `1000` return and blending linearly to `0.0` at `3000` return.
-  - `pure_velocity_reward_mode: true`, `pure_vel_start_return_ref: 1000.0`, `pure_vel_end_return_ref: 3000.0`: When enabled, the training agent receives solely $w_{\text{fwd}} \cdot \max(0.0, v_x)$ (with `0.0` for negative velocity and no other reward or penalty terms) up to `1000` rolling-20 raw return, then blends linearly into `raw_env_reward` until reaching 100% `raw_env_reward` at `3000` raw return.
+#### `torque_return_ref` and `exploration_return_ref`
+- **Type**: `float` | **Default**: `torque_return_ref: 1000.0`, `exploration_return_ref: 3000.0`
+- **Purpose**: Reference thresholds for the **rolling 20-episode raw environment return** curriculum (`self._recent_ep_returns`, recorded across full 1,000-step healthy episodes with negative returns clamped to `0.0`):
+  - **`torque_return_ref: 1000.0`**: Scales $\alpha_{\text{torque}} = \text{clip}(\text{current\_return} / 1000.0, 0.0, 1.0)$ from `0` to `1000` return, reducing the smoothness penalty to `0` and opening `action_ema_alpha` to `1.0`.
+  - **`exploration_return_ref: 3000.0`**: Scales $\alpha_{\text{explore}} = \text{clip}(\text{current\_return} / 3000.0, 0.0, 1.0)$ from `0` to `3000` return, annealing MCTS action temperature (`tau_act_train`), Dirichlet noise (`root_exploration_fraction`), policy std target (`min_policy_std_target`), Balancer noise, and Tweaker entropy bonus.
 
 #### `vel_shift_factor`
 - **Type**: `float` | **Default**: `3000.0`

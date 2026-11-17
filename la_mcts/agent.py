@@ -15,12 +15,7 @@ import torch.optim as optim
 from brl_core.interfaces import AbstractBRLSolverAgent
 from config import LAMCTSConfig
 from la_mcts.backbone import SelfAttentionBackbone, combine_cumulative_rep, min_max_normalize
-from la_mcts.gmm_heads import (
-    DeterministicActorHead,
-    MultiPeakGMMActorHead,
-    SupportCriticHead,
-    compute_gait_phase,
-)
+from la_mcts.gmm_heads import MultiPeakGMMActorHead, SupportCriticHead
 from la_mcts.rep_trainer import ModelRepresentationTrainer
 from la_mcts.sampled_mcts import SampledContinuousMCTS
 
@@ -280,22 +275,13 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             max_action_dim=self.cfg.max_action_dim,
         ).to(self.device)
 
-        actor_type = str(getattr(self.cfg, "actor_type", "deterministic")).lower()
-        joints_per_limb = 2 if self.cfg.obs_dim <= 35 else None
-        if actor_type == "gmm":
-            self.actor_head: MultiPeakGMMActorHead | DeterministicActorHead = MultiPeakGMMActorHead(
-                latent_dim=self.cfg.latent_dim,
-                action_dim=self.cfg.max_action_dim,
-                num_peaks=self.cfg.num_peaks,
-                log_std_bounds=self.cfg.log_std_bounds,
-                joints_per_limb=joints_per_limb,
-            ).to(self.device)
-        else:
-            self.actor_head = DeterministicActorHead(
-                latent_dim=self.cfg.latent_dim,
-                action_dim=self.cfg.max_action_dim,
-                joints_per_limb=joints_per_limb,
-            ).to(self.device)
+        self.actor_head = MultiPeakGMMActorHead(
+            latent_dim=self.cfg.latent_dim,
+            action_dim=self.cfg.max_action_dim,
+            num_peaks=self.cfg.num_peaks,
+            log_std_bounds=self.cfg.log_std_bounds,
+            joints_per_limb=(2 if self.cfg.obs_dim <= 35 else None),
+        ).to(self.device)
 
         self.critic_head = SupportCriticHead(
             latent_dim=self.cfg.latent_dim,
@@ -378,10 +364,8 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         self._last_mcts_info: Optional[Tuple[np.ndarray, np.ndarray, float]] = None
         self._last_limb_kinematics: Optional[np.ndarray] = None
         self._latent_noise_unit: Optional[torch.Tensor] = None
-        self._det_explore_noise: Optional[torch.Tensor] = None
         self._committed_peak: Optional[int] = None
         self._mode_hold_remaining: int = 0
-        self._episode_step: int = 0
         self.total_transitions_observed: int = 0
         self.exploration_progress: float = 0.0
         self._diagnostics: Dict[str, float] = {
@@ -396,10 +380,10 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             "exploration_progress": 0.0,
             "effective_std_target": float(self.cfg.min_policy_std_target),
             "effective_tau_act": float(self.cfg.tau_act_train),
-            "effective_latent_noise_std": float(getattr(self.cfg, "latent_noise_std", 0.25)),
+            "effective_latent_noise_std": float(getattr(self.cfg, "latent_noise_std", 0.08)),
             "effective_lambda_peak_ent": float(getattr(self.cfg, "lambda_peak_ent", 0.15)),
             "critic_warmup_scale": (
-                1.0 if int(getattr(self.cfg, "critic_warmup_steps", 25000)) <= 0 else 0.15
+                1.0 if int(getattr(self.cfg, "critic_warmup_steps", 5000)) <= 0 else 0.15
             ),
         }
 
@@ -425,23 +409,10 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         return float(start + self.exploration_progress * (end - start))
 
     def get_current_root_exploration_fraction(self) -> float:
-        """Returns step-decayed MCTS root Dirichlet noise fraction clipped at root_exploration_fraction_end."""
+        """Returns the annealed MCTS root Dirichlet noise fraction."""
         start = float(self.cfg.root_exploration_fraction)
         end = float(getattr(self.cfg, "root_exploration_fraction_end", start))
-        decay = float(
-            getattr(self.cfg, "root_exploration_fraction_decay_constant", 0.999996)
-        )
-        steps_taken = max(
-            0,
-            max(int(self.total_transitions_observed), int(self.replay_buffer.total_steps)),
-        )
-        if decay <= 0.0:
-            decayed = start if steps_taken == 0 else 0.0
-        else:
-            decayed = start * (decay ** steps_taken)
-        low = min(start, end)
-        high = max(start, end)
-        return float(np.clip(decayed, low, high))
+        return float(start + self.exploration_progress * (end - start))
 
     def get_current_latent_noise_std(self) -> float:
         """Returns annealed global latent exploration std in z-space (Point A)."""
@@ -491,17 +462,6 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         """Returns Q-advantage sharpening weight in MCTS policy selection scaled by critic warmup (Point D)."""
         return float(4.0 * self.get_critic_warmup_scale())
 
-    def get_current_action_explore_std(self) -> float:
-        """Returns annealed exploratory action noise std around deterministic proposals."""
-        start = float(getattr(self.cfg, "action_explore_std", 0.12))
-        end = float(getattr(self.cfg, "action_explore_std_end", 0.02))
-        return float(max(0.0, start + self.exploration_progress * (end - start)))
-
-    def get_current_lambda_dpg(self) -> float:
-        """Returns DPG weight gated by critic/world-model warmup (Point D)."""
-        base = float(getattr(self.cfg, "lambda_dpg", 0.50))
-        return float(max(0.0, base * self.get_critic_warmup_scale()))
-
     def _refresh_latent_noise(self, rho: float = 0.5) -> None:
         """Updates temporally correlated unit-scale latent noise direction in z-space (Point A)."""
         eps = torch.randn(self.cfg.latent_dim, device=self.device, dtype=torch.float32)
@@ -510,15 +470,6 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         else:
             blend = math.sqrt(max(0.0, 1.0 - rho * rho))
             self._latent_noise_unit = rho * self._latent_noise_unit + blend * eps
-
-    def _refresh_det_explore_noise(self, rho: float = 0.5) -> None:
-        """Updates temporally correlated unit-scale action exploration vector held over mode_hold_steps."""
-        eps = torch.randn(self.cfg.max_action_dim, device=self.device, dtype=torch.float32)
-        if self._det_explore_noise is None:
-            self._det_explore_noise = eps
-        else:
-            blend = math.sqrt(max(0.0, 1.0 - rho * rho))
-            self._det_explore_noise = rho * self._det_explore_noise + blend * eps
 
     def _get_actor_latent_root(
         self,
@@ -560,10 +511,8 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         self._running_prev_cum = None
         self._pending_history_step = None
         self._latent_noise_unit = None
-        self._det_explore_noise = None
         self._committed_peak = None
         self._mode_hold_remaining = 0
-        self._episode_step = 0
         self.current_trajectory.context = self.current_context.copy()
         self.current_trajectory.action_mask = self.current_action_mask.copy()
         self.current_trajectory.limb_kinematics = (
@@ -651,19 +600,14 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 q_adv_weight = 4.0
                 eff_hold_steps = 1
                 starting_new_window = False
-                eff_lat_noise = 0.0
-                eff_act_noise = 0.0
-                held_act_noise_in = None
             else:
                 eff_hold_steps = self.get_current_mode_hold_steps()
                 eff_commit_prob = self.get_current_mode_commitment_prob()
-                is_det_head = bool(getattr(self.actor_head, "is_deterministic", False))
                 starting_new_window = (
                     self._mode_hold_remaining <= 0 or self._committed_peak is None
                 )
                 if starting_new_window:
                     self._refresh_latent_noise(rho=0.5)
-                    self._refresh_det_explore_noise(rho=0.5)
                     commit_peak_in = None
                     commit_prob_in = 0.0
                 else:
@@ -677,7 +621,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 base_tau_act = self.get_current_tau_act_train()
                 base_root_exp = self.get_current_root_exploration_fraction()
                 explore_scale = 1.0
-                if self.cfg.adaptive_exploration and not is_det_head:
+                if self.cfg.adaptive_exploration:
                     cur_std = float(
                         self._diagnostics.get("policy_std", std_target)
                     )
@@ -691,26 +635,18 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                             max(1.0, boost_cap),
                         )
                     )
-                eff_lat_noise = self.get_current_latent_noise_std()
-                eff_act_noise = self.get_current_action_explore_std()
-                held_act_noise_in = self._det_explore_noise if is_det_head else None
                 self._diagnostics["exploration_scale"] = explore_scale
                 self._diagnostics["effective_std_target"] = std_target
-                self._diagnostics["effective_latent_noise_std"] = eff_lat_noise
+                self._diagnostics["effective_latent_noise_std"] = (
+                    self.get_current_latent_noise_std()
+                )
                 self._diagnostics["critic_warmup_scale"] = self.get_critic_warmup_scale()
                 tau_act = base_tau_act * explore_scale
                 self._diagnostics["effective_tau_act"] = tau_act
-                self._diagnostics["effective_root_exploration_fraction"] = base_root_exp
                 root_tau_beta = self.cfg.root_tau_beta * explore_scale
-                root_exp_cap = min(1.0, max(0.65, base_root_exp))
-                root_exp_frac = min(root_exp_cap, base_root_exp * explore_scale)
+                root_exp_frac = min(0.65, base_root_exp * explore_scale)
                 q_adv_weight = self.get_current_q_advantage_weight()
 
-            use_phase = (
-                bool(getattr(self.cfg, "use_gait_phase", True))
-                and int(getattr(self.cfg, "gait_phase_period", 0)) > 0
-            )
-            gait_period = max(1, int(getattr(self.cfg, "gait_phase_period", 20)))
             chosen_action, policy_weights, root_samples, root_value, root_node = (
                 self.mcts.search(
                     z_root,
@@ -726,14 +662,8 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     committed_peak=commit_peak_in,
                     mode_commitment_prob=commit_prob_in,
                     q_advantage_weight=q_adv_weight,
-                    latent_noise_std=eff_lat_noise,
-                    action_noise_std=eff_act_noise,
-                    held_action_noise=held_act_noise_in,
-                    phase_step=(self._episode_step if use_phase else None),
-                    gait_period_steps=gait_period,
                 )
             )
-            self._episode_step += 1
             if not deterministic:
                 chosen_peak = getattr(root_node, "chosen_peak", None)
                 if eff_hold_steps <= 1:
@@ -849,10 +779,6 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             if step_kin is not None
             else None
         )
-        if "limb_kinematics" in info and info["limb_kinematics"] is not None:
-            self.current_limb_kinematics = np.asarray(
-                info["limb_kinematics"], dtype=np.float32
-            ).copy()
         self._last_mcts_info = None
         self._last_limb_kinematics = None
 
@@ -867,10 +793,8 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             self._running_prev_cum = None
             self._pending_history_step = None
             self._latent_noise_unit = None
-            self._det_explore_noise = None
             self._committed_peak = None
             self._mode_hold_remaining = 0
-            self._episode_step = 0
             self.current_trajectory = EpisodeTrajectory(
                 context=self.current_context.copy(),
                 action_mask=self.current_action_mask.copy(),
@@ -928,19 +852,6 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     ctx_t, hist_t, alpha=ema_decay
                 )
                 prev_cum_root = prev_cum_t.squeeze(0) if prev_cum_t is not None else None
-                use_phase = (
-                    bool(getattr(self.cfg, "use_gait_phase", True))
-                    and int(getattr(self.cfg, "gait_phase_period", 0)) > 0
-                )
-                gait_period = max(1, int(getattr(self.cfg, "gait_phase_period", 20)))
-                is_det_head = bool(getattr(self.actor_head, "is_deterministic", False))
-                held_reanalyze_noise = (
-                    torch.randn(
-                        self.cfg.max_action_dim, device=self.device, dtype=torch.float32
-                    )
-                    if is_det_head
-                    else None
-                )
                 _, policy_weights, root_samples, root_value, _ = self.mcts.search(
                     z_root,
                     deterministic=False,
@@ -951,11 +862,6 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     root_exploration_fraction=self.get_current_root_exploration_fraction(),
                     prev_cum_state=prev_cum_root,
                     q_advantage_weight=self.get_current_q_advantage_weight(),
-                    latent_noise_std=self.get_current_latent_noise_std(),
-                    action_noise_std=self.get_current_action_explore_std(),
-                    held_action_noise=held_reanalyze_noise,
-                    phase_step=(step if use_phase else None),
-                    gait_period_steps=gait_period,
                 )
                 traj.mcts_policy_samples[step] = root_samples
                 traj.mcts_policy_weights[step] = policy_weights
@@ -1135,32 +1041,6 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         self._diagnostics["critic_warmup_scale"] = warmup_scale
         self._diagnostics["effective_lambda_peak_ent"] = eff_lambda_peak_ent
 
-        use_phase = (
-            bool(getattr(self.cfg, "use_gait_phase", True))
-            and int(getattr(self.cfg, "gait_phase_period", 0)) > 0
-        )
-        gait_period = max(1, int(getattr(self.cfg, "gait_phase_period", 20)))
-        dpg_horizon = max(1, int(getattr(self.cfg, "dpg_horizon", 4)))
-        if use_phase:
-            max_phase_steps = max(self.cfg.unroll_steps + 1, dpg_horizon)
-            start_steps_t = torch.tensor(
-                [s for (_, s) in refs], device=self.device, dtype=torch.float32
-            ).unsqueeze(1)
-            offsets_t = torch.arange(
-                max_phase_steps, device=self.device, dtype=torch.float32
-            ).unsqueeze(0)
-            phase_seq = compute_gait_phase(
-                start_steps_t + offsets_t,
-                period_steps=gait_period,
-                device=self.device,
-                dtype=torch.float32,
-            )
-            unroll_phase_seq = phase_seq[:, : self.cfg.unroll_steps + 1]
-            dpg_phase_seq = phase_seq[:, :dpg_horizon]
-        else:
-            unroll_phase_seq = None
-            dpg_phase_seq = None
-
         self.optimizer.zero_grad()
         total_loss, metrics = self.rep_trainer.compute_unrolled_loss(
             obs_seq=obs_seq,
@@ -1189,54 +1069,8 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             peak_entropy_floor_ratio=eff_peak_floor_ratio,
             lambda_peak_sep=eff_lambda_peak_sep,
             min_peak_separation=eff_min_peak_sep,
-            phase_seq=unroll_phase_seq,
         )
         total_loss.backward()
-        eff_lambda_dpg = self.get_current_lambda_dpg()
-        if eff_lambda_dpg > 0.0 and self.rep_trainer._last_root_latents is not None:
-            actor_params = [p for p in self.actor_head.parameters() if p.requires_grad]
-            g_before = [
-                p.grad.detach().clone() if p.grad is not None else torch.zeros_like(p)
-                for p in actor_params
-            ]
-            p_grad_norm = float(
-                torch.sqrt(
-                    sum((g.pow(2).sum() for g in g_before), torch.tensor(0.0, device=self.device))
-                    + 1e-12
-                ).item()
-            )
-            z_0_det, cum_0_det = self.rep_trainer._last_root_latents
-            loss_dpg, dpg_metrics = self.rep_trainer.compute_deterministic_policy_loss(
-                z_0=z_0_det,
-                cum_0=cum_0_det,
-                actor_head=self.actor_head,
-                critic_head=self.critic_head,
-                action_mask=mask_batch,
-                limb_kinematics=kin_batch,
-                gamma=self.cfg.gamma,
-                dpg_horizon=dpg_horizon,
-                lambda_dpg=eff_lambda_dpg,
-                phase_seq=dpg_phase_seq,
-            )
-            loss_dpg.backward()
-            g_dpg = [
-                (p.grad.detach() - gb) if p.grad is not None else torch.zeros_like(gb)
-                for p, gb in zip(actor_params, g_before)
-            ]
-            dpg_grad_norm = float(
-                torch.sqrt(
-                    sum((gd.pow(2).sum() for gd in g_dpg), torch.tensor(0.0, device=self.device))
-                    + 1e-12
-                ).item()
-            )
-            max_dpg_norm = 0.25 * max(p_grad_norm, 1e-3)
-            if dpg_grad_norm > max_dpg_norm and dpg_grad_norm > 0.0:
-                scale_dpg = max_dpg_norm / dpg_grad_norm
-                for p, gb, gd in zip(actor_params, g_before, g_dpg):
-                    if p.grad is not None:
-                        p.grad.copy_(gb + scale_dpg * gd)
-            metrics.update(dpg_metrics)
-
         torch.nn.utils.clip_grad_norm_(
             list(self.backbone.parameters())
             + list(self.actor_head.parameters())
@@ -1284,50 +1118,6 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     actor_state[w_key] = torch.nn.functional.pad(
                         saved_w, (0, pad_cols)
                     )
-            if (
-                "limb_head.z_film.weight" not in actor_state
-                and hasattr(self.actor_head, "limb_head")
-                and hasattr(self.actor_head.limb_head, "z_film")
-            ):
-                actor_state["limb_head.z_film.weight"] = torch.zeros_like(
-                    self.actor_head.limb_head.z_film.weight
-                )
-                actor_state["limb_head.z_film.bias"] = torch.zeros_like(
-                    self.actor_head.limb_head.z_film.bias
-                )
-            if (
-                "limb_head.phase_film.weight" not in actor_state
-                and hasattr(self.actor_head, "limb_head")
-                and hasattr(self.actor_head.limb_head, "phase_film")
-            ):
-                actor_state["limb_head.phase_film.weight"] = torch.zeros_like(
-                    self.actor_head.limb_head.phase_film.weight
-                )
-                actor_state["limb_head.phase_film.bias"] = torch.zeros_like(
-                    self.actor_head.limb_head.phase_film.bias
-                )
-            elif (
-                "limb_head.phase_film.weight" in actor_state
-                and hasattr(self.actor_head, "limb_head")
-                and hasattr(self.actor_head.limb_head, "phase_film")
-            ):
-                saved_pf = actor_state["limb_head.phase_film.weight"]
-                cur_pf = self.actor_head.limb_head.phase_film.weight
-                if saved_pf.shape[1] < cur_pf.shape[1]:
-                    actor_state["limb_head.phase_film.weight"] = torch.nn.functional.pad(
-                        saved_pf, (0, cur_pf.shape[1] - saved_pf.shape[1])
-                    )
-            if (
-                "limb_head.limb_osc_proj.weight" not in actor_state
-                and hasattr(self.actor_head, "limb_head")
-                and hasattr(self.actor_head.limb_head, "limb_osc_proj")
-            ):
-                actor_state["limb_head.limb_osc_proj.weight"] = torch.zeros_like(
-                    self.actor_head.limb_head.limb_osc_proj.weight
-                )
-                actor_state["limb_head.limb_osc_proj.bias"] = torch.zeros_like(
-                    self.actor_head.limb_head.limb_osc_proj.bias
-                )
             self.actor_head.load_state_dict(actor_state)
         if "critic_head" in state:
             self.critic_head.load_state_dict(state["critic_head"])

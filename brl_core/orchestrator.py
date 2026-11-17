@@ -83,16 +83,9 @@ class BRLTrainingOrchestrator:
             exp_progress = float(self.env.get_reward_blend_alpha())
         else:
             exp_progress = 0.0
-        use_real_returns = bool(
-            getattr(getattr(self.cfg, "ant_morph", None), "use_real_returns", False)
-        )
-        eff_exp_progress = exp_progress
-        if use_real_returns:
-            vel_gate = float(np.clip(self.mean_x_vel / 0.15, 0.0, 1.0))
-            eff_exp_progress = exp_progress * vel_gate
         if hasattr(self.agent, "set_exploration_progress"):
-            self.agent.set_exploration_progress(eff_exp_progress)
-        self.tweaker.exploration_progress = float(np.clip(eff_exp_progress, 0.0, 1.0))
+            self.agent.set_exploration_progress(exp_progress)
+        self.tweaker.exploration_progress = float(np.clip(exp_progress, 0.0, 1.0))
 
         bal_state = self.balancer.build_state(
             ema_win_rate=self.win_evaluator.ema_win_rate,
@@ -103,7 +96,7 @@ class BRLTrainingOrchestrator:
             state=bal_state,
             warmup=is_warmup,
             deterministic=is_consolidation,
-            exploration_progress=eff_exp_progress,
+            exploration_progress=exp_progress,
             ema_win_rate=self.win_evaluator.ema_win_rate,
         )
 
@@ -158,22 +151,15 @@ class BRLTrainingOrchestrator:
             )
             next_obs, reward, terminated, truncated, info = self.env.step(action)
             if "exploration_progress" in info and hasattr(self.agent, "set_exploration_progress"):
-                step_exp = float(info["exploration_progress"])
-                if use_real_returns:
-                    step_exp *= float(np.clip(self.mean_x_vel / 0.15, 0.0, 1.0))
-                self.agent.set_exploration_progress(step_exp)
+                self.agent.set_exploration_progress(float(info["exploration_progress"]))
             elif "reward_blend_alpha" in info and hasattr(self.agent, "set_exploration_progress"):
-                step_exp = float(info["reward_blend_alpha"])
-                if use_real_returns:
-                    step_exp *= float(np.clip(self.mean_x_vel / 0.15, 0.0, 1.0))
-                self.agent.set_exploration_progress(step_exp)
-            raw_step_reward = float(info.get("raw_env_reward", reward))
-            agent_step_reward = raw_step_reward if use_real_returns else float(reward)
+                self.agent.set_exploration_progress(float(info["reward_blend_alpha"]))
             self.agent.observe_transition(
-                obs, action, agent_step_reward, next_obs, terminated, truncated, info
+                obs, action, float(reward), next_obs, terminated, truncated, info
             )
+            raw_step_reward = float(info.get("raw_env_reward", reward))
             ep_return += raw_step_reward
-            agent_ep_return += agent_step_reward
+            agent_ep_return += float(reward)
             steps += 1
             obs = next_obs
             last_info = info
@@ -257,12 +243,9 @@ class BRLTrainingOrchestrator:
             end_exp_progress = float(self.env.get_reward_blend_alpha())
         else:
             end_exp_progress = exp_progress
-        end_eff_exp_progress = end_exp_progress
-        if use_real_returns:
-            end_eff_exp_progress = end_exp_progress * float(np.clip(self.mean_x_vel / 0.15, 0.0, 1.0))
         if hasattr(self.agent, "set_exploration_progress"):
-            self.agent.set_exploration_progress(end_eff_exp_progress)
-        self.tweaker.exploration_progress = float(np.clip(end_eff_exp_progress, 0.0, 1.0))
+            self.agent.set_exploration_progress(end_exp_progress)
+        self.tweaker.exploration_progress = float(np.clip(end_exp_progress, 0.0, 1.0))
 
         # 6. Update Tweaker and Balancer
         twk_reward = self.tweaker.record_episode(
@@ -279,7 +262,7 @@ class BRLTrainingOrchestrator:
             value=twk_val,
         )
         twk_metrics = self.tweaker.update(
-            ppo_epochs=2, exploration_progress=end_eff_exp_progress
+            ppo_epochs=2, exploration_progress=end_exp_progress
         )
 
         bal_reward = self.balancer.compute_reward(

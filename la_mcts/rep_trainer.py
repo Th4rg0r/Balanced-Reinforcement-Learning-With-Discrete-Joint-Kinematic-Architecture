@@ -9,11 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from la_mcts.backbone import min_max_normalize, SelfAttentionBackbone, combine_cumulative_rep
-from la_mcts.gmm_heads import (
-    DeterministicActorHead,
-    MultiPeakGMMActorHead,
-    SupportCriticHead,
-)
+from la_mcts.gmm_heads import MultiPeakGMMActorHead, SupportCriticHead
 
 
 class SimSiamConsistencyHead(nn.Module):
@@ -129,8 +125,6 @@ class ModelRepresentationTrainer(nn.Module):
             pred_dim=pred_dim,
             beta_mse=beta_mse,
         )
-        self._dpg_q_scale: float = 1.0
-        self._last_root_latents: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     def _align_action_dim(self, action: torch.Tensor) -> torch.Tensor:
         cur_dim = action.shape[-1]
@@ -183,7 +177,7 @@ class ModelRepresentationTrainer(nn.Module):
         mcts_policy_samples: torch.Tensor,
         mcts_policy_weights: torch.Tensor,
         backbone: SelfAttentionBackbone,
-        actor_head: MultiPeakGMMActorHead | DeterministicActorHead,
+        actor_head: MultiPeakGMMActorHead,
         critic_head: SupportCriticHead,
         context: Optional[torch.Tensor] = None,
         history: Optional[torch.Tensor] = None,
@@ -202,7 +196,6 @@ class ModelRepresentationTrainer(nn.Module):
         peak_entropy_floor_ratio: float = 0.70,
         lambda_peak_sep: float = 0.25,
         min_peak_separation: float = 0.40,
-        phase_seq: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Computes K-step unrolled total loss with SimSiam representation consistency.
 
@@ -224,7 +217,6 @@ class ModelRepresentationTrainer(nn.Module):
             context, hist_0, alpha=self.latent_ema_decay
         )
         cum_hat = combine_cumulative_rep(z_hat, prev_cum_0, alpha=self.latent_ema_decay)
-        self._last_root_latents = (z_hat.detach(), cum_hat.detach())
 
         # Encode k = 1..K target representations under no_grad using target_backbone when provided
         z_target_seq: Optional[torch.Tensor] = None
@@ -314,202 +306,6 @@ class ModelRepresentationTrainer(nn.Module):
         samples_flat = mcts_policy_samples[:, :n_steps].reshape(
             bsz * n_steps, mcts_policy_samples.size(2), mcts_policy_samples.size(3)
         )
-        weights_seq = mcts_policy_weights[:, :n_steps]
-        is_det_actor = bool(getattr(actor_head, "is_deterministic", False))
-
-        if is_det_actor:
-            phase_flat = None
-            if phase_seq is not None:
-                if phase_seq.dim() == 3:
-                    phase_flat = phase_seq[:, :n_steps].reshape(bsz * n_steps, -1)
-                elif phase_seq.dim() == 2:
-                    phase_flat = (
-                        phase_seq.unsqueeze(1)
-                        .expand(bsz, n_steps, phase_seq.size(-1))
-                        .reshape(bsz * n_steps, -1)
-                    )
-                else:
-                    phase_flat = phase_seq
-            # Evaluate deterministic actor on detached REAL closed-loop latent sequence (obs_seq[:, 0..K])
-            # rather than collapsing open-loop dynamics predictions (cum_hat), preventing world-model
-            # distortion and ensuring loss_p_osc measures genuine closed-loop temporal variation.
-            with torch.no_grad():
-                cum_real_list = [cum_seq[:, 0].detach()]
-                cur_real_cum = cum_seq[:, 0].detach()
-                for k_step in range(1, n_steps):
-                    hist_k = (
-                        history[:, k_step, :]
-                        if (history is not None and history.dim() == 3)
-                        else history
-                    )
-                    z_real_k = backbone(obs_seq[:, k_step], context=context, history=hist_k)
-                    cur_real_cum = combine_cumulative_rep(
-                        z_real_k, cur_real_cum, alpha=self.latent_ema_decay
-                    )
-                    cum_real_list.append(cur_real_cum)
-                cum_actor_flat = torch.stack(cum_real_list, dim=1).reshape(bsz * n_steps, -1).detach()
-
-            a_det_flat, pre_tanh_flat = actor_head(
-                cum_actor_flat,
-                limb_kinematics=kin_flat,
-                action_mask=mask_flat,
-                return_pre_tanh=True,
-                phase=phase_flat,
-            )
-            a_det_seq = a_det_flat.view(bsz, n_steps, -1)
-            # 1) Strongly sharpened MCTS visit/Q target (pow(4) + top-branch anchor) prevents
-            #    averaging antithetic (+h_delta / -h_delta) and isotropic noise back to zero
-            w_sharp = weights_seq.pow(4.0)
-            w_sharp = w_sharp / w_sharp.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-            a_bary = torch.sum(
-                w_sharp.unsqueeze(-1) * mcts_policy_samples[:, :n_steps], dim=2
-            )
-            best_idx = (
-                weights_seq.argmax(dim=-1, keepdim=True)
-                .unsqueeze(-1)
-                .expand(bsz, n_steps, 1, mcts_policy_samples.size(-1))
-            )
-            a_best = torch.gather(mcts_policy_samples[:, :n_steps], dim=2, index=best_idx).squeeze(2)
-            a_mcts_target = (0.5 * a_bary + 0.5 * a_best).detach()
-            sq_err = (a_det_seq - a_mcts_target).pow(2)
-            pre_tanh_seq = pre_tanh_flat.view(bsz, n_steps, -1)
-            pre_tanh_pen = (
-                20.0 * F.relu(pre_tanh_seq.abs() - 0.9).pow(2) + 2.0 * pre_tanh_seq.pow(2)
-            )
-            if action_mask is not None:
-                m_seq = action_mask.view(1, 1, -1) if action_mask.dim() == 1 else action_mask.unsqueeze(1)
-                loss_p_mcts = ((sq_err * m_seq).sum(dim=-1) / active_dims).mean(dim=0).sum()
-                pre_tanh_reg = ((pre_tanh_pen * m_seq).sum(dim=-1) / active_dims).mean()
-            else:
-                m_seq = None
-                loss_p_mcts = (sq_err.sum(dim=-1) / active_dims).mean(dim=0).sum()
-                pre_tanh_reg = pre_tanh_pen.mean()
-
-            # 2) Selective Advantage-Weighted Regression (AWR) on top-quantile positive-advantage
-            #    AND above-average immediate-reward steps so AWR does not regress to the mean of random noise
-            n_awr = min(unroll_k, action_seq.size(1), target_value_seq.size(1)) if unroll_k > 0 else 0
-            if n_awr > 0 and action_seq.numel() > 0:
-                with torch.no_grad():
-                    v_pred_seq = critic_head(
-                        cum_actor_flat.view(bsz, n_steps, -1)[:, :n_awr].reshape(bsz * n_awr, -1)
-                    ).view(bsz, n_awr)
-                    adv = target_value_seq[:, :n_awr] - v_pred_seq
-                    adv_scale = adv.std().clamp_min(1e-2)
-                    norm_adv = (adv - adv.mean()) / adv_scale
-                    rew_slice = reward_seq[:, :n_awr]
-                    rew_gate = (rew_slice >= rew_slice.mean()).to(adv.dtype) * (
-                        rew_slice > 0.0
-                    ).to(adv.dtype)
-                    adv_score = F.relu(norm_adv - 0.5) * rew_gate
-                    w_awr = (torch.exp(adv_score.clamp(max=2.5)) - 1.0).clamp(max=4.0)
-                awr_sq = (a_det_seq[:, :n_awr] - action_seq[:, :n_awr]).pow(2)
-                if m_seq is not None:
-                    awr_mse = (awr_sq * m_seq).sum(dim=-1) / active_dims
-                else:
-                    awr_mse = awr_sq.sum(dim=-1) / active_dims
-                loss_p_awr = 1.0 * (w_awr.detach() * awr_mse).mean()
-            else:
-                loss_p_awr = torch.tensor(0.0, device=obs_seq.device, dtype=obs_seq.dtype)
-
-            # 3) Closed-loop temporal oscillation & inter-limb activity balance floor across the window
-            has_temporal_var = (
-                (
-                    phase_seq is not None
-                    and phase_seq.dim() == 3
-                    and float(phase_seq[:, :n_steps].std(dim=1).max().item()) > 1e-3
-                )
-                or float(obs_seq[:, :n_steps].std(dim=1).max().item()) > 1e-3
-            )
-            if n_steps >= 2 and float(min_policy_std_target) > 0.0 and has_temporal_var:
-                osc_target = min(0.20, max(0.0, float(min_policy_std_target) * 0.90))
-                temp_std = torch.sqrt(a_det_seq.var(dim=1, unbiased=False) + 1e-6)
-                step_da = (a_det_seq[:, 1:, :] - a_det_seq[:, :-1, :]).abs().mean(dim=1)
-                temp_mean_abs = a_det_seq.mean(dim=1).abs()
-                dc_bias_pen = F.relu(temp_mean_abs - 0.25).pow(2)
-                if m_seq is not None:
-                    m_2d = m_seq.squeeze(1)
-                    max_j_std = (temp_std * m_2d).max(dim=-1, keepdim=True)[0].detach()
-                else:
-                    m_2d = None
-                    max_j_std = temp_std.max(dim=-1, keepdim=True)[0].detach()
-                # Penalize any limb/joint that stays stationary while 1-2 legs move
-                balance_shortfall = F.relu(0.75 * max_j_std - temp_std).pow(2)
-                osc_shortfall = (
-                    F.relu(osc_target - temp_std).pow(2)
-                    + F.relu(0.80 * osc_target - step_da).pow(2)
-                    + 1.5 * balance_shortfall
-                    + 0.75 * dc_bias_pen
-                )
-                if m_2d is not None:
-                    base_osc = ((osc_shortfall * m_2d).sum(dim=-1) / active_dims).mean()
-                else:
-                    base_osc = (osc_shortfall.sum(dim=-1) / active_dims).mean()
-
-                # Inter-limb counter-balance: prevent all 4 legs from locking in identical in-phase torques
-                if a_det_seq.size(-1) >= 8:
-                    limb_view = a_det_seq[:, :, :8].view(bsz, n_steps, 4, 2)
-                    inter_limb_std = torch.sqrt(limb_view.var(dim=2, unbiased=False) + 1e-6).mean(dim=1)
-                    inter_limb_mean = limb_view.mean(dim=2).abs().mean(dim=1)
-                    limb_sym_pen = (
-                        F.relu(0.70 * osc_target - inter_limb_std).pow(2)
-                        + 0.5 * F.relu(inter_limb_mean - 0.25).pow(2)
-                    ).mean(dim=-1)
-                    if m_2d is not None:
-                        four_leg_active = (m_2d[:, :8].sum(dim=-1) >= 6.0).to(limb_sym_pen.dtype)
-                        base_osc = base_osc + (limb_sym_pen * four_leg_active).mean()
-                    else:
-                        base_osc = base_osc + limb_sym_pen.mean()
-
-                loss_p_osc = 6.0 * base_osc
-            else:
-                loss_p_osc = torch.tensor(0.0, device=obs_seq.device, dtype=obs_seq.dtype)
-
-            loss_p = (
-                loss_p_mcts
-                + (loss_p_awr + loss_p_osc) * float(n_steps)
-                + 1e-3 * pre_tanh_reg * float(n_steps)
-            )
-
-            # Normalize over unroll horizon
-            loss_v = loss_v / float(k_plus_1)
-            loss_p = loss_p / float(k_plus_1)
-            if unroll_k > 0:
-                loss_r = loss_r / float(unroll_k)
-                loss_rep = loss_rep / float(unroll_k)
-
-            reg_loss = torch.tensor(0.0, device=obs_seq.device, dtype=obs_seq.dtype)
-            if c_reg > 0.0:
-                for p in self.parameters():
-                    reg_loss = reg_loss + p.pow(2).sum()
-                for p in backbone.parameters():
-                    reg_loss = reg_loss + p.pow(2).sum()
-
-            total_loss = (
-                lambda_v * loss_v
-                + lambda_p * loss_p
-                + lambda_r * loss_r
-                + lambda_rep * loss_rep
-                + c_reg * reg_loss
-            )
-            metrics = {
-                "loss_total": float(total_loss.detach().item()),
-                "loss_v": float(loss_v.detach().item()),
-                "loss_p": float(loss_p.detach().item()),
-                "loss_p_mcts": float((loss_p_mcts / float(k_plus_1)).detach().item()),
-                "loss_p_awr": float(loss_p_awr.detach().item()),
-                "loss_p_osc": float(loss_p_osc.detach().item()),
-                "loss_r": float(loss_r.detach().item()),
-                "loss_rep": float(loss_rep.detach().item()),
-                "loss_peak_ent": 0.0,
-                "loss_peak_sep": 0.0,
-                "policy_entropy": 0.0,
-                "peak_entropy": 0.0,
-                "peak_ent_floor": 0.0,
-                "peak_mean_sep": 0.0,
-                "policy_std": 0.0,
-            }
-            return total_loss, metrics
-
         log_probs_flat, policy_entropy, peak_entropy, mean_policy_std, mu_flat = (
             actor_head.compute_log_prob_pre_tanh_and_entropy(
                 cum_flat,
@@ -520,6 +316,7 @@ class ModelRepresentationTrainer(nn.Module):
             )
         )
         log_probs_seq = log_probs_flat.view(bsz, n_steps, -1)
+        weights_seq = mcts_policy_weights[:, :n_steps]
         loss_p = (
             -torch.sum(weights_seq * log_probs_seq, dim=-1) / active_dims
         ).mean(dim=0).sum()
@@ -610,116 +407,3 @@ class ModelRepresentationTrainer(nn.Module):
             "policy_std": float(mean_policy_std.mean().detach().item()),
         }
         return total_loss, metrics
-
-    def compute_deterministic_policy_loss(
-        self,
-        z_0: torch.Tensor,
-        cum_0: torch.Tensor,
-        actor_head: MultiPeakGMMActorHead | DeterministicActorHead,
-        critic_head: SupportCriticHead,
-        action_mask: Optional[torch.Tensor] = None,
-        limb_kinematics: Optional[torch.Tensor] = None,
-        gamma: float = 0.99,
-        dpg_horizon: int = 2,
-        lambda_dpg: float = 0.50,
-        phase_seq: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Computes analytical Deterministic Policy Gradient loss over a frozen latent world-model rollout.
-
-        Backpropagates d/d_phi [sum gamma^h r_hat + gamma^H V(z_cum)] directly into `actor_head`
-        without modifying `rep_trainer` or `critic_head` weights.
-        """
-        z_det = z_0.detach()
-        cum_det = cum_0.detach()
-        horizon = max(1, int(dpg_horizon))
-
-        frozen_params = list(self.parameters()) + list(critic_head.parameters())
-        prev_flags = [p.requires_grad for p in frozen_params]
-        for p in frozen_params:
-            p.requires_grad_(False)
-
-        try:
-            is_det = bool(getattr(actor_head, "is_deterministic", False))
-            bsz = z_det.shape[0]
-            q_total = torch.zeros(bsz, device=z_det.device, dtype=z_det.dtype)
-            pre_tanh_reg = torch.tensor(0.0, device=z_det.device, dtype=z_det.dtype)
-            discount = 1.0
-            z_cur = z_det
-            cum_cur = cum_det
-
-            if is_det:
-                for h in range(horizon):
-                    if limb_kinematics is not None and limb_kinematics.dim() == 4:
-                        kin_h = limb_kinematics[:, min(h, limb_kinematics.size(1) - 1)]
-                    else:
-                        kin_h = limb_kinematics
-                    if phase_seq is not None and phase_seq.dim() == 3:
-                        phase_h = phase_seq[:, min(h, phase_seq.size(1) - 1)]
-                    else:
-                        phase_h = phase_seq
-                    act_h, pre_h = actor_head(
-                        cum_cur,
-                        limb_kinematics=kin_h,
-                        action_mask=action_mask,
-                        return_pre_tanh=True,
-                        phase=phase_h,
-                    )
-                    pre_tanh_reg = pre_tanh_reg + (
-                        20.0 * F.relu(pre_h.abs() - 0.9).pow(2) + 2.0 * pre_h.pow(2)
-                    ).mean()
-                    z_next, r_hat = self.forward(z_cur, act_h)
-                    cum_next = combine_cumulative_rep(
-                        z_next, cum_cur, alpha=self.latent_ema_decay, assume_nonzero=True
-                    )
-                    q_total = q_total + discount * r_hat.squeeze(-1)
-                    discount *= float(gamma)
-                    z_cur = z_next
-                    cum_cur = cum_next
-                v_boot = critic_head(cum_cur).squeeze(-1)
-                q_total = q_total + discount * v_boot
-            else:
-                kin_0 = (
-                    limb_kinematics[:, 0]
-                    if (limb_kinematics is not None and limb_kinematics.dim() == 4)
-                    else limb_kinematics
-                )
-                logits, mu, _ = actor_head.get_distribution_params(
-                    cum_cur, temperature=1.0, limb_kinematics=kin_0
-                )
-                probs = F.softmax(logits, dim=-1).detach()  # (B, M)
-                best_k = torch.argmax(probs, dim=-1)
-                idx = best_k.unsqueeze(-1).unsqueeze(-1).expand(bsz, 1, mu.shape[-1])
-                mu_best = torch.gather(mu, dim=1, index=idx).squeeze(1)
-                act_0 = torch.tanh(mu_best)
-                if action_mask is not None:
-                    act_0 = act_0 * action_mask
-                pre_tanh_reg = mu_best.pow(2).mean()
-                z_next, r_hat = self.forward(z_cur, act_0)
-                cum_next = combine_cumulative_rep(
-                    z_next, cum_cur, alpha=self.latent_ema_decay, assume_nonzero=True
-                )
-                v_boot = critic_head(cum_next).squeeze(-1)
-                q_total = r_hat.squeeze(-1) + float(gamma) * v_boot
-
-            with torch.no_grad():
-                if q_total.numel() >= 2:
-                    q_span = float(
-                        max(1.0, (torch.quantile(q_total, 0.95) - torch.quantile(q_total, 0.05)).item())
-                    )
-                else:
-                    q_span = max(1.0, float(q_total.abs().mean().item()))
-                self._dpg_q_scale = 0.95 * self._dpg_q_scale + 0.05 * q_span
-                scale = max(1.0, float(self._dpg_q_scale))
-
-            loss_dpg = -float(lambda_dpg) * (q_total / scale).mean() + 1e-3 * (
-                pre_tanh_reg / float(horizon)
-            )
-            dpg_metrics = {
-                "loss_dpg": float(loss_dpg.detach().item()),
-                "dpg_q_mean": float(q_total.mean().detach().item()),
-                "dpg_q_scale": float(scale),
-            }
-            return loss_dpg, dpg_metrics
-        finally:
-            for p, flag in zip(frozen_params, prev_flags):
-                p.requires_grad_(flag)
