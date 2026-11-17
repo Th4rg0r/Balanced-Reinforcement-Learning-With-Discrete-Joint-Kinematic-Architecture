@@ -9,7 +9,7 @@ la_mcts:
   num_peaks: 4
   log_std_bounds: [-1.8, 0.25]
   use_categorical_critic: true
-  actor_type: "deterministic"
+  actor_type: "gmm"
   lambda_dpg: 0.05
   dpg_horizon: 1
   use_gait_phase: false
