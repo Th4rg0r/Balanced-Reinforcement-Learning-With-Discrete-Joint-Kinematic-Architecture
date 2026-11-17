@@ -1320,20 +1320,27 @@ class DeterministicLimbHead(nn.Module):
         film_raw = self.z_film(z_norm).unsqueeze(1) + self.phase_film(limb_phase)
         scale, shift = film_raw.chunk(2, dim=-1)
 
-        kin_emb = self.kin_proj(limb_geom)
+        # Center shared cosine/pitch constants and scale (x,y,z) so each leg quadrant gets an orthogonal kin_emb
+        geom_centered = limb_geom.clone()
+        geom_centered[..., 0:3] = geom_centered[..., 0:3] * 4.0
+        geom_centered[..., 3:4] = (geom_centered[..., 3:4] - 0.5) * 2.0
+        geom_centered[..., 6:7] = (geom_centered[..., 6:7] - 0.5) * 2.0
+        geom_centered[..., 7:8] = geom_centered[..., 7:8] - 1.0
+        geom_centered[..., 9::3] = geom_centered[..., 9::3] - 1.0
+
+        kin_emb = self.kin_proj(geom_centered)
         e_limbs_static = kin_emb + self.limb_type_emb
         e_limbs = e_limbs_static + kin_emb * torch.tanh(scale) + shift
 
         enc_seq = torch.cat([e_global, e_limbs], dim=1)
         raw_limbs = self.encoder(enc_seq)[:, 1:, :]
 
-        dyn_angles = limb_geom[..., 8:].clone()
-        dyn_angles[..., 1::3] = dyn_angles[..., 1::3] - 1.0
+        dyn_angles = geom_centered[..., 8:]
         osc_in = torch.cat(
             [
                 0.7 * e_global_clean.expand(-1, limb_geom.size(1), -1),
                 4.0 * limb_phase,
-                2.0 * dyn_angles,
+                2.5 * dyn_angles,
             ],
             dim=-1,
         )
@@ -1569,13 +1576,87 @@ class DeterministicActorHead(nn.Module):
         z_in = z_t.unsqueeze(0) if single else z_t
         bsz = z_in.shape[0]
 
-        if deterministic_candidates or k_act <= 1:
+        if k_act <= 1:
             a_det = self.forward(
                 z_in, limb_kinematics=limb_kinematics, action_mask=action_mask, phase=phase
             )
             sampled = a_det.unsqueeze(1)  # (B, 1, N)
             prior_weights = torch.ones((bsz, 1), device=z_t.device, dtype=z_t.dtype)
             peaks = torch.zeros((bsz, 1), device=z_t.device, dtype=torch.long)
+            self.last_sampled_peaks = (peaks.squeeze(0) if single else peaks).detach()
+            if single:
+                if return_peaks:
+                    return sampled.squeeze(0), prior_weights.squeeze(0), peaks.squeeze(0)
+                return sampled.squeeze(0), prior_weights.squeeze(0)
+            if return_peaks:
+                return sampled, prior_weights, peaks
+            return sampled, prior_weights
+
+        if deterministic_candidates:
+            # Generate k_act deterministic structured candidates for MCTS evaluation lookahead:
+            #   slot 0: clean deterministic policy f_phi(z, c)
+            #   slot 1: de-saturated / sign-reversing joint release -0.5 * a_det
+            #   slots 2..: deterministic latent-directional probes f_phi(norm(z + delta_j))
+            kin, counts = self._resolve_kinematics(limb_kinematics, z_in.device)
+            n_lat_det = max(0, k_act - 2)
+            if n_lat_det > 0:
+                idx_j = torch.arange(1, n_lat_det + 1, device=z_t.device, dtype=z_t.dtype).view(1, n_lat_det, 1)
+                dim_k = torch.arange(self.latent_dim, device=z_t.device, dtype=z_t.dtype).view(1, 1, self.latent_dim)
+                det_dirs = torch.sin(idx_j * 1.6180339887 * (dim_k + 1.0))
+                eff_det_lat = max(0.08, float(latent_noise_std) if latent_noise_std > 0.0 else 0.18)
+                z_pert_det = min_max_normalize(
+                    z_in.unsqueeze(1) + eff_det_lat * det_dirs,
+                    eps=1e-6,
+                )
+                z_stack_det = torch.cat([z_in.unsqueeze(1), z_pert_det], dim=1)
+            else:
+                z_stack_det = z_in.unsqueeze(1)
+
+            n_core_det = z_stack_det.shape[1]
+            flat_z_det = z_stack_det.reshape(bsz * n_core_det, self.latent_dim)
+            if kin.dim() >= 3:
+                kin_stack_det = (
+                    kin.unsqueeze(1)
+                    .expand(bsz, n_core_det, kin.shape[-2], kin.shape[-1])
+                    .reshape(bsz * n_core_det, kin.shape[-2], kin.shape[-1])
+                )
+            else:
+                kin_stack_det = kin
+
+            phase_stack_det = None
+            if phase is not None:
+                p_in = phase.to(device=z_t.device, dtype=z_t.dtype)
+                if p_in.dim() == 1:
+                    p_in = p_in.unsqueeze(0).expand(bsz, -1)
+                phase_stack_det = (
+                    p_in.unsqueeze(1)
+                    .expand(bsz, n_core_det, p_in.shape[-1])
+                    .reshape(bsz * n_core_det, -1)
+                )
+
+            acts_core_det = self.limb_head.forward_all_limbs(
+                flat_z_det,
+                kin_stack_det,
+                limb_joint_counts=counts,
+                target_action_dim=self.action_dim,
+                phase=phase_stack_det,
+            ).view(bsz, n_core_det, self.action_dim)
+
+            a_det_0 = acts_core_det[:, 0:1, :]
+            a_rel_1 = torch.clamp(-0.5 * a_det_0, -1.0, 1.0)
+            det_chunks = [a_det_0, a_rel_1]
+            if n_lat_det > 0:
+                det_chunks.append(acts_core_det[:, 1:, :])
+            sampled = torch.cat(det_chunks, dim=1)[:, :k_act, :]
+            sampled = self._apply_mask(sampled, action_mask)
+            prior_weights = torch.full(
+                (bsz, k_act), 1.0 / float(k_act), device=z_t.device, dtype=z_t.dtype
+            )
+            peaks = (
+                torch.arange(k_act, device=z_t.device, dtype=torch.long)
+                .unsqueeze(0)
+                .expand(bsz, k_act)
+            )
             self.last_sampled_peaks = (peaks.squeeze(0) if single else peaks).detach()
             if single:
                 if return_peaks:

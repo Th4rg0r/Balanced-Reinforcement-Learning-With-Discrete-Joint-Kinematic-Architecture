@@ -673,6 +673,7 @@ def test_needle_point_d_critic_warmup_and_config_defaults() -> None:
     assert np.isclose(sys_cfg.la_mcts.lr, 1e-4)
     assert np.isclose(sys_cfg.la_mcts.c_1, 2.50)
     assert np.isclose(sys_cfg.la_mcts.tau_act_train, 1.25)
+    assert sys_cfg.la_mcts.use_gait_phase is False
     assert sys_cfg.la_mcts.gait_phase_period == 16
     assert np.isclose(sys_cfg.ant_morph.ctrl_cost_weight, 0.0)
     assert np.isclose(sys_cfg.ant_morph.ctrl_start_return_ref, 1000.0)
@@ -1134,4 +1135,149 @@ def test_deterministic_limb_head_dynamic_cosine_and_dpg_grad_clip() -> None:
 
         a_phase = actor(z_rand[0:1].expand(16, -1), phase=phases)
         assert float(a_phase.std(dim=0).mean().item()) > 0.08
+
+
+def test_use_gait_phase_false_disables_clock_and_centers_cross_limb_kin_emb() -> None:
+    """Verifies use_gait_phase=False disables the phase clock and centered kin_emb differentiates all 4 limbs."""
+    from la_mcts.gmm_heads import DeterministicActorHead
+
+    torch.manual_seed(404)
+    cfg = LAMCTSConfig(
+        obs_dim=12,
+        max_action_dim=8,
+        context_dim=6,
+        history_len=2,
+        k_tok=4,
+        d_model=32,
+        n_heads=2,
+        l_enc=1,
+        latent_dim=32,
+        l_dyn=1,
+        proj_dim=32,
+        pred_dim=32,
+        actor_type="deterministic",
+        use_gait_phase=False,
+        gait_phase_period=16,
+    )
+    agent = LatentActionMCTSAgent(cfg, device=torch.device("cpu"))
+    obs = np.random.randn(12).astype(np.float32)
+
+    agent.set_episode_context()
+    agent._episode_step = 0
+    a_step0 = agent.select_action(obs, deterministic=True)
+
+    agent.set_episode_context()
+    agent._episode_step = 5
+    a_step5 = agent.select_action(obs, deterministic=True)
+
+    # With use_gait_phase=False and identical history, _episode_step has zero effect on action
+    np.testing.assert_allclose(a_step0, a_step5, atol=1e-6)
+
+    # Verify centered limb geometry produces distinct (low/negative cosine similarity) kin_emb across the 4 Ant legs
+    actor = DeterministicActorHead(latent_dim=64, action_dim=8, hidden_dim=64, joints_per_limb=2)
+    lh = actor.limb_head
+    kin = actor.default_limb_kinematics.unsqueeze(0)  # (1, 4, 11)
+    geom = lh.encode_kinematics(kin)
+    geom_centered = geom.clone()
+    geom_centered[..., 0:3] = geom_centered[..., 0:3] * 4.0
+    geom_centered[..., 3:4] = (geom_centered[..., 3:4] - 0.5) * 2.0
+    geom_centered[..., 6:7] = (geom_centered[..., 6:7] - 0.5) * 2.0
+    geom_centered[..., 7:8] = geom_centered[..., 7:8] - 1.0
+    geom_centered[..., 9::3] = geom_centered[..., 9::3] - 1.0
+    with torch.no_grad():
+        kin_emb = torch.nn.functional.normalize(lh.kin_proj(geom_centered).squeeze(0), dim=-1)
+        cross_limb_sim = kin_emb @ kin_emb.T
+        off_diag_limb_sim = float(((cross_limb_sim.sum() - cross_limb_sim.diag().sum()) / (4 * 3)).item())
+        assert off_diag_limb_sim < 0.25, f"Cross-limb kin_emb cosine similarity too high: {off_diag_limb_sim}"
+
+
+def test_deterministic_eval_runs_mcts_lookahead_and_unroll_isolates_world_model() -> None:
+    """Verifies deterministic=True expands k_act candidates via MCTS lookahead and loss_p uses detached real latents."""
+    from la_mcts.gmm_heads import DeterministicActorHead
+
+    torch.manual_seed(505)
+    cfg = LAMCTSConfig(
+        obs_dim=12,
+        max_action_dim=4,
+        context_dim=6,
+        history_len=2,
+        k_tok=4,
+        d_model=32,
+        n_heads=2,
+        l_enc=1,
+        latent_dim=32,
+        l_dyn=1,
+        proj_dim=32,
+        pred_dim=32,
+        actor_type="deterministic",
+        use_gait_phase=False,
+        n_sim=8,
+        n_sim_eval=12,
+        k_act=6,
+        unroll_steps=2,
+        batch_size=2,
+    )
+    agent = LatentActionMCTSAgent(cfg, device=torch.device("cpu"))
+    agent.set_episode_context()
+    obs = np.random.randn(12).astype(np.float32)
+
+    # 1) deterministic=True expands k_act=6 structured candidates and runs n_sim_eval=12 MCTS simulations
+    act_eval = agent.select_action(obs, deterministic=True)
+    assert act_eval.shape == (4,)
+    assert agent._last_mcts_info is not None
+    root_samples, policy_weights, _ = agent._last_mcts_info
+    assert root_samples.shape == (6, 4)
+    assert policy_weights.shape == (6,)
+    assert float(np.std(root_samples, axis=0).mean()) > 0.05
+
+    # 2) In compute_unrolled_loss, policy loss (lambda_p=1.0, others=0.0) must only update actor_head,
+    #    keeping backbone and rep_trainer world-model gradients strictly zero.
+    bsz, unroll_k = 2, 2
+    obs_seq = torch.randn(bsz, unroll_k + 1, 12)
+    act_seq = torch.randn(bsz, unroll_k, 4).clamp(-1.0, 1.0)
+    rew_seq = torch.ones(bsz, unroll_k)
+    val_seq = torch.ones(bsz, unroll_k + 1) * 5.0
+    samps = torch.randn(bsz, unroll_k + 1, 6, 4).clamp(-1.0, 1.0)
+    weights = torch.full((bsz, unroll_k + 1, 6), 1.0 / 6.0)
+
+    agent.backbone.zero_grad()
+    agent.rep_trainer.zero_grad()
+    agent.actor_head.zero_grad()
+    loss_p_only, _ = agent.rep_trainer.compute_unrolled_loss(
+        obs_seq=obs_seq,
+        action_seq=act_seq,
+        reward_seq=rew_seq,
+        target_value_seq=val_seq,
+        mcts_policy_samples=samps,
+        mcts_policy_weights=weights,
+        backbone=agent.backbone,
+        actor_head=agent.actor_head,
+        critic_head=agent.critic_head,
+        lambda_v=0.0,
+        lambda_p=1.0,
+        lambda_r=0.0,
+        lambda_rep=0.0,
+        c_reg=0.0,
+    )
+    loss_p_only.backward()
+    actor_gn = sum(
+        float(p.grad.abs().sum().item())
+        for p in agent.actor_head.parameters()
+        if p.grad is not None
+    )
+    bb_gn = sum(
+        float(p.grad.abs().sum().item())
+        for p in agent.backbone.parameters()
+        if p.grad is not None
+    )
+    rep_gn = sum(
+        float(p.grad.abs().sum().item())
+        for p in agent.rep_trainer.parameters()
+        if p.grad is not None
+    )
+    assert actor_gn > 0.0
+    assert bb_gn == 0.0
+    assert rep_gn == 0.0
+
+
 

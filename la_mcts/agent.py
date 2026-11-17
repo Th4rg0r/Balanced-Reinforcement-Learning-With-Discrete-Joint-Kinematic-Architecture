@@ -706,6 +706,10 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 root_exp_frac = min(root_exp_cap, base_root_exp * explore_scale)
                 q_adv_weight = self.get_current_q_advantage_weight()
 
+            use_phase = (
+                bool(getattr(self.cfg, "use_gait_phase", True))
+                and int(getattr(self.cfg, "gait_phase_period", 0)) > 0
+            )
             gait_period = max(1, int(getattr(self.cfg, "gait_phase_period", 20)))
             chosen_action, policy_weights, root_samples, root_value, root_node = (
                 self.mcts.search(
@@ -725,7 +729,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     latent_noise_std=eff_lat_noise,
                     action_noise_std=eff_act_noise,
                     held_action_noise=held_act_noise_in,
-                    phase_step=self._episode_step,
+                    phase_step=(self._episode_step if use_phase else None),
                     gait_period_steps=gait_period,
                 )
             )
@@ -920,6 +924,10 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     ctx_t, hist_t, alpha=ema_decay
                 )
                 prev_cum_root = prev_cum_t.squeeze(0) if prev_cum_t is not None else None
+                use_phase = (
+                    bool(getattr(self.cfg, "use_gait_phase", True))
+                    and int(getattr(self.cfg, "gait_phase_period", 0)) > 0
+                )
                 gait_period = max(1, int(getattr(self.cfg, "gait_phase_period", 20)))
                 is_det_head = bool(getattr(self.actor_head, "is_deterministic", False))
                 held_reanalyze_noise = (
@@ -942,12 +950,11 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                     latent_noise_std=self.get_current_latent_noise_std(),
                     action_noise_std=self.get_current_action_explore_std(),
                     held_action_noise=held_reanalyze_noise,
-                    phase_step=step,
+                    phase_step=(step if use_phase else None),
                     gait_period_steps=gait_period,
                 )
-                if not is_det_head:
-                    traj.mcts_policy_samples[step] = root_samples
-                    traj.mcts_policy_weights[step] = policy_weights
+                traj.mcts_policy_samples[step] = root_samples
+                traj.mcts_policy_weights[step] = policy_weights
                 traj.mcts_values[step] = float(root_value)
 
     def _target_pairs(self) -> List[Tuple[nn.Module, nn.Module]]:
@@ -1124,21 +1131,31 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         self._diagnostics["critic_warmup_scale"] = warmup_scale
         self._diagnostics["effective_lambda_peak_ent"] = eff_lambda_peak_ent
 
+        use_phase = (
+            bool(getattr(self.cfg, "use_gait_phase", True))
+            and int(getattr(self.cfg, "gait_phase_period", 0)) > 0
+        )
         gait_period = max(1, int(getattr(self.cfg, "gait_phase_period", 20)))
         dpg_horizon = max(1, int(getattr(self.cfg, "dpg_horizon", 4)))
-        max_phase_steps = max(self.cfg.unroll_steps + 1, dpg_horizon)
-        start_steps_t = torch.tensor(
-            [s for (_, s) in refs], device=self.device, dtype=torch.float32
-        ).unsqueeze(1)
-        offsets_t = torch.arange(
-            max_phase_steps, device=self.device, dtype=torch.float32
-        ).unsqueeze(0)
-        phase_seq = compute_gait_phase(
-            start_steps_t + offsets_t,
-            period_steps=gait_period,
-            device=self.device,
-            dtype=torch.float32,
-        )
+        if use_phase:
+            max_phase_steps = max(self.cfg.unroll_steps + 1, dpg_horizon)
+            start_steps_t = torch.tensor(
+                [s for (_, s) in refs], device=self.device, dtype=torch.float32
+            ).unsqueeze(1)
+            offsets_t = torch.arange(
+                max_phase_steps, device=self.device, dtype=torch.float32
+            ).unsqueeze(0)
+            phase_seq = compute_gait_phase(
+                start_steps_t + offsets_t,
+                period_steps=gait_period,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            unroll_phase_seq = phase_seq[:, : self.cfg.unroll_steps + 1]
+            dpg_phase_seq = phase_seq[:, :dpg_horizon]
+        else:
+            unroll_phase_seq = None
+            dpg_phase_seq = None
 
         self.optimizer.zero_grad()
         total_loss, metrics = self.rep_trainer.compute_unrolled_loss(
@@ -1168,7 +1185,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             peak_entropy_floor_ratio=eff_peak_floor_ratio,
             lambda_peak_sep=eff_lambda_peak_sep,
             min_peak_separation=eff_min_peak_sep,
-            phase_seq=phase_seq[:, : self.cfg.unroll_steps + 1],
+            phase_seq=unroll_phase_seq,
         )
         total_loss.backward()
         eff_lambda_dpg = self.get_current_lambda_dpg()
@@ -1195,7 +1212,7 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 gamma=self.cfg.gamma,
                 dpg_horizon=dpg_horizon,
                 lambda_dpg=eff_lambda_dpg,
-                phase_seq=phase_seq[:, :dpg_horizon],
+                phase_seq=dpg_phase_seq,
             )
             loss_dpg.backward()
             g_dpg = [

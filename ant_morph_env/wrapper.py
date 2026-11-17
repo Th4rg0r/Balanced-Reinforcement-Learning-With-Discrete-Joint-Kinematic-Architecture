@@ -711,6 +711,7 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self._healthy_steps = 0
         self._upside_down_time = 0.0
         self._start_x = float(self.mj_data.qpos[0])
+        self._max_forward_x = self._start_x
         self._prev_raw_action = None
         self._prev_smoothed_action = None
 
@@ -850,13 +851,23 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             agent_reward = raw_env_reward
             reward = raw_env_reward
         elif self.pure_velocity_reward_mode:
-            # Pure non-negative forward-velocity reward up to 1000 raw return, linearly blending to raw_env_reward at 3000
+            # Pure non-negative forward-velocity reward up to 1000 raw return, linearly blending to raw_env_reward at 3000.
+            # Gate on rolling-window net forward velocity (smooth_x_vel) once the window is populated
+            # so zero-mean torso rocking around a stationary stance cannot accumulate fake velocity return.
             blend_alpha = self.get_reward_blend_alpha()
             exploration_progress = self.get_exploration_progress()
             eff_forward_weight = self.forward_reward_weight
             eff_ctrl_weight = 0.0
             reward_fwd = float(info.get("reward_forward", step_x_vel))
-            pure_vel_reward = float(self.forward_reward_weight) * max(0.0, reward_fwd)
+            if (
+                self.stationary_vel_window > 1
+                and len(self._recent_step_vels) >= min(5, self.stationary_vel_window)
+                and self.min_healthy_vel > 0.0
+            ):
+                vel_gate = float(np.clip(smooth_x_vel / self.min_healthy_vel, 0.0, 1.0))
+            else:
+                vel_gate = 1.0
+            pure_vel_reward = float(self.forward_reward_weight) * max(0.0, reward_fwd) * vel_gate
             pure_vel_raw_blend = self.get_current_pure_vel_raw_blend()
             agent_reward = (
                 (1.0 - pure_vel_raw_blend) * pure_vel_reward

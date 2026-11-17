@@ -827,5 +827,19 @@ def test_pure_velocity_reward_mode_non_negative_and_blends_1000_to_3000() -> Non
         wrapper.reset(seed=42, options={"eval_mode": True})
         _, eval_r, _, _, eval_info = wrapper.step(full_act)
         assert eval_r == pytest.approx(float(eval_info["raw_env_reward"]), abs=1e-5)
+
+        # 5) Zero-mean back-and-forth rocking jitter over >= 5 steps is gated to 0.0 pure velocity reward
+        wrapper.reset(seed=42, options={"eval_mode": False})
+        wrapper.target_return = 0.0
+        wrapper.current_return = 0.0
+        wrapper._recent_step_vels.clear()
+        for v in (-0.4, 0.3, -0.4, 0.3):
+            wrapper._recent_step_vels.append(v)
+        wrapper.mj_data.qvel[:] = 0.0
+        wrapper.mj_data.qvel[0] = 0.1
+        _, r_rock, _, _, info_rock = wrapper.step(np.zeros(12, dtype=np.float32))
+        assert float(info_rock["smooth_x_vel"]) <= 0.0
+        assert float(info_rock["pure_vel_reward"]) == pytest.approx(0.0, abs=1e-6)
+        assert r_rock == pytest.approx(0.0, abs=1e-6)
     finally:
         wrapper.close()

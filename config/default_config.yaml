@@ -12,6 +12,7 @@ la_mcts:
   actor_type: "deterministic"
   lambda_dpg: 0.05
   dpg_horizon: 1
+  use_gait_phase: false
   gait_phase_period: 16
   action_explore_std: 0.40
   action_explore_std_end: 0.05

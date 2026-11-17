@@ -89,7 +89,8 @@ This document provides a comprehensive reference for every configuration paramet
     - `"gmm"`: Legacy `MultiPeakGMMActorHead` outputting multi-peak `(logits, mu, log_std)` distribution parameters.
   - `lambda_dpg: 0.05`: Weight of the analytical Deterministic Policy Gradient (`d/d_phi [r_hat + gamma V(z_cum)]`) backpropagated through the frozen world model and critic (clipped to at most `0.25x` of the `loss_p` actor gradient norm).
   - `dpg_horizon: 1`: 1-step latent evaluation horizon differentiated per DPG update to prevent multi-step world-model corner exploitation.
-  - `gait_phase_period: 16`: Period in environment steps (`16 * 50ms = 0.80s`, `1.25 Hz`) of the global 2D sinusoidal gait clock $[\sin(2\pi t / T), \cos(2\pi t / T)]$ combined with each limb's yaw angle $\psi_i$.
+  - `use_gait_phase: false`: Enables (`true`) or disables (`false`) the external 2D sinusoidal gait clock signal $[\sin(2\pi t / T), \cos(2\pi t / T)]$. When `false`, the actor relies purely on closed-loop proprioceptive state feedback.
+  - `gait_phase_period: 16`: Period in environment steps (`16 * 50ms = 0.80s`, `1.25 Hz`) of the global 2D sinusoidal gait clock when `use_gait_phase: true`.
   - `action_explore_std: 0.40` $\to$ `action_explore_std_end: 0.05`: Exploration noise std around deterministic MCTS proposals during training, annealing linearly over `0 -> exploration_return_ref` (`3000`, velocity-gated when `use_real_returns: true`).
 
 #### `num_peaks`

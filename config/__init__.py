@@ -26,6 +26,7 @@ class LAMCTSConfig:
     actor_type: str = "deterministic"
     lambda_dpg: float = 0.05
     dpg_horizon: int = 1
+    use_gait_phase: bool = False
     gait_phase_period: int = 16
     action_explore_std: float = 0.40
     action_explore_std_end: float = 0.05

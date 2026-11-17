@@ -330,20 +330,47 @@ class ModelRepresentationTrainer(nn.Module):
                     )
                 else:
                     phase_flat = phase_seq
+            # Evaluate deterministic actor on detached REAL closed-loop latent sequence (obs_seq[:, 0..K])
+            # rather than collapsing open-loop dynamics predictions (cum_hat), preventing world-model
+            # distortion and ensuring loss_p_osc measures genuine closed-loop temporal variation.
+            with torch.no_grad():
+                cum_real_list = [cum_seq[:, 0].detach()]
+                cur_real_cum = cum_seq[:, 0].detach()
+                for k_step in range(1, n_steps):
+                    hist_k = (
+                        history[:, k_step, :]
+                        if (history is not None and history.dim() == 3)
+                        else history
+                    )
+                    z_real_k = backbone(obs_seq[:, k_step], context=context, history=hist_k)
+                    cur_real_cum = combine_cumulative_rep(
+                        z_real_k, cur_real_cum, alpha=self.latent_ema_decay
+                    )
+                    cum_real_list.append(cur_real_cum)
+                cum_actor_flat = torch.stack(cum_real_list, dim=1).reshape(bsz * n_steps, -1).detach()
+
             a_det_flat, pre_tanh_flat = actor_head(
-                cum_flat,
+                cum_actor_flat,
                 limb_kinematics=kin_flat,
                 action_mask=mask_flat,
                 return_pre_tanh=True,
                 phase=phase_flat,
             )
             a_det_seq = a_det_flat.view(bsz, n_steps, -1)
-            # 1) Sharpened MCTS visit/Q barycenter avoids brittle Slot-0 argmax lock-in
-            w_sharp = weights_seq.pow(2.0)
+            # 1) Strongly sharpened MCTS visit/Q target (pow(4) + top-branch anchor) prevents
+            #    averaging antithetic (+h_delta / -h_delta) and isotropic noise back to zero
+            w_sharp = weights_seq.pow(4.0)
             w_sharp = w_sharp / w_sharp.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-            a_mcts_target = torch.sum(
+            a_bary = torch.sum(
                 w_sharp.unsqueeze(-1) * mcts_policy_samples[:, :n_steps], dim=2
             )
+            best_idx = (
+                weights_seq.argmax(dim=-1, keepdim=True)
+                .unsqueeze(-1)
+                .expand(bsz, n_steps, 1, mcts_policy_samples.size(-1))
+            )
+            a_best = torch.gather(mcts_policy_samples[:, :n_steps], dim=2, index=best_idx).squeeze(2)
+            a_mcts_target = (0.5 * a_bary + 0.5 * a_best).detach()
             sq_err = (a_det_seq - a_mcts_target).pow(2)
             pre_tanh_seq = pre_tanh_flat.view(bsz, n_steps, -1)
             pre_tanh_pen = (
@@ -358,48 +385,62 @@ class ModelRepresentationTrainer(nn.Module):
                 loss_p_mcts = (sq_err.sum(dim=-1) / active_dims).mean(dim=0).sum()
                 pre_tanh_reg = pre_tanh_pen.mean()
 
-            # 2) Direct Advantage-Weighted Regression (AWR) on executed replay actions so
-            #    high-return exploratory motions distill straight into the deterministic actor
+            # 2) Selective Advantage-Weighted Regression (AWR) on top-quantile positive-advantage
+            #    AND above-average immediate-reward steps so AWR does not regress to the mean of random noise
             n_awr = min(unroll_k, action_seq.size(1), target_value_seq.size(1)) if unroll_k > 0 else 0
             if n_awr > 0 and action_seq.numel() > 0:
                 with torch.no_grad():
                     v_pred_seq = critic_head(
-                        cum_seq[:, :n_awr].detach().reshape(bsz * n_awr, -1)
+                        cum_actor_flat.view(bsz, n_steps, -1)[:, :n_awr].reshape(bsz * n_awr, -1)
                     ).view(bsz, n_awr)
                     adv = target_value_seq[:, :n_awr] - v_pred_seq
-                    adv_scale = adv.std().clamp_min(1.0)
-                    adv_score = torch.relu((adv - adv.mean()) / adv_scale) * (
-                        adv > -0.5 * adv_scale
+                    adv_scale = adv.std().clamp_min(1e-2)
+                    norm_adv = (adv - adv.mean()) / adv_scale
+                    rew_slice = reward_seq[:, :n_awr]
+                    rew_gate = (rew_slice >= rew_slice.mean()).to(adv.dtype) * (
+                        rew_slice > 0.0
                     ).to(adv.dtype)
-                    w_awr = (torch.exp(adv_score.clamp(max=3.0)) - 1.0).clamp(max=6.0)
+                    adv_score = F.relu(norm_adv - 0.5) * rew_gate
+                    w_awr = (torch.exp(adv_score.clamp(max=2.5)) - 1.0).clamp(max=4.0)
                 awr_sq = (a_det_seq[:, :n_awr] - action_seq[:, :n_awr]).pow(2)
                 if m_seq is not None:
                     awr_mse = (awr_sq * m_seq).sum(dim=-1) / active_dims
                 else:
                     awr_mse = awr_sq.sum(dim=-1) / active_dims
-                loss_p_awr = 2.0 * (w_awr.detach() * awr_mse).mean()
+                loss_p_awr = 1.0 * (w_awr.detach() * awr_mse).mean()
             else:
                 loss_p_awr = torch.tensor(0.0, device=obs_seq.device, dtype=obs_seq.dtype)
 
-            # 3) Temporal oscillation anti-stasis floor across the unrolled gait phase window
-            if (
-                phase_seq is not None
-                and n_steps >= 2
-                and phase_seq.dim() == 3
-                and float(phase_seq[:, :n_steps].std(dim=1).max().item()) > 1e-3
-            ):
-                osc_target = min(0.18, max(0.0, float(min_policy_std_target) * 0.85))
+            # 3) Closed-loop temporal oscillation & inter-limb activity balance floor across the window
+            has_temporal_var = (
+                (
+                    phase_seq is not None
+                    and phase_seq.dim() == 3
+                    and float(phase_seq[:, :n_steps].std(dim=1).max().item()) > 1e-3
+                )
+                or float(obs_seq[:, :n_steps].std(dim=1).max().item()) > 1e-3
+            )
+            if n_steps >= 2 and float(min_policy_std_target) > 0.0 and has_temporal_var:
+                osc_target = min(0.20, max(0.0, float(min_policy_std_target) * 0.90))
                 temp_std = torch.sqrt(a_det_seq.var(dim=1, unbiased=False) + 1e-6)
                 step_da = (a_det_seq[:, 1:, :] - a_det_seq[:, :-1, :]).abs().mean(dim=1)
-                osc_shortfall = (
-                    F.relu(osc_target - temp_std).pow(2)
-                    + F.relu(0.75 * osc_target - step_da).pow(2)
-                )
                 if m_seq is not None:
                     m_2d = m_seq.squeeze(1)
-                    loss_p_osc = 2.5 * ((osc_shortfall * m_2d).sum(dim=-1) / active_dims).mean()
+                    max_j_std = (temp_std * m_2d).max(dim=-1, keepdim=True)[0].detach()
                 else:
-                    loss_p_osc = 2.5 * (osc_shortfall.sum(dim=-1) / active_dims).mean()
+                    m_2d = None
+                    max_j_std = temp_std.max(dim=-1, keepdim=True)[0].detach()
+                # Penalize any limb/joint that stays stationary while 1-2 legs move
+                balance_shortfall = F.relu(0.75 * max_j_std - temp_std).pow(2)
+                osc_shortfall = (
+                    F.relu(osc_target - temp_std).pow(2)
+                    + F.relu(0.80 * osc_target - step_da).pow(2)
+                    + 1.5 * balance_shortfall
+                )
+                if m_2d is not None:
+                    loss_p_osc = 6.0 * ((osc_shortfall * m_2d).sum(dim=-1) / active_dims).mean()
+                else:
+                    loss_p_osc = 6.0 * (osc_shortfall.sum(dim=-1) / active_dims).mean()
             else:
                 loss_p_osc = torch.tensor(0.0, device=obs_seq.device, dtype=obs_seq.dtype)
 
