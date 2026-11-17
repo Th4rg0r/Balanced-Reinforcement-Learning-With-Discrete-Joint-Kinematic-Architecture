@@ -637,3 +637,57 @@ def test_orchestrator_forwards_raw_returns_and_gates_exploration_by_velocity() -
 
 
 
+def test_ctrl_cost_cancellation_holds_until_1000_and_ramps_to_3500() -> None:
+    """Verifies ctrl_cost_weight=0.0 cancels 100% of torque penalty up to 1000 return, then ramps linearly to 0.5 at 3500."""
+    wrapper = MorphologicalAntBRLWrapper(
+        max_action_capacity=12,
+        fixed_action_space=True,
+        action_ema_alpha=1.0,
+        action_smoothness_coef=0.0,
+        min_healthy_vel=0.0,
+        stationary_penalty_coef=0.0,
+        forward_reward_weight=1.0,
+        ctrl_cost_weight=0.0,
+        ctrl_start_return_ref=1000.0,
+        ctrl_return_ref=3500.0,
+        forward_return_ref=5000.0,
+        use_real_returns=False,
+    )
+    try:
+        wrapper.reset(seed=42, options={"eval_mode": False})
+        act = np.full(12, 0.5, dtype=np.float32)  # 8 active actuators -> ||a||^2 = 2.0, reward_ctrl = -1.0
+
+        # 1) At 0 and 1000 real return: 100% torque penalty cancelled
+        for ret in (0.0, 1000.0):
+            wrapper.target_return = ret
+            wrapper.current_return = ret
+            assert wrapper.get_current_ctrl_cost_weight() == pytest.approx(0.0, abs=1e-6)
+            _, r, _, _, info = wrapper.step(act)
+            assert float(info["ctrl_cost_weight"]) == pytest.approx(0.0, abs=1e-6)
+            assert float(info["reward_ctrl"]) == pytest.approx(-1.0, abs=1e-5)
+            assert r - float(info["raw_env_reward"]) == pytest.approx(1.0, abs=1e-5)
+
+        # 2) At 2250 real return (midpoint between 1000 and 3500): 50% cancelled (eff_ctrl_weight = 0.25)
+        wrapper.target_return = 2250.0
+        wrapper.current_return = 2250.0
+        assert wrapper.get_current_ctrl_cost_weight() == pytest.approx(0.25, abs=1e-6)
+        _, mid_r, _, _, mid_info = wrapper.step(act)
+        assert float(mid_info["ctrl_cost_weight"]) == pytest.approx(0.25, abs=1e-6)
+        assert mid_r - float(mid_info["raw_env_reward"]) == pytest.approx(0.5, abs=1e-5)
+
+        # 3) At 3500+ real return: full standard Ant-v5 torque penalty (eff_ctrl_weight = 0.5)
+        wrapper.target_return = 3500.0
+        wrapper.current_return = 3500.0
+        assert wrapper.get_current_ctrl_cost_weight() == pytest.approx(0.5, abs=1e-6)
+        _, full_r, _, _, full_info = wrapper.step(act)
+        assert float(full_info["ctrl_cost_weight"]) == pytest.approx(0.5, abs=1e-6)
+        assert full_r == pytest.approx(float(full_info["raw_env_reward"]), abs=1e-5)
+
+        # 4) Eval mode always keeps standard 0.5 regardless of low training return
+        wrapper.current_return = 0.0
+        wrapper.reset(seed=42, options={"eval_mode": True})
+        _, eval_r, _, _, eval_info = wrapper.step(act)
+        assert float(eval_info["ctrl_cost_weight"]) == pytest.approx(0.5, abs=1e-6)
+        assert eval_r == pytest.approx(float(eval_info["raw_env_reward"]), abs=1e-5)
+    finally:
+        wrapper.close()

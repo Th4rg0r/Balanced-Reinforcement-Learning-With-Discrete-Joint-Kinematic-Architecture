@@ -144,10 +144,12 @@ class AntMorphConfig:
     action_smoothness_end_step: int = 500000
     action_smoothness_log_shape: float = 10.0  # Deprecated/unused; kept for backward config compatibility
     forward_reward_weight: float = 2.5
-    ctrl_cost_weight: float = 0.5
+    ctrl_cost_weight: float = 0.0
     benchmark_vel_ref: float = 6.0
     torque_return_ref: float = 1000.0
     exploration_return_ref: float = 3000.0
+    ctrl_start_return_ref: float = 1000.0
+    ctrl_return_ref: float = 3500.0
     forward_return_ref: float = 5000.0
     vel_std_threshold: float = 0.15
     vel_shift_factor: float = 3000.0

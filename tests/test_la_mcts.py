@@ -674,7 +674,9 @@ def test_needle_point_d_critic_warmup_and_config_defaults() -> None:
     assert np.isclose(sys_cfg.la_mcts.c_1, 2.50)
     assert np.isclose(sys_cfg.la_mcts.tau_act_train, 1.5)
     assert sys_cfg.la_mcts.gait_phase_period == 20
-    assert sys_cfg.ant_morph.use_real_returns is True
+    assert np.isclose(sys_cfg.ant_morph.ctrl_cost_weight, 0.0)
+    assert np.isclose(sys_cfg.ant_morph.ctrl_start_return_ref, 1000.0)
+    assert np.isclose(sys_cfg.ant_morph.ctrl_return_ref, 3500.0)
     assert 0.0 < sys_cfg.ant_morph.action_ema_alpha <= 1.0
     assert np.isclose(sys_cfg.la_mcts.root_exploration_fraction_decay_constant, 0.999996)
     assert sys_cfg.brl.warmup_episodes == 150

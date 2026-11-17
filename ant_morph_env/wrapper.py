@@ -56,6 +56,8 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         stationary_vel_window: int = 20,
         forward_reward_weight: float = 1.0,
         ctrl_cost_weight: float = 0.5,
+        ctrl_start_return_ref: float = 0.0,
+        ctrl_return_ref: Optional[float] = None,
         forward_return_ref: float = 5000.0,
         use_real_returns: bool = False,
     ) -> None:
@@ -101,6 +103,12 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self.forward_reward_weight = max(0.0, float(forward_reward_weight))
         self.ctrl_cost_weight = max(0.0, float(ctrl_cost_weight))
         self.forward_return_ref = max(1e-6, float(forward_return_ref))
+        self.ctrl_start_return_ref = max(0.0, float(ctrl_start_return_ref))
+        self.ctrl_return_ref = (
+            self.forward_return_ref
+            if ctrl_return_ref is None
+            else max(self.ctrl_start_return_ref + 1e-6, float(ctrl_return_ref))
+        )
         self.use_real_returns = bool(use_real_returns)
         self._recent_step_vels: Deque[float] = deque(maxlen=self.stationary_vel_window)
         self._recent_ep_returns: Deque[float] = deque(maxlen=20)
@@ -512,13 +520,17 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         )
 
     def _blend_weight_toward_benchmark(
-        self, train_weight: float, benchmark_weight: float
+        self,
+        train_weight: float,
+        benchmark_weight: float,
+        start_ref: float = 0.0,
+        end_ref: Optional[float] = None,
     ) -> float:
-        """Linearly blends a training weight toward its benchmark value over 0 -> forward_return_ref raw return."""
+        """Linearly blends a training weight toward its benchmark value over start_ref -> end_ref raw return."""
+        end = self.forward_return_ref if end_ref is None else end_ref
         pos_ret = max(0.0, float(self._current_return))
-        blend = float(
-            np.clip(pos_ret / max(self.forward_return_ref, 1e-6), 0.0, 1.0)
-        )
+        span = max(float(end) - float(start_ref), 1e-6)
+        blend = float(np.clip((pos_ret - float(start_ref)) / span, 0.0, 1.0))
         return float(train_weight + blend * (benchmark_weight - train_weight))
 
     def get_current_forward_reward_weight(self) -> float:
@@ -526,8 +538,13 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         return self._blend_weight_toward_benchmark(self.forward_reward_weight, 1.0)
 
     def get_current_ctrl_cost_weight(self) -> float:
-        """Linearly blends training ctrl_cost_weight toward standard 0.5 over 0 -> forward_return_ref (5000) raw return."""
-        return self._blend_weight_toward_benchmark(self.ctrl_cost_weight, 0.5)
+        """Holds ctrl_cost_weight until ctrl_start_return_ref, then linearly blends to standard 0.5 at ctrl_return_ref."""
+        return self._blend_weight_toward_benchmark(
+            self.ctrl_cost_weight,
+            0.5,
+            start_ref=self.ctrl_start_return_ref,
+            end_ref=self.ctrl_return_ref,
+        )
 
     def get_current_action_ema_alpha(self) -> float:
         """Returns the effective action EMA alpha interpolating linearly from action_ema_alpha to 1.0 over 0 -> 1000 return."""

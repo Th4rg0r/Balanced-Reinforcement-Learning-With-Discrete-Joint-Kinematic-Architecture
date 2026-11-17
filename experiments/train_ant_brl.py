@@ -469,6 +469,8 @@ def run_single_seed(
         stationary_vel_window=sys_cfg.ant_morph.stationary_vel_window,
         forward_reward_weight=sys_cfg.ant_morph.forward_reward_weight,
         ctrl_cost_weight=sys_cfg.ant_morph.ctrl_cost_weight,
+        ctrl_start_return_ref=sys_cfg.ant_morph.ctrl_start_return_ref,
+        ctrl_return_ref=sys_cfg.ant_morph.ctrl_return_ref,
         forward_return_ref=sys_cfg.ant_morph.forward_return_ref,
         use_real_returns=sys_cfg.ant_morph.use_real_returns,
     )
