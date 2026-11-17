@@ -64,6 +64,9 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         ctrl_return_ref: Optional[float] = None,
         forward_return_ref: float = 5000.0,
         use_real_returns: bool = False,
+        pure_velocity_reward_mode: bool = False,
+        pure_vel_start_return_ref: float = 1000.0,
+        pure_vel_end_return_ref: float = 3000.0,
     ) -> None:
         self.env_id = env_id
         if env is None:
@@ -120,6 +123,11 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             else max(self.ctrl_start_return_ref + 1e-6, float(ctrl_return_ref))
         )
         self.use_real_returns = bool(use_real_returns)
+        self.pure_velocity_reward_mode = bool(pure_velocity_reward_mode)
+        self.pure_vel_start_return_ref = max(0.0, float(pure_vel_start_return_ref))
+        self.pure_vel_end_return_ref = max(
+            self.pure_vel_start_return_ref + 1e-6, float(pure_vel_end_return_ref)
+        )
         self._recent_step_vels: Deque[float] = deque(maxlen=self.stationary_vel_window)
         self._recent_ep_returns: Deque[float] = deque(maxlen=20)
         self._recent_ep_velocities: Deque[float] = self._recent_ep_returns
@@ -570,6 +578,19 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         )
         return float(1.0 - fade)
 
+    def get_current_pure_vel_raw_blend(self) -> float:
+        """Returns linear blend weight in [0, 1] from pure velocity reward to raw_env_reward over [start_ref, end_ref]."""
+        pos_ret = max(0.0, float(self._current_return))
+        span = max(
+            float(self.pure_vel_end_return_ref) - float(self.pure_vel_start_return_ref),
+            1e-6,
+        )
+        return float(
+            np.clip(
+                (pos_ret - float(self.pure_vel_start_return_ref)) / span, 0.0, 1.0
+            )
+        )
+
     def get_current_action_ema_alpha(self) -> float:
         """Returns the effective action EMA alpha interpolating linearly from action_ema_alpha to 1.0 over 0 -> 1000 return."""
         blend = self.get_reward_blend_alpha()
@@ -809,6 +830,8 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         joint_vel_scale = 0.0
         forward_bonus = 0.0
         ctrl_refund = 0.0
+        pure_vel_reward = 0.0
+        pure_vel_raw_blend = 0.0
         self._recent_step_vels.append(float(step_x_vel))
         smooth_x_vel = float(sum(self._recent_step_vels) / len(self._recent_step_vels))
         if self._eval_mode:
@@ -826,6 +849,20 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             eff_ctrl_weight = 0.5
             agent_reward = raw_env_reward
             reward = raw_env_reward
+        elif self.pure_velocity_reward_mode:
+            # Pure non-negative forward-velocity reward up to 1000 raw return, linearly blending to raw_env_reward at 3000
+            blend_alpha = self.get_reward_blend_alpha()
+            exploration_progress = self.get_exploration_progress()
+            eff_forward_weight = self.forward_reward_weight
+            eff_ctrl_weight = 0.0
+            reward_fwd = float(info.get("reward_forward", step_x_vel))
+            pure_vel_reward = float(self.forward_reward_weight) * max(0.0, reward_fwd)
+            pure_vel_raw_blend = self.get_current_pure_vel_raw_blend()
+            agent_reward = (
+                (1.0 - pure_vel_raw_blend) * pure_vel_reward
+                + pure_vel_raw_blend * raw_env_reward
+            )
+            reward = agent_reward
         else:
             blend_alpha = self.get_reward_blend_alpha()
             exploration_progress = self.get_exploration_progress()
@@ -909,6 +946,8 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         info["stationary_penalty"] = float(stationary_penalty)
         info["joint_vel_penalty"] = float(joint_vel_penalty)
         info["joint_vel_penalty_scale"] = float(joint_vel_scale)
+        info["pure_vel_reward"] = float(pure_vel_reward)
+        info["pure_vel_raw_blend"] = float(pure_vel_raw_blend)
         info["smooth_x_vel"] = float(smooth_x_vel)
         info["reward_blend_alpha"] = float(blend_alpha)
         info["exploration_progress"] = float(exploration_progress)

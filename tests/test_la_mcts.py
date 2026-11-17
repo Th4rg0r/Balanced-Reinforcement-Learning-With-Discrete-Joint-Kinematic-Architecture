@@ -681,6 +681,9 @@ def test_needle_point_d_critic_warmup_and_config_defaults() -> None:
     assert sys_cfg.ant_morph.joint_vel_penalty_coef > 0.0
     assert np.isclose(sys_cfg.ant_morph.joint_vel_start_return_ref, 1000.0)
     assert np.isclose(sys_cfg.ant_morph.joint_vel_end_return_ref, 3000.0)
+    assert sys_cfg.ant_morph.pure_velocity_reward_mode is True
+    assert np.isclose(sys_cfg.ant_morph.pure_vel_start_return_ref, 1000.0)
+    assert np.isclose(sys_cfg.ant_morph.pure_vel_end_return_ref, 3000.0)
     assert 0.0 < sys_cfg.ant_morph.action_ema_alpha <= 1.0
     assert 0.0 < sys_cfg.la_mcts.root_exploration_fraction_decay_constant <= 1.0
     assert sys_cfg.brl.warmup_episodes == 150

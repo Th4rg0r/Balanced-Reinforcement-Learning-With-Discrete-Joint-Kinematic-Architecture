@@ -753,3 +753,79 @@ def test_joint_vel_penalty_enforces_all_joints_and_blends_1000_to_3000() -> None
         assert eval_r == pytest.approx(float(eval_info["raw_env_reward"]), abs=1e-5)
     finally:
         wrapper.close()
+
+
+def test_pure_velocity_reward_mode_non_negative_and_blends_1000_to_3000() -> None:
+    """Verifies pure_velocity_reward_mode gives w_fwd * max(0, v_x) up to 1000 raw return and blends linearly to raw_env_reward at 3000."""
+    wrapper = MorphologicalAntBRLWrapper(
+        fixed_action_space=True,
+        action_ema_alpha=1.0,
+        action_smoothness_coef=0.5,
+        min_healthy_vel=0.5,
+        stationary_penalty_coef=1.0,
+        min_joint_vel=1.0,
+        joint_vel_penalty_coef=1.0,
+        forward_reward_weight=3.0,
+        ctrl_cost_weight=0.5,
+        use_real_returns=False,
+        pure_velocity_reward_mode=True,
+        pure_vel_start_return_ref=1000.0,
+        pure_vel_end_return_ref=3000.0,
+    )
+    try:
+        wrapper.reset(seed=42, options={"eval_mode": False})
+        full_act = np.ones(12, dtype=np.float32)
+
+        # 1) At 0 and 1000 raw return: blend == 0.0; negative velocity gives 0.0, positive velocity gives 3.0 * v_x
+        for ret in (0.0, 1000.0):
+            wrapper.target_return = ret
+            wrapper.current_return = ret
+            assert wrapper.get_current_pure_vel_raw_blend() == pytest.approx(0.0, abs=1e-6)
+
+            # Force strong negative x-velocity: reward must be 0.0 (no penalty for negative velocity, no ctrl cost, no healthy bonus)
+            wrapper.mj_data.qvel[:] = 0.0
+            wrapper.mj_data.qvel[0] = -2.0
+            _, r_neg, _, _, info_neg = wrapper.step(full_act)
+            assert float(info_neg["reward_forward"]) < 0.0
+            assert float(info_neg["pure_vel_raw_blend"]) == pytest.approx(0.0, abs=1e-6)
+            assert float(info_neg["pure_vel_reward"]) == pytest.approx(0.0, abs=1e-6)
+            assert r_neg == pytest.approx(0.0, abs=1e-6)
+
+            # Force positive x-velocity: reward must be strictly 3.0 * reward_forward
+            wrapper.mj_data.qvel[:] = 0.0
+            wrapper.mj_data.qvel[0] = 2.0
+            _, r_pos, _, _, info_pos = wrapper.step(full_act)
+            fwd_v = float(info_pos["reward_forward"])
+            assert fwd_v > 0.0
+            expected_pure = 3.0 * fwd_v
+            assert float(info_pos["pure_vel_reward"]) == pytest.approx(expected_pure, abs=1e-5)
+            assert r_pos == pytest.approx(expected_pure, abs=1e-5)
+
+        # 2) At 2000 raw return (midpoint between 1000 and 3000): blend == 0.5
+        wrapper.target_return = 2000.0
+        wrapper.current_return = 2000.0
+        assert wrapper.get_current_pure_vel_raw_blend() == pytest.approx(0.5, abs=1e-6)
+        wrapper.mj_data.qvel[:] = 0.0
+        wrapper.mj_data.qvel[0] = 1.5
+        _, mid_r, _, _, mid_info = wrapper.step(full_act)
+        assert float(mid_info["pure_vel_raw_blend"]) == pytest.approx(0.5, abs=1e-6)
+        expected_mid = 0.5 * float(mid_info["pure_vel_reward"]) + 0.5 * float(mid_info["raw_env_reward"])
+        assert mid_r == pytest.approx(expected_mid, abs=1e-5)
+
+        # 3) At 3000+ raw return: blend == 1.0 -> 100% raw_env_reward
+        for ret in (3000.0, 4000.0):
+            wrapper.target_return = ret
+            wrapper.current_return = ret
+            assert wrapper.get_current_pure_vel_raw_blend() == pytest.approx(1.0, abs=1e-6)
+            _, end_r, _, _, end_info = wrapper.step(full_act)
+            assert float(end_info["pure_vel_raw_blend"]) == pytest.approx(1.0, abs=1e-6)
+            assert end_r == pytest.approx(float(end_info["raw_env_reward"]), abs=1e-5)
+
+        # 4) Eval mode always returns 100% raw_env_reward even at 0.0 training return
+        wrapper.target_return = 0.0
+        wrapper.current_return = 0.0
+        wrapper.reset(seed=42, options={"eval_mode": True})
+        _, eval_r, _, _, eval_info = wrapper.step(full_act)
+        assert eval_r == pytest.approx(float(eval_info["raw_env_reward"]), abs=1e-5)
+    finally:
+        wrapper.close()

@@ -380,6 +380,7 @@ Exploration in LA-MCTS is dynamically annealed using the environment's **rolling
   - `ctrl_cost_weight: 0.0` held until `ctrl_start_return_ref` (`1000.0`), then ramping linearly to `0.5` at `ctrl_return_ref` (`3500.0`).
   - `min_healthy_vel: 0.10`, `stationary_penalty_coef: 0.25`, `stationary_vel_window: 10`: Velocity-gated healthy reward and anti-stationary penalty over a responsive 10-step (`0.5s`) window.
   - `min_joint_vel: 0.60`, `joint_vel_penalty_coef: 0.35`, `joint_vel_start_return_ref: 1000.0`, `joint_vel_end_return_ref: 3000.0`: Per-joint minimum angular speed (`|qvel| >= 0.60` rad/s across all active hip and ankle joints) held at `1.0` scale up to `1000` return and blending linearly to `0.0` at `3000` return.
+  - `pure_velocity_reward_mode: true`, `pure_vel_start_return_ref: 1000.0`, `pure_vel_end_return_ref: 3000.0`: When enabled, the training agent receives solely $w_{\text{fwd}} \cdot \max(0.0, v_x)$ (with `0.0` for negative velocity and no other reward or penalty terms) up to `1000` rolling-20 raw return, then blends linearly into `raw_env_reward` until reaching 100% `raw_env_reward` at `3000` raw return.
 
 #### `vel_shift_factor`
 - **Type**: `float` | **Default**: `3000.0`

@@ -477,6 +477,9 @@ def run_single_seed(
         ctrl_return_ref=sys_cfg.ant_morph.ctrl_return_ref,
         forward_return_ref=sys_cfg.ant_morph.forward_return_ref,
         use_real_returns=sys_cfg.ant_morph.use_real_returns,
+        pure_velocity_reward_mode=sys_cfg.ant_morph.pure_velocity_reward_mode,
+        pure_vel_start_return_ref=sys_cfg.ant_morph.pure_vel_start_return_ref,
+        pure_vel_end_return_ref=sys_cfg.ant_morph.pure_vel_end_return_ref,
     )
 
     agent = LatentActionMCTSAgent(config=sys_cfg.la_mcts, device=device)

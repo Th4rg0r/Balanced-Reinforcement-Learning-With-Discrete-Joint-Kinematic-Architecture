@@ -101,7 +101,7 @@ class BRLConfig:
     target_win_rate: float = 0.50
     ema_beta_w: float = 0.05
     tau_s: float = 500.0
-    initial_r_ref: float = -250.0
+    initial_r_ref: float = 0.0
     benchmark_r_ref: float = 6169.54
     min_win_velocity: float = 0.05
     r_ref_target_mult: float = 1.02
@@ -162,6 +162,9 @@ class AntMorphConfig:
     joint_vel_penalty_coef: float = 0.35
     joint_vel_start_return_ref: float = 1000.0
     joint_vel_end_return_ref: float = 3000.0
+    pure_velocity_reward_mode: bool = True
+    pure_vel_start_return_ref: float = 1000.0
+    pure_vel_end_return_ref: float = 3000.0
 
 
 @dataclass

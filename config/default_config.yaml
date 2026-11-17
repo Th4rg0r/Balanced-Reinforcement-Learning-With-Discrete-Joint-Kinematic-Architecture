@@ -81,7 +81,7 @@ brl:
   target_win_rate: 0.50
   ema_beta_w: 0.05
   tau_s: 500.0
-  initial_r_ref: -250.0
+  initial_r_ref: 0.0
   benchmark_r_ref: 6169.54
   min_win_velocity: 0.05    # minimum mean x_velocity (m/s) required to count as a WIN (0.0 disables)
   r_ref_target_mult: 1.02   # multiplier on episode_return when raising r_ref (>1.0 keeps duel challenging)
@@ -137,6 +137,9 @@ ant_morph:
   joint_vel_penalty_coef: 0.35    # per-step penalty coef averaged across all active hip & ankle joints; 0.0 disables
   joint_vel_start_return_ref: 1000.0 # rolling-20 real return where joint-speed penalty begins blending out
   joint_vel_end_return_ref: 3000.0   # rolling-20 real return where joint-speed penalty reaches 0.0
+  pure_velocity_reward_mode: true    # pure non-negative forward-velocity reward up to 1000 raw return, blending to raw_reward by 3000
+  pure_vel_start_return_ref: 1000.0  # rolling-20 raw return where pure velocity reward begins blending toward raw_reward
+  pure_vel_end_return_ref: 3000.0    # rolling-20 raw return where agent_reward reaches 100% raw_reward
 
 # Run protocol defaults for experiments/train_ant_brl.py (CLI flags override; 0 = automatic)
 run:
