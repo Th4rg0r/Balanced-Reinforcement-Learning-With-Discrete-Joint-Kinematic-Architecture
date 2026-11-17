@@ -1214,7 +1214,8 @@ class DeterministicLimbHead(nn.Module):
         max_joints_per_limb: int = 4,
         hidden_dim: int = 128,
         n_heads: int = 4,
-        n_enc_layers: int = 2,
+        n_enc_layers: int = 1,
+        n_dec_layers: int = 1,
     ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
@@ -1235,7 +1236,7 @@ class DeterministicLimbHead(nn.Module):
         # Avoid large default bias flooding early z/phase FiLM modulation
         nn.init.orthogonal_(self.phase_film.weight, gain=0.85)
         nn.init.zeros_(self.phase_film.bias)
-        self.limb_osc_proj = nn.Linear(hidden_dim + self.phase_dim + 18, hidden_dim)
+        self.limb_osc_proj = nn.Linear(hidden_dim + self.phase_dim + self.geom_dim, hidden_dim)
         nn.init.orthogonal_(self.limb_osc_proj.weight, gain=0.85)
         nn.init.zeros_(self.limb_osc_proj.bias)
         self.kin_proj = nn.Sequential(
@@ -1247,6 +1248,10 @@ class DeterministicLimbHead(nn.Module):
         )
         self.global_type_emb = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
         self.limb_type_emb = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
+        self.dec_query_proj = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
 
         enc_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
@@ -1260,6 +1265,16 @@ class DeterministicLimbHead(nn.Module):
         self.encoder = nn.TransformerEncoder(
             enc_layer, num_layers=n_enc_layers, enable_nested_tensor=False
         )
+        dec_layer = nn.TransformerDecoderLayer(
+            d_model=hidden_dim,
+            nhead=n_heads,
+            dim_feedforward=hidden_dim * 2,
+            dropout=0.0,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(dec_layer, num_layers=n_dec_layers)
         self.out_ln = nn.LayerNorm(hidden_dim)
         self.mu_head = nn.Linear(hidden_dim, max_joints_per_limb)
         nn.init.orthogonal_(self.mu_head.weight, gain=0.5)
@@ -1305,13 +1320,25 @@ class DeterministicLimbHead(nn.Module):
             dim=-1,
         )
 
+    @staticmethod
+    def _center_geom(limb_geom: torch.Tensor) -> torch.Tensor:
+        """Centers shared cosine/pitch constants and scales (x,y,z) across all 26 kinematic dimensions."""
+        geom_centered = limb_geom.clone()
+        geom_centered[..., 0:3] = geom_centered[..., 0:3] * 4.0
+        geom_centered[..., 3:4] = (geom_centered[..., 3:4] - 0.5) * 2.0
+        geom_centered[..., 6:7] = (geom_centered[..., 6:7] - 0.5) * 2.0
+        geom_centered[..., 7:8] = geom_centered[..., 7:8] - 1.0
+        geom_centered[..., 9::3] = geom_centered[..., 9::3] - 1.0
+        return geom_centered
+
     def _encode_limbs(
         self,
         z_flat: torch.Tensor,
         limb_geom: torch.Tensor,
         phase: Optional[torch.Tensor] = None,
+        context_geom: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Runs per-limb FiLM state + phase conditioning & centered dynamic readout -> (B, N_limbs, D)."""
+        """Runs Transformer Encoder-Decoder over [global, context_limbs] and all 26D limb parameters -> (B, N_limbs, D)."""
         z_norm = F.layer_norm(z_flat, (self.latent_dim,))
         e_global_clean = self.global_proj(z_norm).unsqueeze(1)
         e_global = e_global_clean + self.global_type_emb
@@ -1320,32 +1347,41 @@ class DeterministicLimbHead(nn.Module):
         film_raw = self.z_film(z_norm).unsqueeze(1) + self.phase_film(limb_phase)
         scale, shift = film_raw.chunk(2, dim=-1)
 
-        # Center shared cosine/pitch constants and scale (x,y,z) so each leg quadrant gets an orthogonal kin_emb
-        geom_centered = limb_geom.clone()
-        geom_centered[..., 0:3] = geom_centered[..., 0:3] * 4.0
-        geom_centered[..., 3:4] = (geom_centered[..., 3:4] - 0.5) * 2.0
-        geom_centered[..., 6:7] = (geom_centered[..., 6:7] - 0.5) * 2.0
-        geom_centered[..., 7:8] = geom_centered[..., 7:8] - 1.0
-        geom_centered[..., 9::3] = geom_centered[..., 9::3] - 1.0
-
+        geom_centered = self._center_geom(limb_geom)
         kin_emb = self.kin_proj(geom_centered)
         e_limbs_static = kin_emb + self.limb_type_emb
-        e_limbs = e_limbs_static + kin_emb * torch.tanh(scale) + shift
+        e_query = e_limbs_static + kin_emb * torch.tanh(scale) + shift
 
-        enc_seq = torch.cat([e_global, e_limbs], dim=1)
-        raw_limbs = self.encoder(enc_seq)[:, 1:, :]
+        if context_geom is None:
+            e_ctx = e_query
+        else:
+            ctx_phase = self._compute_limb_phase_harmonics(context_geom, phase)
+            ctx_film = self.z_film(z_norm).unsqueeze(1) + self.phase_film(ctx_phase)
+            ctx_scale, ctx_shift = ctx_film.chunk(2, dim=-1)
+            ctx_centered = self._center_geom(context_geom)
+            ctx_emb = self.kin_proj(ctx_centered)
+            e_ctx = ctx_emb + self.limb_type_emb + ctx_emb * torch.tanh(ctx_scale) + ctx_shift
 
-        dyn_angles = geom_centered[..., 8:]
+        enc_seq = torch.cat([e_global, e_ctx], dim=1)
+        memory = self.encoder(enc_seq)
+
+        e_global_exp = e_global_clean.expand(-1, limb_geom.size(1), -1)
+        dec_queries = (
+            self.dec_query_proj(torch.cat([e_query, e_global_exp], dim=-1))
+            + e_query
+        )
+        dec_out = self.decoder(tgt=dec_queries, memory=memory)
+
         osc_in = torch.cat(
             [
-                0.7 * e_global_clean.expand(-1, limb_geom.size(1), -1),
+                0.7 * e_global_exp,
                 4.0 * limb_phase,
-                2.5 * dyn_angles,
+                2.5 * geom_centered,
             ],
             dim=-1,
         )
         osc_delta = self.limb_osc_proj(osc_in) * torch.tanh(kin_emb)
-        return self.out_ln((raw_limbs - e_limbs_static) + osc_delta)
+        return self.out_ln((dec_out - e_limbs_static) + osc_delta)
 
     def forward_single_limb(
         self,
@@ -1376,15 +1412,14 @@ class DeterministicLimbHead(nn.Module):
             if ctx_t.dim() == 2:
                 ctx_t = ctx_t.unsqueeze(0).expand(bsz, -1, -1)
             ctx_geom = self.encode_kinematics(ctx_t)
-            # Reuse matching limb token if anchor corresponds to an existing body limb
             dists = torch.norm(ctx_t[0, :, :3] - kin_11d[0, :3].unsqueeze(0), dim=-1)
             best_idx = int(torch.argmin(dists).item())
             if float(dists[best_idx].item()) < 1e-3:
                 h_limbs = self._encode_limbs(z_in, ctx_geom, phase=phase)
                 h_target = h_limbs[:, best_idx, :]
             else:
-                h_limbs = self._encode_limbs(z_in, torch.cat([ctx_geom, geom_q], dim=1), phase=phase)
-                h_target = h_limbs[:, -1, :]
+                h_limbs = self._encode_limbs(z_in, geom_q, phase=phase, context_geom=ctx_geom)
+                h_target = h_limbs[:, 0, :]
         else:
             h_target = self._encode_limbs(z_in, geom_q, phase=phase)[:, 0, :]
 
@@ -1543,6 +1578,8 @@ class DeterministicActorHead(nn.Module):
         deterministic: bool = True,
         peak_idx: Optional[int | torch.Tensor] = None,
         all_limbs_kinematics: Optional[torch.Tensor] = None,
+        angle_diff: Optional[Tuple[float, float, float] | Sequence[float] | torch.Tensor] = None,
+        world_euler: Optional[Tuple[float, float, float] | Sequence[float] | torch.Tensor] = None,
     ) -> torch.Tensor:
         """Queries deterministic action vector for a single limb given 3D anchor and direction."""
         return self.limb_head.forward_single_limb(
@@ -1552,6 +1589,8 @@ class DeterministicActorHead(nn.Module):
             pitch=pitch,
             num_joints=num_joints,
             all_limbs_kinematics=all_limbs_kinematics,
+            angle_diff=angle_diff,
+            world_euler=world_euler,
         )
 
     def sample_actions(
@@ -1595,14 +1634,17 @@ class DeterministicActorHead(nn.Module):
         if deterministic_candidates:
             # Generate k_act deterministic structured candidates for MCTS evaluation lookahead:
             #   slot 0: clean deterministic policy f_phi(z, c)
-            #   slot 1: de-saturated / sign-reversing joint release -0.5 * a_det
-            #   slots 2..: deterministic latent-directional probes f_phi(norm(z + delta_j))
+            #   slot 1: sign-reversing joint release -0.75 * a_det
+            #   slot 2: anti-phase diagonal trot probe (alternating limb signs)
+            #   slots 3..: state-modulated latent-directional probes f_phi(norm(z + delta_j))
             kin, counts = self._resolve_kinematics(limb_kinematics, z_in.device)
-            n_lat_det = max(0, k_act - 2)
+            n_action_probes = min(k_act, 3)
+            n_lat_det = max(0, k_act - n_action_probes)
             if n_lat_det > 0:
                 idx_j = torch.arange(1, n_lat_det + 1, device=z_t.device, dtype=z_t.dtype).view(1, n_lat_det, 1)
                 dim_k = torch.arange(self.latent_dim, device=z_t.device, dtype=z_t.dtype).view(1, 1, self.latent_dim)
-                det_dirs = torch.sin(idx_j * 1.6180339887 * (dim_k + 1.0))
+                z_phase = 6.2831853 * z_in[:, :1].unsqueeze(1)
+                det_dirs = torch.sin(idx_j * 1.6180339887 * (dim_k + 1.0) + z_phase)
                 eff_det_lat = max(0.08, float(latent_noise_std) if latent_noise_std > 0.0 else 0.18)
                 z_pert_det = min_max_normalize(
                     z_in.unsqueeze(1) + eff_det_lat * det_dirs,
@@ -1643,8 +1685,18 @@ class DeterministicActorHead(nn.Module):
             ).view(bsz, n_core_det, self.action_dim)
 
             a_det_0 = acts_core_det[:, 0:1, :]
-            a_rel_1 = torch.clamp(-0.5 * a_det_0, -1.0, 1.0)
+            a_rel_1 = torch.clamp(-0.75 * a_det_0, -1.0, 1.0)
             det_chunks = [a_det_0, a_rel_1]
+            if k_act >= 3:
+                j_idx = torch.arange(self.action_dim, device=z_t.device)
+                j_per_limb = max(1, self.limb_head.max_joints_per_limb)
+                trot_sign = torch.where(
+                    ((j_idx // j_per_limb) % 2) == 0,
+                    torch.ones(1, device=z_t.device, dtype=z_t.dtype),
+                    -torch.ones(1, device=z_t.device, dtype=z_t.dtype),
+                ).view(1, 1, self.action_dim)
+                a_trot_2 = torch.clamp(a_det_0 * trot_sign, -1.0, 1.0)
+                det_chunks.append(a_trot_2)
             if n_lat_det > 0:
                 det_chunks.append(acts_core_det[:, 1:, :])
             sampled = torch.cat(det_chunks, dim=1)[:, :k_act, :]

@@ -424,6 +424,8 @@ class ModelRepresentationTrainer(nn.Module):
                 osc_target = min(0.20, max(0.0, float(min_policy_std_target) * 0.90))
                 temp_std = torch.sqrt(a_det_seq.var(dim=1, unbiased=False) + 1e-6)
                 step_da = (a_det_seq[:, 1:, :] - a_det_seq[:, :-1, :]).abs().mean(dim=1)
+                temp_mean_abs = a_det_seq.mean(dim=1).abs()
+                dc_bias_pen = F.relu(temp_mean_abs - 0.25).pow(2)
                 if m_seq is not None:
                     m_2d = m_seq.squeeze(1)
                     max_j_std = (temp_std * m_2d).max(dim=-1, keepdim=True)[0].detach()
@@ -436,11 +438,29 @@ class ModelRepresentationTrainer(nn.Module):
                     F.relu(osc_target - temp_std).pow(2)
                     + F.relu(0.80 * osc_target - step_da).pow(2)
                     + 1.5 * balance_shortfall
+                    + 0.75 * dc_bias_pen
                 )
                 if m_2d is not None:
-                    loss_p_osc = 6.0 * ((osc_shortfall * m_2d).sum(dim=-1) / active_dims).mean()
+                    base_osc = ((osc_shortfall * m_2d).sum(dim=-1) / active_dims).mean()
                 else:
-                    loss_p_osc = 6.0 * (osc_shortfall.sum(dim=-1) / active_dims).mean()
+                    base_osc = (osc_shortfall.sum(dim=-1) / active_dims).mean()
+
+                # Inter-limb counter-balance: prevent all 4 legs from locking in identical in-phase torques
+                if a_det_seq.size(-1) >= 8:
+                    limb_view = a_det_seq[:, :, :8].view(bsz, n_steps, 4, 2)
+                    inter_limb_std = torch.sqrt(limb_view.var(dim=2, unbiased=False) + 1e-6).mean(dim=1)
+                    inter_limb_mean = limb_view.mean(dim=2).abs().mean(dim=1)
+                    limb_sym_pen = (
+                        F.relu(0.70 * osc_target - inter_limb_std).pow(2)
+                        + 0.5 * F.relu(inter_limb_mean - 0.25).pow(2)
+                    ).mean(dim=-1)
+                    if m_2d is not None:
+                        four_leg_active = (m_2d[:, :8].sum(dim=-1) >= 6.0).to(limb_sym_pen.dtype)
+                        base_osc = base_osc + (limb_sym_pen * four_leg_active).mean()
+                    else:
+                        base_osc = base_osc + limb_sym_pen.mean()
+
+                loss_p_osc = 6.0 * base_osc
             else:
                 loss_p_osc = torch.tensor(0.0, device=obs_seq.device, dtype=obs_seq.dtype)
 

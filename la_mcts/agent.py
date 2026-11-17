@@ -849,6 +849,10 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
             if step_kin is not None
             else None
         )
+        if "limb_kinematics" in info and info["limb_kinematics"] is not None:
+            self.current_limb_kinematics = np.asarray(
+                info["limb_kinematics"], dtype=np.float32
+            ).copy()
         self._last_mcts_info = None
         self._last_limb_kinematics = None
 

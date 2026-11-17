@@ -1279,5 +1279,18 @@ def test_deterministic_eval_runs_mcts_lookahead_and_unroll_isolates_world_model(
     assert bb_gn == 0.0
     assert rep_gn == 0.0
 
+    # 3) Verify DeterministicLimbHead uses full 26D kinematics in Encoder-Decoder + limb_osc_proj,
+    #    and observe_transition updates agent.current_limb_kinematics on every step
+    lh = agent.actor_head.limb_head
+    assert hasattr(lh, "encoder") and hasattr(lh, "decoder") and hasattr(lh, "dec_query_proj")
+    assert lh.limb_osc_proj.in_features == lh.hidden_dim + lh.phase_dim + 26
+
+    new_kin = np.ones((4, 11), dtype=np.float32) * 0.42
+    agent.observe_transition(
+        obs, act_eval, 1.0, obs, False, False, {"limb_kinematics": new_kin}
+    )
+    np.testing.assert_allclose(agent.current_limb_kinematics, new_kin, atol=1e-6)
+
+
 
 
