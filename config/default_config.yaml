@@ -10,8 +10,8 @@ la_mcts:
   log_std_bounds: [-1.8, 0.25]
   use_categorical_critic: true
   actor_type: "deterministic"
-  lambda_dpg: 0.25
-  dpg_horizon: 4
+  lambda_dpg: 0.05
+  dpg_horizon: 1
   gait_phase_period: 20
   action_explore_std: 0.35
   action_explore_std_end: 0.05

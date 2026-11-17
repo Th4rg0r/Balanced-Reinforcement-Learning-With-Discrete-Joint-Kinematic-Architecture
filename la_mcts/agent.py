@@ -1173,6 +1173,17 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
         total_loss.backward()
         eff_lambda_dpg = self.get_current_lambda_dpg()
         if eff_lambda_dpg > 0.0 and self.rep_trainer._last_root_latents is not None:
+            actor_params = [p for p in self.actor_head.parameters() if p.requires_grad]
+            g_before = [
+                p.grad.detach().clone() if p.grad is not None else torch.zeros_like(p)
+                for p in actor_params
+            ]
+            p_grad_norm = float(
+                torch.sqrt(
+                    sum((g.pow(2).sum() for g in g_before), torch.tensor(0.0, device=self.device))
+                    + 1e-12
+                ).item()
+            )
             z_0_det, cum_0_det = self.rep_trainer._last_root_latents
             loss_dpg, dpg_metrics = self.rep_trainer.compute_deterministic_policy_loss(
                 z_0=z_0_det,
@@ -1187,6 +1198,22 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 phase_seq=phase_seq[:, :dpg_horizon],
             )
             loss_dpg.backward()
+            g_dpg = [
+                (p.grad.detach() - gb) if p.grad is not None else torch.zeros_like(gb)
+                for p, gb in zip(actor_params, g_before)
+            ]
+            dpg_grad_norm = float(
+                torch.sqrt(
+                    sum((gd.pow(2).sum() for gd in g_dpg), torch.tensor(0.0, device=self.device))
+                    + 1e-12
+                ).item()
+            )
+            max_dpg_norm = 0.25 * max(p_grad_norm, 1e-3)
+            if dpg_grad_norm > max_dpg_norm and dpg_grad_norm > 0.0:
+                scale_dpg = max_dpg_norm / dpg_grad_norm
+                for p, gb, gd in zip(actor_params, g_before, g_dpg):
+                    if p.grad is not None:
+                        p.grad.copy_(gb + scale_dpg * gd)
             metrics.update(dpg_metrics)
 
         torch.nn.utils.clip_grad_norm_(
@@ -1257,6 +1284,28 @@ class LatentActionMCTSAgent(AbstractBRLSolverAgent):
                 )
                 actor_state["limb_head.phase_film.bias"] = torch.zeros_like(
                     self.actor_head.limb_head.phase_film.bias
+                )
+            elif (
+                "limb_head.phase_film.weight" in actor_state
+                and hasattr(self.actor_head, "limb_head")
+                and hasattr(self.actor_head.limb_head, "phase_film")
+            ):
+                saved_pf = actor_state["limb_head.phase_film.weight"]
+                cur_pf = self.actor_head.limb_head.phase_film.weight
+                if saved_pf.shape[1] < cur_pf.shape[1]:
+                    actor_state["limb_head.phase_film.weight"] = torch.nn.functional.pad(
+                        saved_pf, (0, cur_pf.shape[1] - saved_pf.shape[1])
+                    )
+            if (
+                "limb_head.limb_osc_proj.weight" not in actor_state
+                and hasattr(self.actor_head, "limb_head")
+                and hasattr(self.actor_head.limb_head, "limb_osc_proj")
+            ):
+                actor_state["limb_head.limb_osc_proj.weight"] = torch.zeros_like(
+                    self.actor_head.limb_head.limb_osc_proj.weight
+                )
+                actor_state["limb_head.limb_osc_proj.bias"] = torch.zeros_like(
+                    self.actor_head.limb_head.limb_osc_proj.bias
                 )
             self.actor_head.load_state_dict(actor_state)
         if "critic_head" in state:

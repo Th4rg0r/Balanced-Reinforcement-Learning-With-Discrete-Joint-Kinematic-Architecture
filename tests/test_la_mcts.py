@@ -661,8 +661,8 @@ def test_needle_point_d_critic_warmup_and_config_defaults() -> None:
         sys_cfg = load_config("config/default_config.yaml")
     assert not caught, f"Unexpected config warnings: {[str(w.message) for w in caught]}"
     assert sys_cfg.la_mcts.actor_type == "deterministic"
-    assert np.isclose(sys_cfg.la_mcts.lambda_dpg, 0.25)
-    assert sys_cfg.la_mcts.dpg_horizon == 4
+    assert np.isclose(sys_cfg.la_mcts.lambda_dpg, 0.05)
+    assert sys_cfg.la_mcts.dpg_horizon == 1
     assert np.isclose(sys_cfg.la_mcts.action_explore_std, 0.35)
     assert np.isclose(sys_cfg.la_mcts.latent_noise_std, 0.25)
     assert sys_cfg.la_mcts.mode_hold_steps == 8
@@ -1107,3 +1107,28 @@ def test_deterministic_awr_distills_positive_advantage_actions_over_slot0_collap
         a_slot0_after = actor(backbone(obs_seq[:, 0]), phase=ph0)
     dist_after = float((a_slot0_after[0] - a_win).abs().mean().item())
     assert dist_after < dist_before - 0.1
+
+
+def test_deterministic_limb_head_dynamic_cosine_and_dpg_grad_clip() -> None:
+    """Verifies per-limb phase harmonics eliminate static 0.975 cosine similarity and DPG grad is clipped."""
+    from la_mcts.gmm_heads import DeterministicActorHead, compute_gait_phase
+
+    torch.manual_seed(303)
+    actor = DeterministicActorHead(latent_dim=64, action_dim=8, hidden_dim=64, joints_per_limb=2)
+    lh = actor.limb_head
+    z_rand = torch.rand(16, 64)
+    phases = compute_gait_phase(torch.arange(16, dtype=torch.float32), period_steps=20)
+    kin = actor.default_limb_kinematics.unsqueeze(0).expand(16, -1, -1)
+    geom = lh.encode_kinematics(kin)
+
+    with torch.no_grad():
+        h = lh._encode_limbs(z_rand, geom, phase=phases)
+        for i in range(4):
+            hi = torch.nn.functional.normalize(h[:, i, :], dim=-1)
+            sim_mat = hi @ hi.T
+            off_diag = float(((sim_mat.sum() - sim_mat.diag().sum()) / (16 * 15)).item())
+            assert off_diag < 0.35, f"Limb {i} off-diagonal cosine similarity too high: {off_diag}"
+
+        a_phase = actor(z_rand[0:1].expand(16, -1), phase=phases)
+        assert float(a_phase.std(dim=0).mean().item()) > 0.08
+

@@ -1228,10 +1228,16 @@ class DeterministicLimbHead(nn.Module):
             nn.LayerNorm(hidden_dim),
         )
         self.z_film = nn.Linear(latent_dim, hidden_dim * 2)
-        self.phase_film = nn.Linear(2, hidden_dim * 2)
-        # Avoid large default 1/sqrt(2) bias flooding early z/phase FiLM modulation
-        nn.init.orthogonal_(self.phase_film.weight, gain=0.75)
+        nn.init.orthogonal_(self.z_film.weight, gain=0.75)
+        nn.init.zeros_(self.z_film.bias)
+        self.phase_dim = 8
+        self.phase_film = nn.Linear(self.phase_dim, hidden_dim * 2)
+        # Avoid large default bias flooding early z/phase FiLM modulation
+        nn.init.orthogonal_(self.phase_film.weight, gain=0.85)
         nn.init.zeros_(self.phase_film.bias)
+        self.limb_osc_proj = nn.Linear(hidden_dim + self.phase_dim + 18, hidden_dim)
+        nn.init.orthogonal_(self.limb_osc_proj.weight, gain=0.85)
+        nn.init.zeros_(self.limb_osc_proj.bias)
         self.kin_proj = nn.Sequential(
             nn.Linear(self.geom_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -1263,27 +1269,76 @@ class DeterministicLimbHead(nn.Module):
     def encode_kinematics(kinematics: torch.Tensor) -> torch.Tensor:
         return encode_limb_kinematics(kinematics)
 
+    def _compute_limb_phase_harmonics(
+        self,
+        limb_geom: torch.Tensor,
+        phase: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Computes 8D per-limb phase harmonics [phi, phi+psi_i, phi-psi_i, phi+2*psi_i] for wave & trot gaits."""
+        bsz, n_limbs, _ = limb_geom.shape
+        if phase is None:
+            return torch.zeros(
+                bsz, n_limbs, self.phase_dim, device=limb_geom.device, dtype=limb_geom.dtype
+            )
+        p_in = phase.to(device=limb_geom.device, dtype=limb_geom.dtype)
+        if p_in.dim() == 1:
+            p_in = p_in.unsqueeze(0).expand(bsz, -1)
+        elif p_in.shape[0] == 1 and bsz > 1:
+            p_in = p_in.expand(bsz, -1)
+        sin_p = p_in[:, 0:1].unsqueeze(1).expand(bsz, n_limbs, 1)
+        cos_p = p_in[:, 1:2].unsqueeze(1).expand(bsz, n_limbs, 1)
+
+        cos_yaw = limb_geom[..., 4:5]
+        sin_yaw = limb_geom[..., 5:6]
+        sin_2yaw = 2.0 * sin_yaw * cos_yaw
+        cos_2yaw = cos_yaw * cos_yaw - sin_yaw * sin_yaw
+
+        sin_plus = sin_p * cos_yaw + cos_p * sin_yaw
+        cos_plus = cos_p * cos_yaw - sin_p * sin_yaw
+        sin_minus = sin_p * cos_yaw - cos_p * sin_yaw
+        cos_minus = cos_p * cos_yaw + sin_p * sin_yaw
+        sin_trot = sin_p * cos_2yaw + cos_p * sin_2yaw
+        cos_trot = cos_p * cos_2yaw - sin_p * sin_2yaw
+
+        return torch.cat(
+            [sin_p, cos_p, sin_plus, cos_plus, sin_minus, cos_minus, sin_trot, cos_trot],
+            dim=-1,
+        )
+
     def _encode_limbs(
         self,
         z_flat: torch.Tensor,
         limb_geom: torch.Tensor,
         phase: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Runs shared FiLM state + phase conditioning & self-attention over [global_z, limb_tokens] -> (B, N_limbs, D)."""
-        e_global = self.global_proj(z_flat).unsqueeze(1) + self.global_type_emb
-        film_raw = self.z_film(z_flat)
-        if phase is not None:
-            p_in = phase.to(device=z_flat.device, dtype=z_flat.dtype)
-            if p_in.dim() == 1:
-                p_in = p_in.unsqueeze(0).expand(z_flat.shape[0], -1)
-            elif p_in.shape[0] == 1 and z_flat.shape[0] > 1:
-                p_in = p_in.expand(z_flat.shape[0], -1)
-            film_raw = film_raw + self.phase_film(p_in)
-        scale, shift = film_raw.unsqueeze(1).chunk(2, dim=-1)
-        e_limbs = self.kin_proj(limb_geom) * (1.0 + 0.5 * torch.tanh(scale)) + shift + self.limb_type_emb
+        """Runs per-limb FiLM state + phase conditioning & centered dynamic readout -> (B, N_limbs, D)."""
+        z_norm = F.layer_norm(z_flat, (self.latent_dim,))
+        e_global_clean = self.global_proj(z_norm).unsqueeze(1)
+        e_global = e_global_clean + self.global_type_emb
+
+        limb_phase = self._compute_limb_phase_harmonics(limb_geom, phase)
+        film_raw = self.z_film(z_norm).unsqueeze(1) + self.phase_film(limb_phase)
+        scale, shift = film_raw.chunk(2, dim=-1)
+
+        kin_emb = self.kin_proj(limb_geom)
+        e_limbs_static = kin_emb + self.limb_type_emb
+        e_limbs = e_limbs_static + kin_emb * torch.tanh(scale) + shift
+
         enc_seq = torch.cat([e_global, e_limbs], dim=1)
-        enc_out = self.out_ln(self.encoder(enc_seq))
-        return enc_out[:, 1:, :]
+        raw_limbs = self.encoder(enc_seq)[:, 1:, :]
+
+        dyn_angles = limb_geom[..., 8:].clone()
+        dyn_angles[..., 1::3] = dyn_angles[..., 1::3] - 1.0
+        osc_in = torch.cat(
+            [
+                0.7 * e_global_clean.expand(-1, limb_geom.size(1), -1),
+                4.0 * limb_phase,
+                2.0 * dyn_angles,
+            ],
+            dim=-1,
+        )
+        osc_delta = self.limb_osc_proj(osc_in) * torch.tanh(kin_emb)
+        return self.out_ln((raw_limbs - e_limbs_static) + osc_delta)
 
     def forward_single_limb(
         self,
@@ -1594,11 +1649,16 @@ class DeterministicActorHead(nn.Module):
         if n_lat > 0:
             chunks.append(acts_core[:, 1:, :])
         if n_act > 0:
-            a_noisy = torch.clamp(
-                a_det + eff_act_std * torch.randn(bsz, n_act, self.action_dim, device=z_t.device, dtype=z_t.dtype),
-                -1.0,
-                1.0,
+            noise_draws = eff_act_std * torch.randn(
+                bsz, n_act, self.action_dim, device=z_t.device, dtype=z_t.dtype
             )
+            if n_act >= 2:
+                # Include one sign-reversing / de-saturated candidate to escape mechanical stops
+                a_local = torch.clamp(a_det + noise_draws[:, :-1, :], -1.0, 1.0)
+                a_release = torch.clamp(-0.5 * a_det + noise_draws[:, -1:, :], -1.0, 1.0)
+                a_noisy = torch.cat([a_local, a_release], dim=1)
+            else:
+                a_noisy = torch.clamp(a_det + noise_draws, -1.0, 1.0)
             chunks.append(a_noisy)
         sampled = torch.cat(chunks, dim=1)
         sampled = self._apply_mask(sampled, action_mask)

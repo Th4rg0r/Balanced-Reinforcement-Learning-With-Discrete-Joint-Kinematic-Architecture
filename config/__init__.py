@@ -24,8 +24,8 @@ class LAMCTSConfig:
     log_std_bounds: Tuple[float, float] = (-1.5, 0.25)
     use_categorical_critic: bool = True
     actor_type: str = "deterministic"
-    lambda_dpg: float = 0.25
-    dpg_horizon: int = 4
+    lambda_dpg: float = 0.05
+    dpg_horizon: int = 1
     gait_phase_period: int = 20
     action_explore_std: float = 0.35
     action_explore_std_end: float = 0.05

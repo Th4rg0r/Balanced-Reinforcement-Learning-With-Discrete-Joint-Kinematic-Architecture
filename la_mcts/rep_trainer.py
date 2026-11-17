@@ -345,15 +345,18 @@ class ModelRepresentationTrainer(nn.Module):
                 w_sharp.unsqueeze(-1) * mcts_policy_samples[:, :n_steps], dim=2
             )
             sq_err = (a_det_seq - a_mcts_target).pow(2)
-            pre_tanh_sq = pre_tanh_flat.view(bsz, n_steps, -1).pow(2)
+            pre_tanh_seq = pre_tanh_flat.view(bsz, n_steps, -1)
+            pre_tanh_pen = (
+                20.0 * F.relu(pre_tanh_seq.abs() - 0.9).pow(2) + 2.0 * pre_tanh_seq.pow(2)
+            )
             if action_mask is not None:
                 m_seq = action_mask.view(1, 1, -1) if action_mask.dim() == 1 else action_mask.unsqueeze(1)
                 loss_p_mcts = ((sq_err * m_seq).sum(dim=-1) / active_dims).mean(dim=0).sum()
-                pre_tanh_reg = ((pre_tanh_sq * m_seq).sum(dim=-1) / active_dims).mean()
+                pre_tanh_reg = ((pre_tanh_pen * m_seq).sum(dim=-1) / active_dims).mean()
             else:
                 m_seq = None
                 loss_p_mcts = (sq_err.sum(dim=-1) / active_dims).mean(dim=0).sum()
-                pre_tanh_reg = pre_tanh_sq.mean()
+                pre_tanh_reg = pre_tanh_pen.mean()
 
             # 2) Direct Advantage-Weighted Regression (AWR) on executed replay actions so
             #    high-return exploratory motions distill straight into the deterministic actor
@@ -378,7 +381,33 @@ class ModelRepresentationTrainer(nn.Module):
             else:
                 loss_p_awr = torch.tensor(0.0, device=obs_seq.device, dtype=obs_seq.dtype)
 
-            loss_p = loss_p_mcts + loss_p_awr * float(n_steps) + 1e-4 * pre_tanh_reg
+            # 3) Temporal oscillation anti-stasis floor across the unrolled gait phase window
+            if (
+                phase_seq is not None
+                and n_steps >= 2
+                and phase_seq.dim() == 3
+                and float(phase_seq[:, :n_steps].std(dim=1).max().item()) > 1e-3
+            ):
+                osc_target = min(0.18, max(0.0, float(min_policy_std_target) * 0.85))
+                temp_std = torch.sqrt(a_det_seq.var(dim=1, unbiased=False) + 1e-6)
+                step_da = (a_det_seq[:, 1:, :] - a_det_seq[:, :-1, :]).abs().mean(dim=1)
+                osc_shortfall = (
+                    F.relu(osc_target - temp_std).pow(2)
+                    + F.relu(0.75 * osc_target - step_da).pow(2)
+                )
+                if m_seq is not None:
+                    m_2d = m_seq.squeeze(1)
+                    loss_p_osc = 2.5 * ((osc_shortfall * m_2d).sum(dim=-1) / active_dims).mean()
+                else:
+                    loss_p_osc = 2.5 * (osc_shortfall.sum(dim=-1) / active_dims).mean()
+            else:
+                loss_p_osc = torch.tensor(0.0, device=obs_seq.device, dtype=obs_seq.dtype)
+
+            loss_p = (
+                loss_p_mcts
+                + (loss_p_awr + loss_p_osc) * float(n_steps)
+                + 1e-3 * pre_tanh_reg * float(n_steps)
+            )
 
             # Normalize over unroll horizon
             loss_v = loss_v / float(k_plus_1)
@@ -407,6 +436,7 @@ class ModelRepresentationTrainer(nn.Module):
                 "loss_p": float(loss_p.detach().item()),
                 "loss_p_mcts": float((loss_p_mcts / float(k_plus_1)).detach().item()),
                 "loss_p_awr": float(loss_p_awr.detach().item()),
+                "loss_p_osc": float(loss_p_osc.detach().item()),
                 "loss_r": float(loss_r.detach().item()),
                 "loss_rep": float(loss_rep.detach().item()),
                 "loss_peak_ent": 0.0,
@@ -573,7 +603,9 @@ class ModelRepresentationTrainer(nn.Module):
                         return_pre_tanh=True,
                         phase=phase_h,
                     )
-                    pre_tanh_reg = pre_tanh_reg + pre_h.pow(2).mean()
+                    pre_tanh_reg = pre_tanh_reg + (
+                        20.0 * F.relu(pre_h.abs() - 0.9).pow(2) + 2.0 * pre_h.pow(2)
+                    ).mean()
                     z_next, r_hat = self.forward(z_cur, act_h)
                     cum_next = combine_cumulative_rep(
                         z_next, cum_cur, alpha=self.latent_ema_decay, assume_nonzero=True
@@ -618,7 +650,7 @@ class ModelRepresentationTrainer(nn.Module):
                 self._dpg_q_scale = 0.95 * self._dpg_q_scale + 0.05 * q_span
                 scale = max(1.0, float(self._dpg_q_scale))
 
-            loss_dpg = -float(lambda_dpg) * (q_total / scale).mean() + 1e-4 * (
+            loss_dpg = -float(lambda_dpg) * (q_total / scale).mean() + 1e-3 * (
                 pre_tanh_reg / float(horizon)
             )
             dpg_metrics = {
