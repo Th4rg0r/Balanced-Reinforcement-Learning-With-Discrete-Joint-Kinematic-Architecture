@@ -75,21 +75,22 @@ This document provides a comprehensive reference for every configuration paramet
   - **Lower**: Struggles to disambiguate unobserved physical parameters (e.g. slippery ice vs. weak actuators) from instantaneous states.
 
 #### `latent_ema_decay`
-- **Type**: `float` | **Default**: `0.4`
+- **Type**: `float` | **Default**: `0.15`
 - **Purpose**: Exponential moving average weight $\alpha \in [0, 1]$ used to blend cumulative historical latent representations ($z^{\text{cum}}_t = \text{norm}(z_t + \alpha z^{\text{cum}}_{t-1})$) for Actor and Critic readout while keeping latent dynamics transitions un-smeared ($z_t \to z_{t+1}$).
 
 ---
 
 ### 1.2 Policy Architecture & Actor Optimization
 
-#### `actor_type`, `lambda_dpg`, `dpg_horizon`, `action_explore_std`, and `action_explore_std_end`
+#### `actor_type`, `lambda_dpg`, `dpg_horizon`, `gait_phase_period`, `action_explore_std`, and `action_explore_std_end`
 - **Defaults**:
   - `actor_type: "deterministic"`: Selects Network 2 implementation:
-    - `"deterministic"` (Default): Uses `DeterministicActorHead` (`DeterministicLimbHead`), mapping `(z_t, c_i) -> a_i in [-1, 1]^J` directly via Pre-LN self-attention without composite GMM sampling, trained via analytical Model-Based DPG (`lambda_dpg`) plus MCTS anchor MSE (`lambda_p`).
+    - `"deterministic"` (Default): Uses `DeterministicActorHead` (`DeterministicLimbHead`), mapping `(z_t, c_i, phase_i) -> a_i in [-1, 1]^J` directly via Pre-LN self-attention and 8D per-limb phase harmonics without composite GMM sampling, trained via MCTS barycenter + AWR + temporal oscillation floor (`lambda_p`) and gradient-clipped 1-step DPG (`lambda_dpg`).
     - `"gmm"`: Legacy `MultiPeakGMMActorHead` outputting multi-peak `(logits, mu, log_std)` distribution parameters.
-  - `lambda_dpg: 0.25`: Weight of the analytical Deterministic Policy Gradient (`d/d_phi [sum gamma^h r_hat + gamma^H V(z_cum)]`) backpropagated per limb through the frozen world model and critic (gated by `critic_warmup_steps`).
-  - `dpg_horizon: 4`: Latent rollout horizon (`4 * 50ms = 200ms`) differentiated per DPG update.
-  - `action_explore_std: 0.35` $\to$ `action_explore_std_end: 0.05`: Exploration noise std around deterministic MCTS proposals during training, annealing linearly over `0 -> exploration_return_ref` (`3000`, velocity-gated when `use_real_returns: true`).
+  - `lambda_dpg: 0.05`: Weight of the analytical Deterministic Policy Gradient (`d/d_phi [r_hat + gamma V(z_cum)]`) backpropagated through the frozen world model and critic (clipped to at most `0.25x` of the `loss_p` actor gradient norm).
+  - `dpg_horizon: 1`: 1-step latent evaluation horizon differentiated per DPG update to prevent multi-step world-model corner exploitation.
+  - `gait_phase_period: 16`: Period in environment steps (`16 * 50ms = 0.80s`, `1.25 Hz`) of the global 2D sinusoidal gait clock $[\sin(2\pi t / T), \cos(2\pi t / T)]$ combined with each limb's yaw angle $\psi_i$.
+  - `action_explore_std: 0.40` $\to$ `action_explore_std_end: 0.05`: Exploration noise std around deterministic MCTS proposals during training, annealing linearly over `0 -> exploration_return_ref` (`3000`, velocity-gated when `use_real_returns: true`).
 
 #### `num_peaks`
 - **Type**: `int` | **Default**: `4`
@@ -373,11 +374,12 @@ Exploration in LA-MCTS is dynamically annealed using the environment's **rolling
   - `action_ema_alpha`: Initial exponential moving average action filter weight ($a_t^{\text{env}} = \alpha_{\text{ema}} a_t + (1 - \alpha_{\text{ema}}) a_{t-1}^{\text{env}}$). Interpolates linearly from `action_ema_alpha` to `1.0` (unfiltered agility) as `current_return` progresses from `0` to `torque_return_ref` (`1000.0`).
   - `action_smoothness_coef`: Penalty weight on squared action changes $\|a_t - a_{t-1}\|_2^2$. Scaled by $(1 - \alpha_{\text{torque}})$ so the smoothness penalty vanishes completely once `current_return` reaches `torque_return_ref` (`1000.0`).
 
-#### `torque_return_ref` and `exploration_return_ref`
-- **Type**: `float` | **Default**: `torque_return_ref: 1000.0`, `exploration_return_ref: 3000.0`
-- **Purpose**: Reference thresholds for the **rolling 20-episode raw environment return** curriculum (`self._recent_ep_returns`, recorded across full 1,000-step healthy episodes with negative returns clamped to `0.0`):
-  - **`torque_return_ref: 1000.0`**: Scales $\alpha_{\text{torque}} = \text{clip}(\text{current\_return} / 1000.0, 0.0, 1.0)$ from `0` to `1000` return, reducing the smoothness penalty to `0` and opening `action_ema_alpha` to `1.0`.
-  - **`exploration_return_ref: 3000.0`**: Scales $\alpha_{\text{explore}} = \text{clip}(\text{current\_return} / 3000.0, 0.0, 1.0)$ from `0` to `3000` return, annealing MCTS action temperature (`tau_act_train`), Dirichlet noise (`root_exploration_fraction`), policy std target (`min_policy_std_target`), Balancer noise, and Tweaker entropy bonus.
+#### `torque_return_ref`, `exploration_return_ref`, `ctrl_start_return_ref`, `ctrl_return_ref`, `forward_return_ref`, and Shaping Penalties
+- **Defaults**:
+  - `forward_reward_weight: 3.0` $\to$ `1.0` over `0 -> forward_return_ref` (`5000.0`).
+  - `ctrl_cost_weight: 0.0` held until `ctrl_start_return_ref` (`1000.0`), then ramping linearly to `0.5` at `ctrl_return_ref` (`3500.0`).
+  - `min_healthy_vel: 0.10`, `stationary_penalty_coef: 0.25`, `stationary_vel_window: 10`: Velocity-gated healthy reward and anti-stationary penalty over a responsive 10-step (`0.5s`) window.
+  - `min_joint_vel: 0.60`, `joint_vel_penalty_coef: 0.35`, `joint_vel_start_return_ref: 1000.0`, `joint_vel_end_return_ref: 3000.0`: Per-joint minimum angular speed (`|qvel| >= 0.60` rad/s across all active hip and ankle joints) held at `1.0` scale up to `1000` return and blending linearly to `0.0` at `3000` return.
 
 #### `vel_shift_factor`
 - **Type**: `float` | **Default**: `3000.0`

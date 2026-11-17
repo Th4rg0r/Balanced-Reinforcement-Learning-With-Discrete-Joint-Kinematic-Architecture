@@ -663,17 +663,17 @@ def test_needle_point_d_critic_warmup_and_config_defaults() -> None:
     assert sys_cfg.la_mcts.actor_type == "deterministic"
     assert np.isclose(sys_cfg.la_mcts.lambda_dpg, 0.05)
     assert sys_cfg.la_mcts.dpg_horizon == 1
-    assert np.isclose(sys_cfg.la_mcts.action_explore_std, 0.35)
+    assert np.isclose(sys_cfg.la_mcts.action_explore_std, 0.40)
     assert np.isclose(sys_cfg.la_mcts.latent_noise_std, 0.25)
-    assert sys_cfg.la_mcts.mode_hold_steps == 8
+    assert sys_cfg.la_mcts.mode_hold_steps == 6
     assert np.isclose(sys_cfg.la_mcts.lambda_peak_ent, 0.15)
     assert np.isclose(sys_cfg.la_mcts.lambda_peak_sep, 0.25)
     assert sys_cfg.la_mcts.k_act == 8
-    assert sys_cfg.la_mcts.critic_warmup_steps == 12000
-    assert np.isclose(sys_cfg.la_mcts.lr, 9e-5)
+    assert sys_cfg.la_mcts.critic_warmup_steps == 8000
+    assert np.isclose(sys_cfg.la_mcts.lr, 1e-4)
     assert np.isclose(sys_cfg.la_mcts.c_1, 2.50)
-    assert np.isclose(sys_cfg.la_mcts.tau_act_train, 1.5)
-    assert sys_cfg.la_mcts.gait_phase_period == 20
+    assert np.isclose(sys_cfg.la_mcts.tau_act_train, 1.25)
+    assert sys_cfg.la_mcts.gait_phase_period == 16
     assert np.isclose(sys_cfg.ant_morph.ctrl_cost_weight, 0.0)
     assert np.isclose(sys_cfg.ant_morph.ctrl_start_return_ref, 1000.0)
     assert np.isclose(sys_cfg.ant_morph.ctrl_return_ref, 3500.0)

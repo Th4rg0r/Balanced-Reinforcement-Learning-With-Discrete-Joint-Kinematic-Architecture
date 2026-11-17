@@ -26,8 +26,8 @@ class LAMCTSConfig:
     actor_type: str = "deterministic"
     lambda_dpg: float = 0.05
     dpg_horizon: int = 1
-    gait_phase_period: int = 20
-    action_explore_std: float = 0.35
+    gait_phase_period: int = 16
+    action_explore_std: float = 0.40
     action_explore_std_end: float = 0.05
     support_min: int = -150
     support_max: int = 150
@@ -43,7 +43,7 @@ class LAMCTSConfig:
     beta_mse: float = 1.0
     lambda_v: float = 0.5
     lambda_r: float = 1.0
-    lambda_p: float = 0.25
+    lambda_p: float = 0.50
     lambda_ent: float = 0.015
     c_reg: float = 1e-4
     n_sim: int = 32
@@ -56,8 +56,8 @@ class LAMCTSConfig:
     root_dirichlet_alpha: float = 0.45
     root_exploration_fraction: float = 0.50
     root_exploration_fraction_end: float = 0.12
-    root_exploration_fraction_decay_constant: float = 0.999996
-    tau_act_train: float = 1.5
+    root_exploration_fraction_decay_constant: float = 0.999995
+    tau_act_train: float = 1.25
     tau_act_train_end: float = 0.15
     tau_act_eval: float = 0.05
     adaptive_exploration: bool = True
@@ -66,7 +66,7 @@ class LAMCTSConfig:
     exploration_boost_max: float = 2.25
     latent_noise_std: float = 0.25
     latent_noise_std_end: float = 0.03
-    mode_hold_steps: int = 8
+    mode_hold_steps: int = 6
     mode_commitment_prob: float = 0.70
     lambda_peak_ent: float = 0.15
     lambda_peak_ent_end: float = 0.02
@@ -74,13 +74,13 @@ class LAMCTSConfig:
     lambda_peak_sep: float = 0.25
     lambda_peak_sep_end: float = 0.05
     min_peak_separation: float = 0.40
-    critic_warmup_steps: int = 12000
-    lr: float = 9e-5
+    critic_warmup_steps: int = 8000
+    lr: float = 1e-4
     batch_size: int = 128
     buffer_capacity: int = 50000
     context_dim: int = 18
     history_len: int = 6
-    latent_ema_decay: float = 0.4
+    latent_ema_decay: float = 0.15
     reanalyze_ratio: float = 0.25
     # Agent gradient update every N env steps (0 = auto: max_steps // 2, the original behaviour)
     train_every_steps: int = 50
@@ -101,7 +101,7 @@ class BRLConfig:
     target_win_rate: float = 0.50
     ema_beta_w: float = 0.05
     tau_s: float = 500.0
-    initial_r_ref: float = 0.0
+    initial_r_ref: float = -250.0
     benchmark_r_ref: float = 6169.54
     min_win_velocity: float = 0.05
     r_ref_target_mult: float = 1.02
@@ -143,7 +143,7 @@ class AntMorphConfig:
     action_smoothness_coef: float = 0.04
     action_smoothness_end_step: int = 500000
     action_smoothness_log_shape: float = 10.0  # Deprecated/unused; kept for backward config compatibility
-    forward_reward_weight: float = 2.5
+    forward_reward_weight: float = 3.0
     ctrl_cost_weight: float = 0.0
     benchmark_vel_ref: float = 6.0
     torque_return_ref: float = 1000.0
@@ -156,10 +156,10 @@ class AntMorphConfig:
     upside_down_time_limit: float = 0.0
     upside_down_penalty: float = 0.0
     min_healthy_vel: float = 0.10
-    stationary_penalty_coef: float = 1.50
-    stationary_vel_window: int = 20
-    min_joint_vel: float = 0.5
-    joint_vel_penalty_coef: float = 0.5
+    stationary_penalty_coef: float = 0.25
+    stationary_vel_window: int = 10
+    min_joint_vel: float = 0.60
+    joint_vel_penalty_coef: float = 0.35
     joint_vel_start_return_ref: float = 1000.0
     joint_vel_end_return_ref: float = 3000.0
 

@@ -12,8 +12,8 @@ la_mcts:
   actor_type: "deterministic"
   lambda_dpg: 0.05
   dpg_horizon: 1
-  gait_phase_period: 20
-  action_explore_std: 0.35
+  gait_phase_period: 16
+  action_explore_std: 0.40
   action_explore_std_end: 0.05
   support_min: -150
   support_max: 150
@@ -29,7 +29,7 @@ la_mcts:
   beta_mse: 1.0
   lambda_v: 0.5
   lambda_r: 1.0
-  lambda_p: 0.25
+  lambda_p: 0.50
   lambda_ent: 0.03
   c_reg: 0.0001
   n_sim: 32
@@ -43,7 +43,7 @@ la_mcts:
   root_exploration_fraction: 0.5
   root_exploration_fraction_end: 0.12
   root_exploration_fraction_decay_constant: 0.999995
-  tau_act_train: 1.5
+  tau_act_train: 1.25
   tau_act_train_end: 0.15
   tau_act_eval: 0.05
   adaptive_exploration: true
@@ -52,7 +52,7 @@ la_mcts:
   exploration_boost_max: 2.75
   latent_noise_std: 0.25
   latent_noise_std_end: 0.03
-  mode_hold_steps: 8
+  mode_hold_steps: 6
   mode_commitment_prob: 0.70
   lambda_peak_ent: 0.15
   lambda_peak_ent_end: 0.02
@@ -60,13 +60,13 @@ la_mcts:
   lambda_peak_sep: 0.25
   lambda_peak_sep_end: 0.05
   min_peak_separation: 0.40
-  critic_warmup_steps: 12000
-  lr: 0.00009
+  critic_warmup_steps: 8000
+  lr: 0.0001
   batch_size: 128
   buffer_capacity: 50000
   context_dim: 18
   history_len: 6
-  latent_ema_decay: 0.2
+  latent_ema_decay: 0.15
   reanalyze_ratio: 0.25
   train_every_steps: 50     # agent update every N env steps (0 = auto: max_steps // 2)
   reanalyze_every: 4        # Reanalyze every N episodes (0 = off)
@@ -81,7 +81,7 @@ brl:
   target_win_rate: 0.50
   ema_beta_w: 0.05
   tau_s: 500.0
-  initial_r_ref: 0.0
+  initial_r_ref: -250.0
   benchmark_r_ref: 6169.54
   min_win_velocity: 0.05    # minimum mean x_velocity (m/s) required to count as a WIN (0.0 disables)
   r_ref_target_mult: 1.02   # multiplier on episode_return when raising r_ref (>1.0 keeps duel challenging)
@@ -118,7 +118,7 @@ ant_morph:
   action_ema_alpha: 1 # 0.75    # mild jitter filter without attenuating exploratory torques -> scales to 1.0 at 1000 return
   action_smoothness_coef: 0.00 #0.05 # smoothness 0.06
   action_smoothness_end_step: 500000
-  forward_reward_weight: 2.5 # training-only agent_reward forward scale (Eval/raw Ant-v5 stays standard 1.0)
+  forward_reward_weight: 3.0 # training-only agent_reward forward scale (Eval/raw Ant-v5 stays standard 1.0)
   ctrl_cost_weight: 0.0      # training-only agent_reward torque cost weight (0.0 cancels torque penalty at start, blends to 0.5)
   benchmark_vel_ref: 0.20
   torque_return_ref: 1000.0
@@ -130,11 +130,11 @@ ant_morph:
   vel_shift_factor: 3000.0
   upside_down_time_limit: 0.0
   upside_down_penalty: 0.0
-  min_healthy_vel: 0.15 # 0.45   # training-only: scale healthy_reward by clip(v_x / min_healthy_vel, 0, 1); 0.0 disables
-  stationary_penalty_coef: 0.5 #0.5 # 0.7  # training-only: extra per-step penalty coef * (1 - vel_gate) fed into MCTS rewards; 0.0 disables
-  stationary_vel_window: 20      # steps (~1.0s) of rolling-mean x-velocity used for the velocity gate
-  min_joint_vel: 0.5              # min |qvel| (rad/s) required per active hip & ankle joint during early training
-  joint_vel_penalty_coef: 0.5     # per-step penalty coef averaged across all active hip & ankle joints; 0.0 disables
+  min_healthy_vel: 0.10          # training-only: scale healthy_reward by clip(v_x / min_healthy_vel, 0, 1); 0.0 disables
+  stationary_penalty_coef: 0.25  # training-only: extra per-step penalty coef * (1 - vel_gate) fed into MCTS rewards; 0.0 disables
+  stationary_vel_window: 10      # steps (0.5s) of rolling-mean x-velocity used for the velocity gate
+  min_joint_vel: 0.60             # min |qvel| (rad/s) required per active hip & ankle joint during early training
+  joint_vel_penalty_coef: 0.35    # per-step penalty coef averaged across all active hip & ankle joints; 0.0 disables
   joint_vel_start_return_ref: 1000.0 # rolling-20 real return where joint-speed penalty begins blending out
   joint_vel_end_return_ref: 3000.0   # rolling-20 real return where joint-speed penalty reaches 0.0
 
