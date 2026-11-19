@@ -68,7 +68,13 @@ def main() -> None:
     parser.add_argument(
         "--stochastic",
         action="store_true",
-        help="Use stochastic action sampling (with exploration temperature) instead of deterministic greedy mode.",
+        default=True,
+        help="Use stochastic policy sampling with MCTS mode commitment matching training (default: True).",
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Force deterministic noise-free mode-center evaluation instead of stochastic policy rollout.",
     )
     parser.add_argument(
         "--orbit-camera",
@@ -99,7 +105,7 @@ def main() -> None:
         overwrite=args.overwrite,
         overlay_hud=not args.no_hud,
         device=args.device,
-        deterministic=not args.stochastic,
+        deterministic=bool(args.deterministic),
         orbit_camera=args.orbit_camera,
         track_camera=not args.no_track_camera,
     )

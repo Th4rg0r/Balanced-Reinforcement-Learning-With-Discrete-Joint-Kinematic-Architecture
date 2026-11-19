@@ -518,3 +518,107 @@ def test_training_shaping_preserves_standard_benchmark_eval() -> None:
         wrapper.close()
 
 
+def test_pure_velocity_reward_mode_non_negative_and_blends_1000_to_3000() -> None:
+    """Verifies pure_velocity_reward_mode gives exact signed distance-scaled reward w_fwd * v_x up to 1000 raw return and blends linearly to raw_env_reward at 3000."""
+    wrapper = MorphologicalAntBRLWrapper(
+        fixed_action_space=True,
+        action_ema_alpha=1.0,
+        action_smoothness_coef=0.5,
+        min_healthy_vel=0.5,
+        stationary_penalty_coef=1.0,
+        forward_reward_weight=3.0,
+        ctrl_cost_weight=0.5,
+        pure_velocity_reward_mode=True,
+        pure_vel_min_threshold=0.0,
+        pure_vel_start_return_ref=1000.0,
+        pure_vel_end_return_ref=3000.0,
+    )
+    try:
+        wrapper.reset(seed=42, options={"eval_mode": False})
+        full_act = np.ones(12, dtype=np.float32)
+        dt = float(wrapper.mj_model.opt.timestep) * int(getattr(wrapper.unwrapped, "frame_skip", 5))
+        dist_scale = 3.0 / dt  # 60.0 reward per meter of displacement
+
+        # 1) At 0 and 1000 raw return: blend == 0.0; reward is strictly 3.0 * v_x == (3.0 / dt) * delta_x
+        for ret in (0.0, 1000.0):
+            wrapper.reset(seed=42, options={"eval_mode": False})
+            wrapper.target_return = ret
+            wrapper.current_return = ret
+            assert wrapper.get_current_pure_vel_raw_blend() == pytest.approx(0.0, abs=1e-6)
+
+            # Negative x-velocity gives negative reward proportional to backward displacement
+            wrapper.mj_data.qvel[:] = 0.0
+            wrapper.mj_data.qvel[0] = -2.0
+            prev_x = float(wrapper.mj_data.qpos[0])
+            _, r_neg, _, _, info_neg = wrapper.step(full_act)
+            delta_x_neg = float(wrapper.mj_data.qpos[0]) - prev_x
+            assert delta_x_neg < 0.0
+            assert float(info_neg["pure_vel_raw_blend"]) == pytest.approx(0.0, abs=1e-6)
+            assert float(info_neg["pure_vel_reward"]) == pytest.approx(dist_scale * delta_x_neg, abs=1e-6)
+            assert r_neg == pytest.approx(dist_scale * delta_x_neg, abs=1e-6)
+
+            # Positive x-velocity gives positive reward proportional to forward displacement
+            wrapper.mj_data.qvel[:] = 0.0
+            wrapper.mj_data.qvel[0] = 2.0
+            prev_x = float(wrapper.mj_data.qpos[0])
+            _, r_pos, _, _, info_pos = wrapper.step(full_act)
+            delta_x_pos = float(wrapper.mj_data.qpos[0]) - prev_x
+            assert delta_x_pos > 0.0
+            expected_pure = dist_scale * delta_x_pos
+            assert float(info_pos["pure_vel_reward"]) == pytest.approx(expected_pure, abs=1e-6)
+            assert r_pos == pytest.approx(expected_pure, abs=1e-6)
+
+            # Cumulative episode agent return is an exact scale of completed total_distance:
+            # AgRet == (forward_reward_weight / dt) * total_distance
+            tot_dist = float(info_pos["brl_metrics"]["total_distance"])
+            ag_ret = float(info_pos["brl_metrics"]["agent_episode_return"])
+            assert ag_ret == pytest.approx(dist_scale * tot_dist, abs=1e-6)
+
+        # 2) Back-and-forth oscillation yields AgRet == dist_scale * net total_distance,
+        #    and synthetic +5m / -10m displacements yield +5*x / -10*x symmetrically
+        wrapper.reset(seed=42, options={"eval_mode": False})
+        wrapper.target_return = 0.0
+        wrapper.current_return = 0.0
+        for qv in (2.0, -2.0, 1.5, -1.5):
+            wrapper.mj_data.qvel[:] = 0.0
+            wrapper.mj_data.qvel[0] = qv
+            _, _, _, _, info_osc = wrapper.step(np.zeros(12, dtype=np.float32))
+        tot_dist_osc = float(info_osc["brl_metrics"]["total_distance"])
+        ag_ret_osc = float(info_osc["brl_metrics"]["agent_episode_return"])
+        assert ag_ret_osc == pytest.approx(dist_scale * tot_dist_osc, abs=1e-4)
+
+        # 3) At 2000 raw return (midpoint between 1000 and 3000): blend == 0.5
+        wrapper.target_return = 2000.0
+        wrapper.current_return = 2000.0
+        assert wrapper.get_current_pure_vel_raw_blend() == pytest.approx(0.5, abs=1e-6)
+        wrapper.mj_data.qvel[:] = 0.0
+        wrapper.mj_data.qvel[0] = 1.5
+        _, mid_r, _, _, mid_info = wrapper.step(full_act)
+        assert float(mid_info["pure_vel_raw_blend"]) == pytest.approx(0.5, abs=1e-6)
+        expected_mid = 0.5 * float(mid_info["pure_vel_reward"]) + 0.5 * float(mid_info["raw_env_reward"])
+        assert mid_r == pytest.approx(expected_mid, abs=1e-5)
+
+        # 4) At 3000+ raw return: blend == 1.0 -> 100% raw_env_reward
+        for ret in (3000.0, 4000.0):
+            wrapper.target_return = ret
+            wrapper.current_return = ret
+            assert wrapper.get_current_pure_vel_raw_blend() == pytest.approx(1.0, abs=1e-6)
+            _, end_r, _, _, end_info = wrapper.step(full_act)
+            assert float(end_info["pure_vel_raw_blend"]) == pytest.approx(1.0, abs=1e-6)
+            assert end_r == pytest.approx(float(end_info["raw_env_reward"]), abs=1e-5)
+
+        # 5) Eval mode returns raw_env_reward from step(), while still populating info["pure_vel_reward"] for video HUD
+        wrapper.target_return = 0.0
+        wrapper.current_return = 0.0
+        wrapper.reset(seed=42, options={"eval_mode": True})
+        wrapper.mj_data.qvel[:] = 0.0
+        wrapper.mj_data.qvel[0] = 1.5
+        _, eval_r, _, _, eval_info = wrapper.step(full_act)
+        assert eval_r == pytest.approx(float(eval_info["raw_env_reward"]), abs=1e-5)
+        assert float(eval_info["pure_vel_reward"]) == pytest.approx(
+            dist_scale * float(eval_info["brl_metrics"]["total_distance"]), abs=1e-6
+        )
+    finally:
+        wrapper.close()
+
+

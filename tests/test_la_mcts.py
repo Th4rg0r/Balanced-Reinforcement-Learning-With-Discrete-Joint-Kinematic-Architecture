@@ -662,6 +662,10 @@ def test_needle_point_d_critic_warmup_and_config_defaults() -> None:
     assert not caught, f"Unexpected config warnings: {[str(w.message) for w in caught]}"
     assert np.isclose(sys_cfg.la_mcts.latent_noise_std, 0.08)
     assert sys_cfg.la_mcts.mode_hold_steps == 8
+    assert sys_cfg.ant_morph.pure_velocity_reward_mode is True
+    assert np.isclose(sys_cfg.ant_morph.pure_vel_min_threshold, 0.0)
+    assert np.isclose(sys_cfg.ant_morph.pure_vel_start_return_ref, 1000.0)
+    assert np.isclose(sys_cfg.ant_morph.pure_vel_end_return_ref, 3000.0)
     assert np.isclose(sys_cfg.la_mcts.lambda_peak_ent, 0.15)
     assert np.isclose(sys_cfg.la_mcts.lambda_peak_sep, 0.25)
     assert sys_cfg.la_mcts.k_act == 8

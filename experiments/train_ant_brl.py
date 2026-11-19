@@ -114,10 +114,13 @@ def evaluate_benchmark_suite(
         last_info = info
         while steps < max_steps:
             action = agent.select_action(
-                obs, deterministic=True, limb_kinematics=last_info.get("limb_kinematics")
+                obs, deterministic=False, limb_kinematics=last_info.get("limb_kinematics")
             )
             obs, reward, terminated, truncated, last_info = env.step(action)
-            ep_return += float(last_info.get("raw_env_reward", reward))
+            if getattr(env, "pure_velocity_reward_mode", False) and "pure_vel_reward" in last_info:
+                ep_return += float(last_info["pure_vel_reward"])
+            else:
+                ep_return += float(last_info.get("raw_env_reward", reward))
             steps += 1
             if terminated or truncated:
                 break
@@ -321,6 +324,14 @@ def load_training_checkpoint(
         getattr(agent, "total_transitions_observed", 0),
         int(payload.get("total_env_steps", 0)),
     )
+    saved_diag = payload.get("agent_state_dict", {}).get("diagnostics", {})
+    if "exploration_progress" in saved_diag:
+        agent.set_exploration_progress(float(saved_diag["exploration_progress"]))
+    elif "vel_curriculum" in payload:
+        vc = payload["vel_curriculum"]
+        cur_ret = max(0.0, float(vc.get("current_return", 0.0)))
+        exp_ref = max(1e-6, float(getattr(cfg.ant_morph, "exploration_return_ref", 3000.0)))
+        agent.set_exploration_progress(float(np.clip(cur_ret / exp_ref, 0.0, 1.0)))
     if "tweaker_state_dict" in payload:
         tweaker.load_state_dict(payload["tweaker_state_dict"])
     if "tweaker_optimizer_state_dict" in payload:
@@ -463,6 +474,10 @@ def run_single_seed(
         forward_reward_weight=sys_cfg.ant_morph.forward_reward_weight,
         ctrl_cost_weight=sys_cfg.ant_morph.ctrl_cost_weight,
         forward_return_ref=sys_cfg.ant_morph.forward_return_ref,
+        pure_velocity_reward_mode=sys_cfg.ant_morph.pure_velocity_reward_mode,
+        pure_vel_min_threshold=sys_cfg.ant_morph.pure_vel_min_threshold,
+        pure_vel_start_return_ref=sys_cfg.ant_morph.pure_vel_start_return_ref,
+        pure_vel_end_return_ref=sys_cfg.ant_morph.pure_vel_end_return_ref,
     )
 
     agent = LatentActionMCTSAgent(config=sys_cfg.la_mcts, device=device)

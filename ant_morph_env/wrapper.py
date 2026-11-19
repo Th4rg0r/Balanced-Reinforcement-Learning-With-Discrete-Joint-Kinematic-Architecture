@@ -57,6 +57,10 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         forward_reward_weight: float = 1.0,
         ctrl_cost_weight: float = 0.5,
         forward_return_ref: float = 5000.0,
+        pure_velocity_reward_mode: bool = False,
+        pure_vel_min_threshold: float = 0.0,
+        pure_vel_start_return_ref: float = 1000.0,
+        pure_vel_end_return_ref: float = 3000.0,
     ) -> None:
         self.env_id = env_id
         if env is None:
@@ -100,6 +104,12 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         self.forward_reward_weight = max(0.0, float(forward_reward_weight))
         self.ctrl_cost_weight = max(0.0, float(ctrl_cost_weight))
         self.forward_return_ref = max(1e-6, float(forward_return_ref))
+        self.pure_velocity_reward_mode = bool(pure_velocity_reward_mode)
+        self.pure_vel_min_threshold = max(0.0, float(pure_vel_min_threshold))
+        self.pure_vel_start_return_ref = max(0.0, float(pure_vel_start_return_ref))
+        self.pure_vel_end_return_ref = max(
+            self.pure_vel_start_return_ref + 1e-6, float(pure_vel_end_return_ref)
+        )
         self._recent_step_vels: Deque[float] = deque(maxlen=self.stationary_vel_window)
         self._recent_ep_returns: Deque[float] = deque(maxlen=20)
         self._recent_ep_velocities: Deque[float] = self._recent_ep_returns
@@ -509,6 +519,19 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             np.clip(pos_ret / max(self.exploration_return_ref, 1e-6), 0.0, 1.0)
         )
 
+    def get_current_pure_vel_raw_blend(self) -> float:
+        """Returns linear blend weight in [0, 1] from pure velocity reward to raw_env_reward over [start_ref, end_ref]."""
+        pos_ret = max(0.0, float(self._current_return))
+        span = max(
+            float(self.pure_vel_end_return_ref) - float(self.pure_vel_start_return_ref),
+            1e-6,
+        )
+        return float(
+            np.clip(
+                (pos_ret - float(self.pure_vel_start_return_ref)) / span, 0.0, 1.0
+            )
+        )
+
     def _blend_weight_toward_benchmark(
         self, train_weight: float, benchmark_weight: float
     ) -> float:
@@ -695,7 +718,11 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
                 self.current_vel = max(self.target_vel, self.current_vel - step_delta)
 
         cur_smooth_coef = self.get_current_smoothness_coef()
-        eff_ema_alpha = self.get_current_action_ema_alpha()
+        eff_ema_alpha = (
+            float(np.clip(self.action_ema_alpha, 0.05, 1.0))
+            if self._eval_mode
+            else self.get_current_action_ema_alpha()
+        )
         if self._prev_raw_action is not None and self._prev_raw_action.shape == act_raw.shape:
             smooth_penalty = cur_smooth_coef * float(
                 np.sum(np.square(act_raw - self._prev_raw_action))
@@ -764,8 +791,15 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         stationary_penalty = 0.0
         forward_bonus = 0.0
         ctrl_refund = 0.0
+        pure_vel_reward = 0.0
+        pure_vel_raw_blend = 0.0
         self._recent_step_vels.append(float(step_x_vel))
         smooth_x_vel = float(sum(self._recent_step_vels) / len(self._recent_step_vels))
+        if self.pure_velocity_reward_mode:
+            if self.pure_vel_min_threshold > 0.0 and abs(step_x_vel) <= self.pure_vel_min_threshold:
+                pure_vel_reward = 0.0
+            else:
+                pure_vel_reward = float(self.forward_reward_weight) * float(step_x_vel)
         if self._eval_mode:
             blend_alpha = 1.0
             exploration_progress = 1.0
@@ -773,6 +807,19 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
             eff_ctrl_weight = 0.5
             agent_reward = raw_env_reward
             reward = raw_env_reward
+        elif self.pure_velocity_reward_mode:
+            # Pure signed velocity reward (telescoping sum == (forward_reward_weight / dt) * total_distance)
+            # up to 1000 raw return, linearly blending to raw_env_reward at 3000.
+            blend_alpha = self.get_reward_blend_alpha()
+            exploration_progress = self.get_exploration_progress()
+            eff_forward_weight = self.forward_reward_weight
+            eff_ctrl_weight = 0.0
+            pure_vel_raw_blend = self.get_current_pure_vel_raw_blend()
+            agent_reward = (
+                (1.0 - pure_vel_raw_blend) * pure_vel_reward
+                + pure_vel_raw_blend * raw_env_reward
+            )
+            reward = agent_reward
         else:
             blend_alpha = self.get_reward_blend_alpha()
             exploration_progress = self.get_exploration_progress()
@@ -847,6 +894,9 @@ class MorphologicalAntBRLWrapper(gym.Wrapper):
         info["agent_reward"] = float(agent_reward)
         info["healthy_penalty"] = float(healthy_penalty)
         info["stationary_penalty"] = float(stationary_penalty)
+        info["pure_vel_reward"] = float(pure_vel_reward)
+        info["pure_vel_min_threshold"] = float(self.pure_vel_min_threshold)
+        info["pure_vel_raw_blend"] = float(pure_vel_raw_blend)
         info["smooth_x_vel"] = float(smooth_x_vel)
         info["reward_blend_alpha"] = float(blend_alpha)
         info["exploration_progress"] = float(exploration_progress)

@@ -148,6 +148,10 @@ class AntMorphConfig:
     min_healthy_vel: float = 0.10
     stationary_penalty_coef: float = 1.50
     stationary_vel_window: int = 20
+    pure_velocity_reward_mode: bool = True
+    pure_vel_min_threshold: float = 0.0
+    pure_vel_start_return_ref: float = 1000.0
+    pure_vel_end_return_ref: float = 3000.0
 
 
 @dataclass

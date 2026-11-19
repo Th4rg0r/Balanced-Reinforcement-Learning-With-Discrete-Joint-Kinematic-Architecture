@@ -485,7 +485,7 @@ def render_once(state: ViewerState, ckpt_stat: Tuple[int, int], args: argparse.N
                 max_steps=args.max_steps,
                 fps=args.fps,
                 overlay_hud=not args.no_hud,
-                deterministic=not args.stochastic,
+                deterministic=bool(getattr(args, "deterministic", False)),
                 orbit_camera=args.orbit_camera,
                 track_camera=not args.no_track_camera,
             )
@@ -1307,7 +1307,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=1000, help="Max rollout steps per clip (default: 1000).")
     parser.add_argument("--fps", type=int, default=30, help="Video FPS (default: 30).")
     parser.add_argument("--device", type=str, default="cpu", help="Torch device (default: cpu).")
-    parser.add_argument("--stochastic", action="store_true", help="Use stochastic action sampling.")
+    parser.add_argument("--stochastic", action="store_true", default=True, help="Use stochastic action sampling matching training (default: True).")
+    parser.add_argument("--deterministic", action="store_true", help="Force deterministic mode-center action selection.")
     parser.add_argument("--no-hud", action="store_true", help="Disable telemetry HUD overlay on video.")
     parser.add_argument("--orbit-camera", action="store_true", help="Orbit camera during video capture.")
     parser.add_argument("--no-track-camera", action="store_true", help="Disable torso-tracking camera.")

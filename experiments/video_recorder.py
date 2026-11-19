@@ -262,6 +262,16 @@ def create_rendering_env(env_type: str, cfg: SystemConfig) -> gym.Env:
             use_contact_forces=use_cfrc,
             max_action_capacity=max_act,
             healthy_z_range=healthy_z,
+            action_ema_alpha=getattr(ant_cfg, "action_ema_alpha", 0.8),
+            action_smoothness_coef=getattr(ant_cfg, "action_smoothness_coef", 0.04),
+            action_smoothness_end_step=getattr(ant_cfg, "action_smoothness_end_step", 500000),
+            torque_return_ref=getattr(ant_cfg, "torque_return_ref", 1000.0),
+            exploration_return_ref=getattr(ant_cfg, "exploration_return_ref", 3000.0),
+            forward_reward_weight=getattr(ant_cfg, "forward_reward_weight", 4.0),
+            pure_velocity_reward_mode=getattr(ant_cfg, "pure_velocity_reward_mode", False),
+            pure_vel_min_threshold=getattr(ant_cfg, "pure_vel_min_threshold", 0.0),
+            pure_vel_start_return_ref=getattr(ant_cfg, "pure_vel_start_return_ref", 1000.0),
+            pure_vel_end_return_ref=getattr(ant_cfg, "pure_vel_end_return_ref", 3000.0),
         )
 
     if env_type == "humanoid":
@@ -412,7 +422,7 @@ def render_scenario_video(
     max_steps: int = 500,
     fps: int = 30,
     overlay_hud: bool = True,
-    deterministic: bool = True,
+    deterministic: bool = False,
     orbit_camera: bool = False,
     track_camera: bool = True,
 ) -> Dict[str, Any]:
@@ -423,6 +433,7 @@ def render_scenario_video(
     reset_opts: Dict[str, Any] = {
         "tweak_vector": scenario_spec["tweak"],
         "eval_mode": True,
+        "seed": int(seed),
     }
     if "num_legs" in scenario_spec:
         reset_opts["num_legs"] = scenario_spec["num_legs"]
@@ -431,7 +442,7 @@ def render_scenario_video(
     if "disabled_leg" in scenario_spec:
         reset_opts["disabled_leg"] = scenario_spec["disabled_leg"]
 
-    obs, info = env.reset(options=reset_opts)
+    obs, info = env.reset(seed=int(seed), options=reset_opts)
     morph_mask = info.get(
         "morphology_mask",
         np.ones(getattr(agent.cfg, "max_action_dim", 12), dtype=np.float32),
@@ -529,7 +540,10 @@ def render_scenario_video(
             except TypeError:
                 action = agent.select_action(obs, deterministic=deterministic)
             obs, reward, terminated, truncated, last_info = env.step(action)
-            ep_return += float(reward)
+            if getattr(env, "pure_velocity_reward_mode", False) and "pure_vel_reward" in last_info:
+                ep_return += float(last_info["pure_vel_reward"])
+            else:
+                ep_return += float(reward)
             steps += 1
 
             if terminated or truncated:
@@ -586,7 +600,7 @@ def run_batch_video_rendering(
     overwrite: bool = False,
     overlay_hud: bool = True,
     device: str = "cpu",
-    deterministic: bool = True,
+    deterministic: bool = False,
     orbit_camera: bool = False,
     track_camera: bool = True,
 ) -> Dict[str, Any]:
