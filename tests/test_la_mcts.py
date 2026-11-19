@@ -766,6 +766,46 @@ def test_peak_mean_separation_regularization_gradient() -> None:
     mu_w_grad = actor_head.limb_head.mu_head.weight.grad
     assert mu_w_grad is not None and float(mu_w_grad.abs().sum().item()) > 0.0
 
+    # Verify per-DOF-group separation: if hip DOFs (row 0) are widely separated across peaks
+    # while ankle DOFs (row 1) remain collapsed, loss_peak_sep must still penalize ankle collapse
+    # and produce a non-zero gradient on the ankle row (mu_head.weight.grad[1]).
+    actor_head_2dof = MultiPeakGMMActorHead(
+        latent_dim=32, action_dim=8, num_peaks=4, joints_per_limb=2
+    )
+    rep_trainer_2dof = ModelRepresentationTrainer(
+        latent_dim=32, action_dim=8, num_blocks=1, proj_dim=32, pred_dim=32
+    )
+    with torch.no_grad():
+        actor_head_2dof.limb_head.mu_head.weight[0].normal_(0.0, 2.5)
+        actor_head_2dof.limb_head.mu_head.weight[1].normal_(0.0, 1e-2)
+        actor_head_2dof.limb_head.mu_head.bias[0] = 0.0
+        actor_head_2dof.limb_head.mu_head.bias[1] = 1.0
+    actor_head_2dof.zero_grad()
+    loss_ank, metrics_ank = rep_trainer_2dof.compute_unrolled_loss(
+        obs_seq=obs_seq,
+        action_seq=torch.zeros(2, 2, 8),
+        reward_seq=rew_seq,
+        target_value_seq=val_seq,
+        mcts_policy_samples=torch.zeros(2, 3, 4, 8),
+        mcts_policy_weights=weights,
+        backbone=backbone,
+        actor_head=actor_head_2dof,
+        critic_head=critic_head,
+        lambda_p=0.0,
+        lambda_v=0.0,
+        lambda_r=0.0,
+        lambda_rep=0.0,
+        lambda_ent=0.0,
+        lambda_peak_ent=0.0,
+        c_reg=0.0,
+        lambda_peak_sep=0.25,
+        min_peak_separation=0.40,
+    )
+    assert metrics_ank["loss_peak_sep"] > 0.02
+    loss_ank.backward()
+    ank_grad = actor_head_2dof.limb_head.mu_head.weight.grad[1]
+    assert float(ank_grad.abs().sum().item()) > 0.0
+
 
 def test_balancer_slew_rate_and_low_win_gating() -> None:
     """Verifies Balancer never spikes budget post-warmup and refuses upward climbs at low win rate."""

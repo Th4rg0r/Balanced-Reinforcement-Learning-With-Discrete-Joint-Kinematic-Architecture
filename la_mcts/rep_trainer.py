@@ -348,10 +348,17 @@ class ModelRepresentationTrainer(nn.Module):
 
         # Pairwise geometric separation between GMM peak means tanh(mu_i), tanh(mu_j)
         # so multi-step mode commitment explores genuinely distinct gaits/postures.
+        # Enforced per DOF group (even/hip vs. odd/ankle) when action_dim >= 2 so
+        # the actor cannot satisfy min_peak_separation solely on hips while collapsing
+        # all GMM peaks on ankles to a static lock.
         m_peaks = mu_flat.size(1)
         if m_peaks >= 2:
             squash_mu = torch.tanh(mu_flat)
-            diff = squash_mu.unsqueeze(2) - squash_mu.unsqueeze(1)
+            diff_sq = (squash_mu.unsqueeze(2) - squash_mu.unsqueeze(1)).pow(2)
+            triu_mask = torch.triu(
+                torch.ones((m_peaks, m_peaks), device=mu_flat.device, dtype=torch.bool),
+                diagonal=1,
+            )
             if mask_flat is not None:
                 if mask_flat.dim() == 1:
                     m_exp = mask_flat.view(1, 1, 1, -1)
@@ -359,17 +366,34 @@ class ModelRepresentationTrainer(nn.Module):
                 else:
                     m_exp = mask_flat.unsqueeze(1).unsqueeze(1)
                     denom_sep = mask_flat.sum(dim=-1).clamp_min(1.0).view(-1, 1, 1)
-                rms_dist = torch.sqrt((diff.pow(2) * m_exp).sum(dim=-1) / denom_sep + 1e-6)
+                rms_dist = torch.sqrt((diff_sq * m_exp).sum(dim=-1) / denom_sep + 1e-6)
             else:
-                rms_dist = torch.sqrt(diff.pow(2).mean(dim=-1) + 1e-6)
-            triu_mask = torch.triu(
-                torch.ones((m_peaks, m_peaks), device=mu_flat.device, dtype=torch.bool),
-                diagonal=1,
-            )
+                m_exp = None
+                rms_dist = torch.sqrt(diff_sq.mean(dim=-1) + 1e-6)
             pair_dist = rms_dist[:, triu_mask]
             peak_mean_sep = pair_dist.mean()
             eff_lambda_sep = max(0.0, float(lambda_peak_sep))
-            loss_peak_sep = eff_lambda_sep * F.relu(float(min_peak_separation) - pair_dist).mean()
+            sep_target = float(min_peak_separation)
+            if mu_flat.size(-1) >= 2:
+                even_sq = diff_sq[..., 0::2]
+                odd_sq = diff_sq[..., 1::2]
+                if m_exp is not None:
+                    m_even = m_exp[..., 0::2]
+                    m_odd = m_exp[..., 1::2]
+                    denom_even = m_even.sum(dim=-1).clamp_min(1.0)
+                    denom_odd = m_odd.sum(dim=-1).clamp_min(1.0)
+                    rms_even = torch.sqrt((even_sq * m_even).sum(dim=-1) / denom_even + 1e-6)
+                    rms_odd = torch.sqrt((odd_sq * m_odd).sum(dim=-1) / denom_odd + 1e-6)
+                else:
+                    rms_even = torch.sqrt(even_sq.mean(dim=-1) + 1e-6)
+                    rms_odd = torch.sqrt(odd_sq.mean(dim=-1) + 1e-6)
+                pair_even = rms_even[:, triu_mask]
+                pair_odd = rms_odd[:, triu_mask]
+                loss_sep_even = F.relu(sep_target - pair_even).mean()
+                loss_sep_odd = F.relu(sep_target - pair_odd).mean()
+                loss_peak_sep = eff_lambda_sep * 0.5 * (loss_sep_even + loss_sep_odd)
+            else:
+                loss_peak_sep = eff_lambda_sep * F.relu(sep_target - pair_dist).mean()
         else:
             peak_mean_sep = torch.tensor(0.0, device=obs_seq.device, dtype=obs_seq.dtype)
             loss_peak_sep = torch.tensor(0.0, device=obs_seq.device, dtype=obs_seq.dtype)

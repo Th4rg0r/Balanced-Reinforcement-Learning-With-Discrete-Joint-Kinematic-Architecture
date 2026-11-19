@@ -183,6 +183,29 @@ def test_hexapod_all_legs_point_downward() -> None:
         f"Leg 5 (rel_z={rel_z_5:.4f}) and Leg 6 (rel_z={rel_z_6:.4f}) are not vertically symmetric!"
     )
 
+    # Verify all 6 ankle joints share canonical [30, 70] deg range and positive angle (+action)
+    # consistently flexes every foot downward (-z) from 30 deg (frac=0) to 70 deg (frac=1)
+    z_at_30 = {}
+    for j in range(1, m.njnt):
+        d.qpos[6 + j] = m.jnt_range[j][0]
+    mujoco.mj_forward(m, d)
+    for leg_id in range(1, 7):
+        j_ank = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, f"ankle_{leg_id}")
+        np.testing.assert_allclose(np.rad2deg(m.jnt_range[j_ank]), [30.0, 70.0], atol=1e-4)
+        g_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, f"ankle_{leg_id}_geom")
+        z_at_30[leg_id] = float(d.geom_xpos[g_id][2])
+
+    for j in range(1, m.njnt):
+        d.qpos[6 + j] = m.jnt_range[j][1]
+    mujoco.mj_forward(m, d)
+    for leg_id in range(1, 7):
+        g_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, f"ankle_{leg_id}_geom")
+        z_at_70 = float(d.geom_xpos[g_id][2])
+        assert z_at_70 < z_at_30[leg_id] - 0.05, (
+            f"Leg {leg_id} positive ankle rotation did not flex foot downward: "
+            f"z(30 deg)={z_at_30[leg_id]:.4f}, z(70 deg)={z_at_70:.4f}"
+        )
+
 
 def test_actuator_weakening_scales_linearly() -> None:
     """Verifies w_9 and w_4 scale effective actuator torque linearly (not quadratically)."""
